@@ -1,0 +1,21 @@
+########
+python3 exchange_AddON.py --input inputs/news_output_2026-05-11.tsv --output-dir outputs
+
+########
+python3 ./highOfDay_addON.py --input ./outputs/news_output_2026-05-11_enriched.tsv --output-dir outputs
+
+########
+python3 finBERT_noCoref_AddON.py --input outputs/concatenated_enriched.tsv
+
+#######
+python3 enriched_tsv_concatener.py -l outputs/tsv_list.txt --input-dir outputs/ -o outputs/concatenated_enriched.tsv
+
+######
+python3 filter_float_dailyhigh.py --input outputs/concatenated_enriched_finBERT_noCoref_AddON.tsv --output outputs/fconcatenated_enriched_FinBERT_filtered-50float-12high.tsv --MaxFloat 50 --maxDailyHigh 12 --string-to-exclude excluded_strings-2.txt 
+
+#
+python3 plot_sentiment_vs_dailyhigh.py --input outputs/fconcatenated_enriched_FinBERT_filtered-50float-12high.tsv \
+--output outputs/ --labels false
+
+#
+python3 plot_sentiment_vs_dailyhigh_terminal.py outputs/concatenated_enriched_FinBERT_05-03-to05-18_Float50_price5.tsv

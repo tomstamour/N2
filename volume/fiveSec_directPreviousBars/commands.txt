@@ -1,0 +1,9 @@
+source ~/venv/bin/activate
+
+python3 fiveSec_directPreviousBars.py --symbol AAPL --client-id 21 \
+  --historical-bars-fetch 60 --lifetime 00:30 --output .
+
+##
+python3 backtest_fiveSec_directPreviousBars.py --symbol HITI --client-id 22 \
+  --historical-bars-fetch 20 --start-datetime "2026-04-20 07:46:57" \
+  --lifetime 120:00 --output .

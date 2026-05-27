@@ -1,0 +1,13 @@
+################### 
+
+python FinBERT_body_noCoref.py \
+--input ../jsons/nGNX2lv6M4-PRZO-2026-05-29.json \
+--log-file outputs/nGNX2lv6M4-PRZO-2026-05-29.log \
+--output-dir outputs/ \
+--sentences-to-analyse 20
+
+
+######################
+python3 ./finBERT_neutral_management_addON.py --input outputs/ASTC-2026-05-27_FinBERT.json \
+--output-dir outputs \
+--management-method 4 -top-k 3

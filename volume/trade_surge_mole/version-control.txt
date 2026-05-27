@@ -1,0 +1,2 @@
+The script trade_mole_4.2.py was created to mork with the script Orchestrator3.6.py, it will not be used. In the version Orchestrator3.6.py tree Clients for ibapi were dedicated and threaded with 10 lines per client, each line dedicated to the Trade mole script. Unfortunately, this               implementation made the Orchestrator3.6.py script jump from 600 lines of code to 1300 lines. I dont think this is sutainable and maintanable.
+

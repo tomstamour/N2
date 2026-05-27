@@ -1,0 +1,3 @@
+python FinBERT-prosusAI-noNER.py \
+--input BWEN-2026-05-12.json \
+--output ./outputs/

@@ -1,0 +1,18 @@
+#######
+./X-wing-1.0.py \
+--symbol JWEL \
+--capital 4.00 \
+--account U18283054 \
+--input-limits-table example-yield_vs-stopLimits.tsv \
+--log-dir logs \
+--price-action-table xwing_tables \
+--lifetime 00:15 \
+--port 4001 \
+--prewarm \
+--max-limit-entry-percent-price 0 \
+--max-cap-entry-percent 20 \
+--last-close-price 2.35 \
+--exit-cross-percent 0.025
+
+#
+pkill -USR1 -f "X-wing-1.0.py --symbol JWEL"   # FIRE  → places the BUY

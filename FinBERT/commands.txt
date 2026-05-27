@@ -1,0 +1,8 @@
+# Phase 1 — one-time export:
+#Downloads ProsusAI/finbert, exports to ONNX via optimum, then runs quantize_dynamic (INT8 UInt8) into ./finbert_onnx/.
+python FinBERT-analysis.py --export
+
+
+# Phase 2 — fast inference:
+# Loads the pre-exported ONNX model (no download, no conversion), processes every sentence, writes
+python FinBERT-analysis.py --input ./FEED_28-jan-2026_sentences_NER.json

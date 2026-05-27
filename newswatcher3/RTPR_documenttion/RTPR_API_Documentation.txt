@@ -1,0 +1,402 @@
+RTPR API Documentation
+
+
+Access real-time press releases from major wire services via REST API or WebSocket. Get the news before everyone else.
+
+What is RTPR?
+RTPR (Real-Time Press Releases) delivers press releases from every major wire service — Business Wire, PR Newswire, GlobeNewsWire, and more — into a single API. Articles arrive in under 500 ms from the moment they hit the wire. Whether you're building a trading bot, a research dashboard, or just want instant alerts, RTPR gives you one connection to all the news.
+
+What are press releases and why do they matter?
+When a public company has important news — earnings results, an FDA drug approval, a merger, or a major partnership — they publish a press release through a wire service. Professional traders and algorithms monitor these releases because they often move stock prices within seconds. The faster you see the news, the earlier you can act on it.
+
+WebSocket vs REST — which should I use?
+REST API
+“You ask, we answer.”
+
+Make an HTTP request whenever you need articles. Simple to use, great for dashboards and quick look-ups. 60 requests/min.
+
+WebSocket
+Fastest
+“We push to you instantly.”
+
+Always-on connection with sub-500 ms delivery. Best for real-time trading and alerting. Unlimited incoming messages.
+
+Many users use both — WebSocket for live monitoring and REST for on-demand queries.
+
+🚀 Getting Started
+Everything you need to know to start using the RTPR API
+
+Base URL
+https://api.rtpr.io
+Authentication
+
+Include your API key as a Bearer token:
+
+Authorization: Bearer YOUR_API_KEY
+
+Rate Limits
+60 requests per minute
+#############################################
+GET
+/articles
+Retrieve recent press releases from all tickers
+Query Parameters
+limit
+optional
+Number of articles to return (default: 20, max: 100)
+
+Response
+{
+  "count": 20,
+  "articles": [
+    {
+      "ticker": "AAPL",
+      "exchange": "NASDAQ",
+      "title": "Apple Announces Q4 Results",
+      "author": "Business Wire",
+      "created": "2025-07-28T16:30:00.000Z",
+      "article_body": "Apple Inc. announced financial results for its fiscal fourth quarter ended September 30, 2025..."
+    }
+  ]
+}
+
+
+Code Examples
+Try it yourself
+Get articles for AAPL
+Get recent press releases
+
+Python
+import requests
+
+url = 'https://api.rtpr.io/articles'
+headers = {'Authorization': 'Bearer YOUR_API_KEY'}
+
+response = requests.get(url, headers=headers)
+data = response.json()
+
+print('Found ' + str(data['count']) + ' articles')
+
+for article in data['articles']:
+    print(article['ticker'] + ': ' + article['title'])
+🐍 Python Notes:
+
+• Requires: pip install requests
+• Works with Python 3.6+
+################################################
+
+GET /articles/{ticker}
+Get press releases for a specific ticker
+
+Path Parameters
+ticker
+required
+Stock ticker symbol (e.g., AAPL, TSLA, MSFT)
+
+Query Parameters
+limit
+optional
+Number of articles to return (default: 50, max: 100)
+
+Response
+{
+  "count": 3,
+  "articles": [
+    {
+      "ticker": "AAPL",
+      "exchange": "NASDAQ",
+      "title": "Apple Announces Q4 Results",
+      "author": "Business Wire",
+      "created": "2025-07-28T16:30:00.000Z",
+      "article_body": "Apple Inc. announced financial results for its fiscal fourth quarter ended September 30, 2025..."
+    }
+  ]
+}
+Code Examples
+Get articles for AAPL
+
+Python
+import requests
+
+ticker = 'AAPL'
+url = f'https://api.rtpr.io/articles/{ticker}'
+headers = {'Authorization': 'Bearer YOUR_API_KEY'}
+
+response = requests.get(url, headers=headers)
+data = response.json()
+
+if data['count'] > 0:
+    print(f"Found {data['count']} articles for {ticker}")
+    
+    for article in data['articles']:
+        print('📰 ' + article['title'])
+        print('🕒 ' + article['created'])
+        print('✍️ ' + article['author'])
+        print('---')
+else:
+    print(f'No articles found for {ticker}')
+🐍 Python Notes:
+
+• Requires: pip install requests
+• Works with Python 3.6+
+• Simple and readable syntax
+Real-Time
+WebSocket API
+Get press releases pushed to you instantly via WebSocket. Sub-500ms latency from wire release to your application.
+
+##############################################################################################################################
+⚡ WebSocket Connection
+Connect to our real-time news stream for instant updates
+
+WebSocket URL
+wss://ws.rtpr.io
+
+Authentication
+Pass your API key as a query parameter when connecting:
+wss://ws.rtpr.io?apiKey=YOUR_API_KEY
+
+Connection Limits
+1 concurrent WebSocket connection per API key
+
+💡 Why WebSocket?
+• Sub-500ms latency — Articles delivered as they hit the wire
+• No polling — Server pushes articles to you instantly
+• Ticker subscriptions — Only receive articles for tickers you care about
+• Efficient — Single persistent connection, no repeated API calls
+
+🎯 Subscribing to Tickers
+Choose which tickers you want to receive articles for — no need to filter client-side
+How it works: After connecting, send a subscribe message with your desired tickers. You'll only receive articles that match your subscription. You can update your subscription anytime without reconnecting.
+
+Subscribe to Tickers
+Client → Server
+Send this message to specify which tickers you want to receive
+
+// Subscribe to specific tickers
+{
+  "action": "subscribe",
+  "tickers": ["AAPL", "TSLA", "NVDA", "MSFT"]
+}
+
+// Subscribe to ALL tickers (firehose mode)
+{
+  "action": "subscribe",
+  "tickers": ["*"]
+}
+subscribed
+Subscription Confirmed
+Server → Client
+Server confirms your subscription
+
+{
+  "type": "subscribed",
+  "tickers": ["AAPL", "TSLA", "NVDA", "MSFT"],
+  "message": "Subscribed to 4 tickers",
+  "timestamp": "2025-07-28T16:30:00.000Z"
+}
+unsubscribe
+Unsubscribe from Tickers
+Client → Server
+Remove specific tickers from your subscription
+
+// Unsubscribe from specific tickers
+{
+  "action": "unsubscribe",
+  "tickers": ["TSLA"]
+}
+
+// Unsubscribe from all (pause feed)
+{
+  "action": "unsubscribe",
+  "tickers": ["*"]
+}
+Common Subscription Patterns
+
+Watch a Watchlist
+{"action": "subscribe", "tickers": ["AAPL", "GOOGL", "MSFT", "AMZN"]}
+
+All News (Firehose)
+{"action": "subscribe", "tickers": ["*"]}
+
+Add a Ticker
+{"action": "subscribe", "tickers": ["NVDA"]} // adds to existing
+
+Pause Feed
+{"action": "unsubscribe", "tickers": ["*"]}
+
+
+📨 Message Types -- Messages you'll receive over the WebSocket connection
+
+connected -- Connection Confirmed
+Sent immediately after successful authentication. Send your subscription after receiving this.
+
+{
+  "type": "connected",
+  "message": "Connected to RTPR real-time feed",
+  "timestamp": "2025-07-28T16:30:00.000Z"
+}
+
+
+subscribed -- Subscription Confirmed
+Confirms your ticker subscription was successful
+
+{
+  "type": "subscribed",
+  "tickers": ["AAPL", "TSLA", "NVDA"],
+  "message": "Subscribed to 3 tickers",
+  "timestamp": "2025-07-28T16:30:00.000Z"
+}
+
+
+article -- New Article
+Pushed instantly when a new press release is published
+
+{
+  "type": "article",
+  "data": {
+    "id": "abc123",
+    "ticker": "AAPL",
+    "exchange": "NASDAQ",
+    "tickers": ["AAPL", "MSFT"],
+    "title": "Apple Announces Strategic Partnership",
+    "author": "Business Wire",
+    "created": "2025-07-28T16:30:00.000Z",
+    "article_body": "Apple Inc. today announced a strategic partnership..."
+  },
+  "timestamp": "2025-07-28T16:30:00.123Z",
+  "server_sent_at_ms": 1753718400123
+}
+
+
+ping -- Heartbeat
+Sent every 30 seconds to keep the connection alive. Respond with a pong message.
+
+{
+  "type": "ping",
+  "timestamp": "2025-07-28T16:30:30.000Z"
+}
+
+error -- Error
+Sent when an error occurs (authentication failure, rate limit, etc.)
+
+{
+  "type": "error",
+  "code": "AUTH_FAILED",
+  "message": "Invalid API key",
+  "timestamp": "2025-07-28T16:30:00.000Z"
+}
+
+
+💻 WebSocket Code Examples -- Connect to the real-time feed in your preferred language
+
+# Python WebSocket Example
+# pip install websockets
+
+import asyncio
+import websockets
+import json
+
+API_KEY = 'YOUR_API_KEY'
+WS_URL = f'wss://ws.rtpr.io?apiKey={API_KEY}'
+WATCHLIST = ['AAPL', 'TSLA', 'NVDA', 'MSFT']
+
+async def connect():
+    async with websockets.connect(WS_URL) as ws:
+        print('✅ Connected to RTPR real-time feed')
+        
+        async for message in ws:
+            data = json.loads(message)
+            
+            if data['type'] == 'connected':
+                print(f"🟢 {data['message']}")
+                # Subscribe to watchlist after connecting
+                await ws.send(json.dumps({
+                    'action': 'subscribe',
+                    'tickers': WATCHLIST
+                }))
+            
+            elif data['type'] == 'subscribed':
+                tickers = ', '.join(data['tickers'])
+                print(f"📋 Subscribed to: {tickers}")
+                
+            elif data['type'] == 'article':
+                article = data['data']
+                print(f"📰 NEW ARTICLE: {article['ticker']}")
+                print(f"   Title: {article['title']}")
+                print(f"   Source: {article['author']}")
+                print(f"   Time: {article['created']}")
+                
+                # Process the article
+                await process_article(article)
+                
+            elif data['type'] == 'ping':
+                # Respond to keep connection alive
+                await ws.send(json.dumps({'type': 'pong'}))
+                
+            elif data['type'] == 'error':
+                print(f"❌ Error: {data['message']}")
+
+async def process_article(article):
+    # Your trading logic here
+    print(f"🍎 Processing: {article['ticker']} - {article['title']}")
+
+async def main():
+    while True:
+        try:
+            await connect()
+        except websockets.ConnectionClosed:
+            print('🔌 Connection closed. Reconnecting in 5s...')
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f'❌ Error: {e}')
+            await asyncio.sleep(5)
+
+if __name__ == '__main__':
+    asyncio.run(main())
+    
+#####################       
+🎯 Best Practices -- Optimize your WebSocket integration for reliability and performance
+✅ Do
+• Implement reconnection logic — Connections can drop; auto-reconnect after 5s
+• Respond to ping messages — Send pong to keep connection alive
+• Process articles asynchronously — Don't block the message handler
+• Log connection events — Track connects, disconnects, and errors
+• Handle all message types — connected, article, ping, error
+❌ Don't
+• Open multiple connections — 1 connection per API key
+• Ignore ping messages — Connection will timeout after 90s
+• Block on article processing — You'll miss subsequent articles
+• Expose API key in client code — Use server-side connections for production
+• Reconnect immediately on close — Use exponential backoff
+
+⚖️ WebSocket vs REST API -- Choose the right approach for your use case
+Feature	WebSocket	REST API
+Latency	~50-500ms (real-time push)	Depends on poll frequency
+Best For	Real-time alerts	Dashboards
+Connection	Persistent (always connected)	On-demand (request/response)
+Complexity	Requires reconnection handling	Simple HTTP requests
+Rate Limits	Unlimited incoming messages	60 requests/minute
+💡 Recommendation: Use WebSocket for real-time trading applications where every millisecond counts. Use REST API for dashboards and on-demand queries. Note: articles are available for the last 24 hours.
+
+Error Responses -- Common error codes and their meanings
+
+400
+Bad Request
+Missing or invalid parameters
+
+401
+Unauthorized
+Invalid or missing API key. Ensure you include Authorization: Bearer YOUR_API_KEY
+
+403
+Forbidden
+Your free trial has expired. Upgrade to Pro at rtpr.io/dashboard
+
+429
+Too Many Requests
+Rate limit exceeded (60 requests per minute)
+
+500
+Internal Server Error
+Server error - please try again or contact support
+

@@ -1,0 +1,28 @@
+# --- Ignore everything by default ---
+*
+
+# --- but still descend into subdirectories so the allow-rules below can match ---
+!*/
+
+# --- track source / config / doc files anywhere in the tree ---
+!*.py
+!*.sh
+!*.txt
+!*.md
+!.gitignore
+
+# --- re-ignore large generated-data folders (they hold big .txt/.csv/.json dumps) ---
+trade_mole_outputs/
+mole-outputs/
+outputs/
+ibkr_data/
+tables/
+
+# --- always-ignore noise ---
+__pycache__/
+*.pyc
+.env
+venv/
+node_modules/
+.DS_Store
+*.log

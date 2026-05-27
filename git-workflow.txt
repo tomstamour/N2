@@ -1,0 +1,37 @@
+# ============================================================
+#  Git workflow cheat-sheet for the N2 project
+#  Repo: https://github.com/tomstamour/N2.git
+#  Only source code is tracked (.py .sh .txt .md). Data/model
+#  outputs are ignored via .gitignore -- do not force-add them.
+# ============================================================
+
+# --- 1. See what changed -------------------------------------
+git status                 # which files changed / are new
+git diff                   # exact line changes (not yet staged)
+
+# --- 2. Stage your changes -----------------------------------
+git add <file>             # stage one specific file
+git add -p                 # review and stage changes chunk-by-chunk (recommended)
+git add .                  # stage everything the .gitignore allows
+
+# --- 3. Commit (save a snapshot locally) ---------------------
+git commit -m "Short description of what you changed"
+
+# --- 4. Send to GitHub ---------------------------------------
+git push                   # upload commits to origin/main
+
+# --- 5. Pull other-machine changes first if needed -----------
+git pull                   # fetch + merge remote changes
+
+# ------------------------------------------------------------
+# Handy extras
+# ------------------------------------------------------------
+git log --oneline -10      # last 10 commits
+git diff --staged          # review what you're about to commit
+git restore <file>         # discard unstaged changes to a file
+git restore --staged <file># unstage a file (keep the edits)
+git checkout -b my-feature # start a new branch for an experiment
+
+# If you accidentally added a big data file:
+git rm --cached <file>     # stop tracking it (keeps it on disk)
+#   then add its folder/pattern to .gitignore and commit.

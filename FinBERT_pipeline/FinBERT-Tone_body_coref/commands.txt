@@ -1,0 +1,30 @@
+################### 
+
+# One-time ONNX export
+python FinBERT-tone/FinBERT-tone-analysis.py --export
+
+# Then run the pipeline
+python FinBERT-tone_body_coref.py --input ../jsons/BWEN-2026-05-12.json --output-dir ./outputs/
+
+
+python FinBERT-tone-origPpl_body_.py \
+--input ../jsons/BWEN-2026-05-12.json \
+--output-dir ./outputs/
+
+#########################################
+
+ Key differences from FinBERT-tone_body_coref.py VERSUS FinBERT-tone_body_coref.py                   
+
+  ┌──────────────────┬─────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────┐     
+  │                  │            _body_coref.py (existing)            │                     origPpl_body_.py (new)                     │     
+  ├──────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤     
+  │ Inference        │ ONNX INT8 via ORTModelForSequenceClassification │ transformers.pipeline("text-classification")                   │     
+  ├──────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤     
+  │ Preprocessing    │ clean → coref → split → NER                     │ spaCy sentence split only                                      │     
+  ├──────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤     
+  │ Entity targeting │ [TARGET]/[OTHER] substitution                   │ none — raw sentence                                            │     
+  ├──────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤     
+  │ Ticker source    │ SEC-EDGAR NER on article text                   │ ticker field from JSON                                         │     
+  ├──────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤     
+  │ Output files     │ 5 intermediate + source                         │ 2 files (_sentences.json, _FinBERT-tone-origPpl.json) + source │     
+  └──────────────────┴─────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────┘

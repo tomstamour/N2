@@ -1,0 +1,9 @@
+################### 
+
+python FinBERT_body_grepCoref.py \
+--input ../jsons/BWEN-2026-05-12.json \
+--strings-to-grep coreference_grep_strings.txt \
+--log-file outputs/ \
+--output-dir outputs/ \
+--sentences-to-analyse 30
+

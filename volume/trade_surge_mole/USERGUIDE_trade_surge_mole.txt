@@ -1,0 +1,170 @@
+How it works
+Three parallel subscriptions for maximum signal fidelity:
+Source  Purpose
+reqTickByTickData("AllLast")  Every trade print (including odd lots) — the primary signal for inter-trade timing
+reqTickByTickData("BidAsk")  Every NBBO change — lets us capture bid/ask/spread/microprice at each trade
+reqMktData(..., "233,236,293,294,295,318,375,165,221")  All your requested generic ticks + Misc Stats (165) + Mark Price (221)
+
+
+Hot-path design (minimal work in tickByTickAllLast):
+
+1-time.perf_counter() — monotonic microsecond timestamp
+2-Append to bounded deque (10-second cap), trim front
+3-One O(n) scan bucketing into all 6 windows simultaneously
+4-Surge rule check (three independent rules)
+5-Dict build + append to records list
+
+No locks, no pandas operations, no I/O in callbacks. DataFrame construction happens once at the end.
+
+Baseline source
+The historical baseline trade rate is supplied as a CLI input (--baseline-trade-per-second).
+It is computed externally from historical data and held constant for the run. The implied
+baseline avg inter-trade time is 1 / baseline_trade_rate. There is no in-session warmup —
+surge detection is live from the first trade.
+
+Surge detection — three independent rules
+
+Rule  Trigger What it catches
+A. Rate jump        trades_in_1s ≥ 2 AND rate_1s / hist_baseline ≥ 5×    Instant ignition
+B. Sustained burst  trades_in_5s ≥ 5 AND rate_5s / hist_baseline ≥ 3×    Slower-building surges
+C. ITI collapse     current inter_trade_time < 2s AND hist_baseline avg ITI > 10s    Dead-tape-to-live pattern (illiquid pre/post-hours microcaps)
+
+DataFrame columns (roughly 50+)
+
+Event metadata: event_type, local_arrival_iso, local_mono_time, exchange_time_iso, tick_type
+Trade payload: price, size, exchange, special_conditions, past_limit, unreported
+Quote snapshot at trade: bid, ask, bid_size, ask_size, spread, spread_pct, midprice, microprice
+Cumulative: cum_volume, cum_trade_count, cum_dollar_volume, vwap
+Timing: inter_trade_time_sec, session_age_sec
+Per window (1,2,3,4,5,10s): trades_in_Xs, volume_in_Xs, dollar_vol_in_Xs, trade_rate_Xs, avg_iti_Xs
+Historical baseline (constant per run): hist_baseline_trade_rate, hist_baseline_avg_iti
+Acceleration ratios: accel_1s_vs_10s, accel_5s_vs_10s, accel_1s_vs_hist_baseline, accel_5s_vs_hist_baseline, etc.
+Surge: surge_detected, surge_reason
+Status: halted, shortable, shortable_shares, mark_price, last_rth_trade
+TWS-smoothed comparators: tws_trade_rate_per_min, tws_volume_rate_per_min, tws_trade_count
+Raw RTVolume parse: rt_price, rt_size, rt_time_ms, rt_total_volume, rt_vwap, rt_single_trade_flag
+
+Usage
+bash# Paper TWS, auto-generated filename in ./data/
+python ibkr_trade_surge.py --symbol AAPL --clientID 7 --lifeTime 15:00 \
+    --output ./data/ --baseline-trade-per-second 5.0
+
+# Live IB Gateway, explicit filename, illiquid microcap baseline
+python ibkr_trade_surge.py --symbol SOFI --clientID 3 --lifeTime 05:00 \
+    --output /tmp/SOFI_premarket.txt --port 4001 --baseline-trade-per-second 0.05
+
+# Requires: pip install ibapi pandas
+
+Notes on the output filename
+I interpreted yyyy-hh-mm as YYYY-MM-DD_HH-MM (year-month-day_hour-minute) since year-hour-minute alone doesn't disambiguate dates. If you pass a directory to --output, the file is auto-named SYMBOL_YYYY-MM-DD_HH-MM.txt. If you pass a full path, it's used literally. Content is CSV-formatted regardless of the .txt extension.
+
+Things to watch for
+
+ClientID must be unique per TWS/Gateway connection. If another script is running on ID 7, this will error out silently or conflict.
+Pre-market/after-hours: IBKR delivers tickByTickAllLast in ETH, but expect long inter-trade gaps (30–120s baseline) on illiquid microcaps. Your three-rule logic handles this — supply a small --baseline-trade-per-second (e.g. 0.01–0.05) so Rules A/B fire correctly and the ITI-collapse rule reflects the true historical regime.
+Tick 236 (Shortable) updates infrequently; if the stock becomes SSR-restricted mid-session, that won't show here (SSR is a separate SIP indicator, not surfaced in Level 1).
+
+================================================================================
+COLUMN GLOSSARY
+================================================================================
+One-line definitions for every column emitted by the CSV.
+
+----- Event metadata -----
+
+event_type           Type of record: TRADE, QUOTE, TICK_PRICE, TICK_SIZE, TICK_GENERIC, or TICK_STRING.
+local_arrival_time   Unix timestamp (float seconds) when the event landed locally.
+local_arrival_iso    ISO-formatted local arrival time, millisecond precision.
+local_mono_time      time.perf_counter() value at local arrival; monotonic, microsecond resolution. Used internally for inter-trade timing; do not compare across runs.
+exchange_time_epoch  Unix epoch the exchange stamped on the event.
+exchange_time_iso    ISO form of exchange_time_epoch.
+tick_type            IBKR numeric tick type (e.g. 1=BID, 2=ASK, 37=MARK_PRICE, 48=RTVolume, 75=LAST_RTH_TRADE).
+rt_source            For RTVolume rows: "RTVolume" (tick 48) or "RTTradeVolume" (tick 77).
+
+----- Trade payload (TRADE rows) -----
+
+price                Trade execution price.
+size                 Shares traded in this print.
+exchange             Reporting exchange code.
+special_conditions   NYSE/Nasdaq trade condition codes (e.g. I = odd lot, T/U = pre/post hours).
+past_limit           True if the print landed outside the NBBO at print time.
+unreported           True if the print is excluded from the consolidated tape.
+
+----- Quote snapshot (embedded into each TRADE; full record on QUOTE rows) -----
+
+bid                  Most recent NBBO bid.
+ask                  Most recent NBBO ask.
+bid_size             Size at the NBBO bid.
+ask_size             Size at the NBBO ask.
+spread               ask − bid in dollars.
+spread_pct           spread / reference_price.
+midprice             (bid + ask) / 2.
+microprice           Stoikov microprice: (bid·ask_size + ask·bid_size) / (bid_size + ask_size). Weights by OPPOSITE-side size, so heavy ask pulls fair value toward the ask.
+bid_past_low         BidAsk attribute: True if bid set a new daily low.
+ask_past_high        BidAsk attribute: True if ask set a new daily high.
+
+----- Cumulative since session start -----
+
+cum_volume           Total shares traded.
+cum_trade_count      Total trade prints received.
+cum_dollar_volume    Sum of price × size.
+vwap                 VWAP as reported by IBKR via the RTVolume string.
+
+----- Timing -----
+
+inter_trade_time_sec Seconds between this trade and the previous one (None on the first trade).
+session_age_sec      Seconds since the first trade was received in this run.
+
+----- Per-window stats (X ∈ {1, 2, 3, 4, 5, 10}) -----
+
+trades_in_Xs         Trade prints in the last X seconds.
+volume_in_Xs         Shares traded in the last X seconds.
+dollar_vol_in_Xs     Dollar volume traded in the last X seconds.
+trade_rate_Xs        Trades per second in the last X seconds (= trades_in_Xs / X).
+avg_iti_Xs           Average inter-trade time in the last X seconds (= X / trades_in_Xs); None if no trades.
+
+----- Historical baseline (constant per run, set by --baseline-trade-per-second) -----
+
+hist_baseline_trade_rate   Externally supplied baseline trades/sec (CLI input value).
+hist_baseline_avg_iti      Implied avg seconds between trades at baseline (= 1 / hist_baseline_trade_rate).
+
+----- Acceleration ratios -----
+
+accel_1s_vs_10s            trade_rate_1s / trade_rate_10s — short-window rate vs. recent session rate (session-relative).
+accel_2s_vs_10s            trade_rate_2s / trade_rate_10s.
+accel_5s_vs_10s            trade_rate_5s / trade_rate_10s.
+accel_1s_vs_hist_baseline  trade_rate_1s / hist_baseline_trade_rate — instant rate vs. historical baseline (regime-relative; primary surge signal).
+accel_2s_vs_hist_baseline  trade_rate_2s / hist_baseline_trade_rate.
+accel_5s_vs_hist_baseline  trade_rate_5s / hist_baseline_trade_rate — sustained rate vs. historical baseline.
+
+----- Surge -----
+
+surge_detected       True if any of the three surge rules tripped on this trade.
+surge_reason         Pipe-delimited list of tripped rules (e.g. "rate_1s/hist_baseline=7.2x|iti_collapse:20.0s→0.45s").
+
+----- Market status -----
+
+halted               0 = trading, 1 = halted, 2 = halted by exchange order.
+shortable            Tick 46: 1 = unavailable, 2 = available, 3 = ample (>1000 shares).
+shortable_shares     Shares available to short.
+mark_price           TWS mark price (after-hours fair value).
+last_rth_trade       Last regular-hours trade price.
+
+----- TWS-smoothed comparators (slow-updating, for reference) -----
+
+tws_trade_rate_per_min   TWS-computed trades/minute.
+tws_volume_rate_per_min  TWS-computed shares/minute.
+tws_trade_count          Cumulative trade count from TWS (tick 54).
+
+----- Raw RTVolume parse (TICK_STRING with tick_type 48 or 77) -----
+
+rt_price             Last trade price from RTVolume string.
+rt_size              Last trade size from RTVolume.
+rt_time_ms           Trade time in ms since epoch.
+rt_total_volume      Cumulative volume per RTVolume.
+rt_vwap              VWAP per RTVolume.
+rt_single_trade_flag True if the RTVolume tick is a single discrete trade; False if aggregated.
+
+----- Catch-all -----
+
+value                Generic-tick value not extracted into a typed column.
+value_str            TICK_STRING value not parsed into typed columns.

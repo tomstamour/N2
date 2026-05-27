@@ -1,0 +1,6 @@
+highOfDay_addON_1.0.py — 2026-06-01
+1. ArrivalTime values are treated as UTC-4 (EDT); market close threshold is 16:00 ET (was incorrectly 20:00 UTC in the base version).
+2. For pre-market / intraday arrivals (< 16:00 ET), fetches the daily high of the same trading day only.
+3. For after-market arrivals (>= 16:00 ET), fetches both the same day and the next trading day via the new get_target_dates() function.
+4. DailyHigh(%) is computed independently for each fetched day; the higher value is written to the output along with its corresponding DailyHigh($).
+5. Caching and pacing are unchanged: each unique (symbol, date) pair triggers one IBKR request and one pacing sleep, so after-market rows may incur two sleeps if both dates are uncached.

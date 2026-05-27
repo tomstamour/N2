@@ -1,0 +1,51 @@
+# RTH baseline 09:30-10:00 (default)
+# pastWindows_ibkr_frequency_baseline.py uses "bars", not ticks, which can be less effective to estimate the trade frequency.
+python pastWindows_ibkr_frequency_baseline.py --symbol MARA --clientID 10
+
+# Pre-market baseline 07:00-09:30 (useRth=0 required)
+python pastWindows_ibkr_frequency_baseline.py --symbol MARA --clientID 10 \
+    --startTime "07:00:00" --endTime "09:30:00" --useRth 0
+
+# Save output
+python pastWindows_ibkr_frequency_baseline.py --symbol SOFI --clientID 10 \
+    --output ./baselines/SOFI_premarket.csv
+
+python pastWindows_trade_frequency_baseline.py --symbol CAST --clientID 712 \
+--on-trigger true --port 4001 --log ./logs/CAST.log
+######################################################################################
+# futureWindows_trade_frequency_baseline.py uses "bars" not ticks, which can be less effective tu estime the trade frequency.
+python futureWindows_trade_frequency_baseline.py \
+--symbol CAST \
+--clientID 777 \
+--days 10 \
+--on-trigger true \
+--port 4001 \
+--log ./logs/future_trade.log \
+--output ./outputs
+
+##
+python futureWindows_tick_trade_frequency_baseline.py \
+--symbol CAST \
+--ticks-quantity 10 \
+--days 10 \
+--clientID 900 \
+--on-trigger true \
+--port 4001 \
+--log ./logs/utureWindows_tick.log
+
+######################################################################################
+# The pre_trade_frequency_baseline.py script is fetching only the ticks before (single-block of ticks) the time specified or --on-trigger 
+
+python3 pre_trade_frequency_baseline.py --symbol MARA --clientID 21 --on-trigger true \
+--ticks-quantity 50 --cross-session true --port 4001 --log ./logs/preTrade_log.txt --output ./outputs
+
+python3 pre_trade_frequency_baseline.py --symbol MARA --clientID 22 \
+--startTime 04:00:05 \
+--date 2026-05-05 \
+--ticks-quantity 20 \
+--log ./logs/pre_trade.log \
+--output ./outputs \
+--cross-session true \
+--port 4001
+
+#####################################################################################

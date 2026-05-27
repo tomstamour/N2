@@ -1,0 +1,17 @@
+##### The script ./trade_mole.py uses a "baseline" as input for some calculations
+./trade_mole.py --symbol ERNA --clientID 444 --lifeTime 00:30 --output ./outputs --host 127.0.0.1 --port 4001
+
+#####
+# The script trade_mole_2.py does not use the baseline input value, the baseline script was launched too often at 04:00 and fetching unrepresentative trade frequency from the past trading cession.
+./trade_mole_2.py --symbol ERNA --clientID 444 --lifeTime 00:30 --output ./outputs --host 127.0.0.1 --port 4001 \
+--log-dir ./logs/
+
+
+####
+# The trade_mole_3.py script does not use ReqTickByTickData anymore, it use ReqMarketData which can get more clients simultanously.
+./trade_mole_3.py --symbol MTVA --clientID 1111 --lifeTime 01:00 --output outputs --log-dir logs --port 4001
+
+###
+# The ./trade_mole_4.py script is using a --baseline-iti input value for the calculations, it uses reqMktData only
+./trade_mole_4.py --symbol MTVA --clientID 1112 --lifeTime 01:00 \
+--output outputs --log-dir logs --port 4001 --baseline-iti 20.0

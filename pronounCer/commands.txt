@@ -1,0 +1,11 @@
+# Terminal 1:Start service ( we need to load the neuralcoref model (1- 3 seconds) prior to running the script)
+/home/tom/venv/bin/python3 pronounCer_service.py
+
+# Terminal 2: Run client
+# For full NeuralCoref
+python3 pronounCer.py --inputs MLEC_13-feb-2026_cleaned.json --mode full
+
+sudo lsof -i :5050
+
+# Or for low resolution:
+#python3 pronounCer.py --inputs FEED_28-jan-2026_cleaned.json

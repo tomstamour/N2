@@ -1,0 +1,10 @@
+I want you to create a new pipeline/script named FinBERT_body_pipeline.py that will also be usable as a library, the new script will use the "article_body" section of the json file (use the file AEHL-2026-05-08.json as example for dev purpose) and run the following script in a serialized order to endup running the FinBERT analysis and provide the sentiment scores for the article_body.
+
+Scripts to stream lime for the pipeline:
+1. /home/tom/Documents/ibkr_scripts/N2/scripts/jsonCleaner/jsonCleaner.py  
+2. /home/tom/Documents/ibkr_scripts/N2/scripts/pronounCer/pronounCer.py  
+3. /home/tom/Documents/ibkr_scripts/N2/scripts/SentenceSplitter/SentenceSplitter.py  
+4. /home/tom/Documents/ibkr_scripts/N2/scripts/NerSecDictionary/NerSecDicCreator.py  
+5. /home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT/FinBERT-analysis.py
+
+The output of each script will be passed as input to the next script in the pipeline, the intermediate outputs of each script/step have to be stored a cached objects and at the end of the pipeline run, all the objects have to be written to disk, have an option for path (use and create a directory named "finBERT_outputs"). All models that have to be loaded before running the script have to be loaded in the pipeline script. Use the AskUserQuestion tool to understand all my needs on that production.

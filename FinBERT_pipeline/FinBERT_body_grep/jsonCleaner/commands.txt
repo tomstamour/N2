@@ -1,0 +1,1 @@
+./jsonCleaner.py --input ../historicalNewsFetch/outputs/MLEC_13-feb-2026.json --parts-to-process 1 --log-dir logs/ --output ./MLEC_13-feb-2026_cleaned.json

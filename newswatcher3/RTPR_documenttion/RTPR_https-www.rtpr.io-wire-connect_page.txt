@@ -1,0 +1,89 @@
+This file contains the content of the web page: https://www.rtpr.io/wire/connect
+
+Connect
+Receive your filter-rule alerts in real time over a WebSocket. The same pipe powers the in-app Matches panel and your own programmatic integrations — one push per article, deduplicated per customer.
+
+============================================================================================
+Quick start · Python
+websockets
+Connects, prints alerts, auto-reconnects. Production-ready shape.
+
+import asyncio, json, websockets
+
+API_KEY = "<your api key>"
+WS_URL = "wss://ws.rtpr.io/ws-alerts?apiKey={API_KEY}"
+
+async def main():
+    # auto-reconnect loop — restarts on any disconnect
+    async for ws in websockets.connect(WS_URL, ping_interval=None):
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+
+                # REQUIRED: respond to server heartbeats or you will be
+                # disconnected with code 4002 after ~90 seconds of silence.
+                if msg.get("type") == "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                    continue
+
+                if msg.get("type") != "alert":
+                    continue  # skip connected/subscribed acks etc.
+
+                ticker = msg["ticker"]
+                rules  = ", ".join(r["rule_name"] for r in msg["rules"])
+                print(f"{ticker}: {rules} -> {msg['article_url']}")
+
+        except websockets.ConnectionClosed:
+            continue  # reconnect
+
+asyncio.run(main())
+
+
+=====================================================================================
+// ── Alert (your rule matched an article) ──────────────
+{
+  "type": "alert",
+  "ticker": "AAPL",
+  "rules": [
+    { "rule_name": "Apple guidance" },
+    { "rule_name": "Big tech FOMC" }
+  ],
+  "article_published_at": "2026-04-29T18:30:00Z",
+  "article_url": "https://rtpr.io/a/lseg_n123?exp=1777497120&sig=ab12..."
+}
+
+// ── Signed permalink behavior (single URL contract) ───
+// Always request article_url exactly as sent in the alert.
+// The exp/sig query params are a short-lived signed token
+// (hot window) to speed first fetches.
+//
+// curl -H "X-API-Key: YOUR_KEY" //   "https://rtpr.io/a/lseg_n123?exp=1777497120&sig=ab12..."
+//
+// After exp, use the SAME URL + your API key and the server
+// falls back to normal authenticated access (no URL switch).
+// If your key is omitted and token is expired, access is denied.
+//
+// Best practice: keep your HTTP connection warm (keep-alive).
+// Reusing one session/client is usually much faster than opening
+// a brand-new HTTPS connection for every article fetch.
+
+// ── Heartbeat (server → you, every 30 s) ──────────────
+{ "type": "ping", "timestamp": "2026-04-29T18:30:00.000Z" }
+
+// ── Heartbeat reply (you → server, required) ──────────
+{ "type": "pong" }
+
+// ── Connection confirmed ───────────────────────────────
+{ "type": "connected", "plan": "pro" }
+
+// ── Disconnect codes ───────────────────────────────────
+// 4002  Ping timeout — pong not received within 90 s
+// 4004  Trial expired
+// 4005  Connection revoked (plan changed / key rotated)
+// 4008  Send queue overflow (reconnect immediately)
+
+
+=========================================================================================================
+
+Show class-action / law-firm press releases
+By default we hide press releases from securities-class-action law firms (e.g. ROSEN, Schall, Pomerantz, Robbins Geller). They're typically not actionable for traders — the firm is soliciting plaintiffs, not announcing material company news. Turn this on if you want to see them in your live feed.

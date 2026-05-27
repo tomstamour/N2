@@ -1,0 +1,12 @@
+In the first version Orchestrator3.py the script was using the Trade frequency "baseline" script to pass the value to the trade_mole.py script
+
+In the version Orchestrator3.2.py the Body Finbert analysis is removed and the Exchange is outputed to the news dict.
+
+In the 3.5 version, the noCoref_FinBERT pipeline with Neutral sentences addon is implemented, but still it triggers the trade mole only based on headline sentiment score. **Falback to that version if any implementation of starting the IBKR Clients preward on start of Orch3 are not succeding, this version 3.5 does not do that and the Trade_mole is starting IBKR Client. Now uses trade_mole_4.1.py..
+
+In the 3.5.1 version, implementation of a trigger_conditions.txt input file that host the rules for triggering the trade mole. Also the trigger is now performed after the Body nocoref analysis is performed.
+
+
+In the version Orchestrator3.6.py tree Clients for ibapi were dedicated and threaded with 10 lines per client, each line dedicated to the Trade mole script. Unfortunately, this implementation made the Orchestrator3.6.py script jump from 600 lines of code to 1300 lines. I dont think this is sutainable and maintanable. The script trade_mole_4.2.py was created to mork with this version, it will not be used.
+
+The Orchestrator3.7.py is running each of the trade moles in a single Client, the clients are connected at start of the Orch, 10 clients are dedicated to trade moles. The script trade_mole_4.3.pywas created with this orch3.7 version to fit the design. Also, The clients and reqMktData are sent to client as soon as PR is received, then if the score sentiment is ok, then the trade mole is launched. It created a trade_mole_4.4 for the latest implementation..

@@ -1,0 +1,261 @@
+
+rtpr_official — 5/4/26, 5:05 PM
+@everyone Hey everyone,
+
+I have some news to share — some not great, but hopefully the workaround makes it manageable.
+
+After a review with our licensing provider, I've been informed that articles can only be displayed to end users directly — they can't be delivered through an API or WebSocket in raw form. Because of this, I'll be shutting down the direct article API and the article WebSocket at the end of the month.
+
+Here's the workaround I've built:
+
+Over the last two weeks I've completely revamped the product around this constraint. If you head to rtpr.io/wire and log in, you'll see the new live feed — articles show up in real time just like before, just behind the dashboard.
+
+For Pro users, the bigger addition is filter rules and a new alert WebSocket. You define the rules (ticker, keywords, sources, etc.), and when an article matches, a lightweight notification gets pushed to your WebSocket. That notification includes a URL pointing to the article. You can then curl that URL with your API key to pull the full article content — the whole round trip has been running about 100ms slower than the old direct flow in my own testing, though obviously that can vary.
+
+I know this isn't ideal and I genuinely appreciate your patience. Here's my offer: try the new filter + alert flow before the end of the month. If it doesn't work for your use case, reach out and I'll refund the prorated amount for this month — no questions asked.
+
+Happy to answer any questions here or in a DM.
+
+
+
+
+I'll be sending an email out to all users soon but you all are the most engaged so thought I would post it here first
+𝘾𝙮𝙗𝙚𝙧𝘽𝙡𝙞𝙩𝙯 — 5/4/26, 7:06 PM
+@rtpr_official with the rtpr wire, you can look up a stock and see all the press releases its got at the same speed as the api, right?
+rtpr_official — 5/4/26, 7:09 PM
+yeah, you can do a search and it has all the releases
+you can set a rule like any article that contains NASDAQ or NYSE (which would essentally be all of them) and the notifications would be pushed to your socket
+the pushes will be the same speed as before
+𝘾𝙮𝙗𝙚𝙧𝘽𝙡𝙞𝙩𝙯 — 5/4/26, 7:18 PM
+have i ever told you that im in love with you?
+as someone who cant code yet, this is exactly what i needed. top 10 things that i have bought instantly
+Sector — 5/4/26, 9:37 PM
+NOOOOOoooo
+lonelyOrca — 5/5/26, 12:43 AM
+😭😭😭
+Mart — 5/5/26, 6:56 AM
+Ok and what about articles formating, will the articles format provided by the URL be a unique format? Or if it mighth change regarding the wire source?
+lepaho [O₂NI],  — 5/5/26, 7:43 AM
+@rtpr_official will the lightweight notification contain at least the headline?
+lepaho [O₂NI],  — 5/5/26, 7:50 AM
+also, will we be able to programatically set the rules? my ticker universe changes on a daily basis and it would be nice to be able to call an API to set it
+i also see that the rules filter can only accept 50 comma separated tickers - do you plan to increase this limit?
+for me currently, the system as it is, is a show stopper
+rtpr_official — 5/5/26, 9:12 AM
+You can make more than one rule
+But I’ll look into increasing the limit
+Is curling the article the biggest issue?
+ [O₂NI], 
+1+1=10 — 5/5/26, 9:17 AM
+Regarding tickers, I think @rtpr_official is saying you can make a rule to scan the body for NYSE or NASDAQ which tends to appear in each press release -- e.g. (NASDAQ: APPL). If so, you would get a notification for every PR, and then you'd have to filter as before.
+lepaho [O₂NI],  — 5/5/26, 9:18 AM
+my daily routine is to set 200 - 300 tickers, which was up until now possible to do by subscribing to them all in one go, in code
+now i have to manually create at least 6 rules
+and manually modify them daily
+given that you can set rules in json format, maybe just add a post endpoint to set this programatically
+rtpr_official — 5/5/26, 9:20 AM
+The only difference in that case is you would have to curl the url for each article data. But you would have the tickets so in your case you can use your same filtering and curl for the ones you want
+ [O₂NI], 
+rtpr_official — 5/5/26, 9:20 AM
+I’m open to that
+But I don’t think it would make a huge difference in workflow
+lepaho [O₂NI],  — 5/5/26, 9:21 AM
+ideally there would be no limit to the number of tickers, this way the same rule could get updated every day
+
+
+
+ [O₂NI], 
+1+1=10 — 5/5/26, 9:21 AM
+Right, you get the notification, which is a small chunk of data, and then you filter by ticker in your code before you retrieve the article. 
+lepaho [O₂NI],  — 5/5/26, 9:23 AM
+but i won't get the notification if i don't define the list of tickers in the rule definition
+that's my issue
+rtpr_official — 5/5/26, 9:23 AM
+No
+You make one rule. Notify me on every article that contains either NASDAQ OR NYSE
+you then get notifications for every single article that comes in
+Basically same as before, just less payload data
+You filter for your tickers on your end
+If it matches then you curl the URL
+1+1=10 — 5/5/26, 9:27 AM
+@rtpr_official One thing that would help is if you describe how you extract the tickers in the first place. Do you only match based on symbol, so every release that you've sent included the (EXCHANGE: TICKER) format or do some just include (TICKER) or just company name, etc?
+Sector — 5/5/26, 9:33 AM
+what fields are in the notification payload????
+1+1=10 — 5/5/26, 9:36 AM
+The docs are updated: https://www.rtpr.io/docs
+
+Available fields:
+title, body, title_or_body — the article text
+ticker, tickers, tickers_length — the symbols mentioned
+exchange — NASDAQ, NYSE, OTC, etc.
+author — the wire source
+created — publish timestamp
+session — market session at publish time
+
+Common operators:
+contains, keyword — substring vs. whole-word match
+starts_with, ends_with, equals
+in, not_in — membership in a list
+gt, gte, lt, lte — numeric comparisons
+proximity — terms near each other
+numeric_match — currency / percentage / count thresholds
+Sector — 5/5/26, 9:36 AM
+thanks!
+ZuluJuliet — 5/5/26, 12:10 PM
+I implemented this change and not seeing any meaningful difference.  I'll be interested to see in the peak news hours tomorrow morning, but so far so good
+cartoad71 — 5/5/26, 1:34 PM
+Can anyone with 'All tickers' give me an estimate of how many alerts your system fields on a 'normal' day?  I mean are we talking 50 or 5000?  Thanks
+rtpr_official — 5/5/26, 3:45 PM
+very rough estimate is between 500 and 1000 articles in a day
+cartoad71 — 5/5/26, 7:05 PM
+Thank You!
+Arc — 5/5/26, 9:41 PM
+@rtpr_official
+is socket alr gone?
+rtpr_official — 5/5/26, 9:51 PM
+No
+Should be good
+End of the month
+HaigTrader [HYPE],  — 5/5/26, 10:37 PM
+@rtpr_official I tried the service but didn't subscribe. I was charged directly even though I didn't use it. Please refund me, thank you.
+@rtpr_official Please help me solve this problem. I just discovered that money is being automatically deducted from my bank card, which is terrible.
+@rtpr_official I have sent a feedback email.
+rtpr_official — 5/5/26, 10:38 PM
+Hi, I just got your email sent minutes ago
+HaigTrader [HYPE],  — 5/5/26, 10:39 PM
+@rtpr_official Thank you for your support.
+rtpr_official — 5/5/26, 10:39 PM
+You did sign up for a trial but never cancelled.  I think the wording is pretty clear.  That being said i'll refund your charges
+ [HYPE], 
+rtpr_official — 5/5/26, 10:40 PM
+done
+HaigTrader [HYPE],  — 5/5/26, 10:44 PM
+@rtpr_official We haven't officially integrated it yet; it's currently undergoing internal evaluation. Once the evaluation is passed, we plan to use it long-term. 
+@rtpr_official How long do I expect to receive the refund?
+Sector — 5/5/26, 10:46 PM
+holy spam
+Sector — 5/5/26, 11:16 PM
+@HaigTrader  why'd you unreact?
+speak with your chest pal
+HaigTrader [HYPE],  — 5/5/26, 11:18 PM
+I'm just reporting a problem here; an automatic deduction did occur. Can't I report it?
+rtpr_official — 5/5/26, 11:19 PM
+All payments are handled through stripe
+Their docs say 3-5 days on avg
+HaigTrader [HYPE],  — 5/5/26, 11:20 PM
+Thank you for your support.  👍
+ZuluJuliet — 5/6/26, 5:32 PM
+I've been playing around with the coming change to the RTPR service and I get heavily backlogged during peak news times now that I have to curl the URL.  Has anyone successfully integrated this change and able see similar results as before (and willing to share your technique)?
+rtpr_official — 5/6/26, 5:37 PM
+hey so i've been heavily working on improving the latency of the alerts-ws to make it more comparable to the firehose. I think i've made some progress there.  After that I'm going to see what if anything I can do about curl latency.  Most of my curls are adding about 200-300ms of overhead, which isn't bad but also isn't great
+lastly, there will be an "off the books" way to get live ws data also
+but i'm hoping to make things fast enough where it won't matter
+ZuluJuliet — 5/6/26, 5:56 PM
+ohh this is good to know!  Thanks for the effort on this!
+adyaa11 — 5/7/26, 2:57 PM
+Has anyone created  a latency report for the last 2 days with the new methodology? I am interested in knowing the latency during burst times
+rtpr_official — 5/7/26, 3:13 PM
+its not as good right now
+the diff combined with curl time i'd say is any where from 800-1200ms slower on avg
+
+
+Are you planning any improvements further?
+rtpr_official — 5/7/26, 3:15 PM
+yeah
+pretty much rewriting a large part of the back end from python to go
+its what I did the first time to make things faster but I didn't go all the way
+adyaa11 — 5/7/26, 3:16 PM
+Ok does switching to a different language like c++ help?
+rtpr_official — 5/7/26, 3:16 PM
+but its a long and tendious process to measure pretty much every function to find bottle necks and know what to convert
+go is basically an easier to use C++
+gets you 95% of the same speed but is much easier to work with
+adyaa11 — 5/7/26, 3:17 PM
+I mean on the backed!
+Backend*
+rtpr_official — 5/7/26, 3:17 PM
+oh like for your client?
+adyaa11 — 5/7/26, 3:18 PM
+No no, I meant on your side
+Also does it improve speed on my client side as well?
+rtpr_official — 5/7/26, 3:18 PM
+yeah i'm rewriting the backend to pretty much all be go
+i dont' really think it would make a huge diff in clients
+there is a lot of concurrency stuff that I have to do that a client doesn't have to worry about
+adyaa11 — 5/7/26, 3:20 PM
+Okk thanks
+Finally got my bot working, removed all latency bottlenecks for order placement, so It would be nice to have RTPR original speed, which was awesome
+rtpr_official — 5/7/26, 3:22 PM
+just keep using the old websocket for now
+i plan on having some compariable options by the time I switch it over
+the alerts one is moslty for new people that are joining, so they don't get hooked on that sweet sweet latency
+adyaa11 — 5/7/26, 3:31 PM
+Yh I understand. With the current websocket, it's beautiful to see my order get placed on ibkr TWS and then later TWS highlighting the bulletin for the same PR. It's absolutely amazing
+Sector — 5/7/26, 5:36 PM
+🫩
+What did your licence provider say even?
+rtpr_official — 5/7/26, 5:37 PM
+article data has to be displayed and can't be sent directly
+that means I can't send an artilce headline or body through a socket or an api
+Sector — 5/7/26, 5:56 PM
+why?
+Sector — 5/7/26, 5:56 PM
+copyright rules?
+rtpr_official — 5/7/26, 5:57 PM
+I dunno, these companies are ultra conservative
+I think there is a reason there isn't anything else really like this out
+Sector — 5/7/26, 5:57 PM
+its just too good
+i guess
+rtpr_official — 5/7/26, 5:58 PM
+I think they are mostly worried about redistribution
+much harder to control with direct pipes
+Sector — 5/7/26, 5:58 PM
+o that makes sense
+damn
+Arc — 5/8/26, 12:45 AM
+Sector — 5/18/26, 1:39 AM
+I think this server needs to change
+from now on the hierarchy should be based on everyones sharpe ratio
+https://www.instagram.com/p/DX7oRzzxauX/ watch this reel if you need to catch up
+Ritschi — 5/18/26, 7:23 AM
+whats your sharpe ratio
+Sector — 5/18/26, 7:24 AM
+5.82 and 7.22 on a good day
+Sector — 5/18/26, 7:25 AM
+What are we measuring next?
+Ritschi — 5/18/26, 7:27 AM
+alright alright sounds legit
+:DocSpin:
+Sector — 5/18/26, 7:35 AM
+25.34 if im feeling lucky tho
+Sector — 5/20/26, 10:45 AM
+Who’s watching SLS rn
+Been in it since $1.40
+cartoad71 — 5/20/26, 1:52 PM
+I got in orginally at 3:17 but then flipped them all to my Roth; I have about 11k at about 5$. Looking Good!
+Sector — 5/20/26, 2:13 PM
+nice
+adyaa11 — 5/22/26, 12:30 PM
+Anyone has done any latency report for the new methodology?
+Sector — 5/22/26, 1:40 PM
+pretty much the same as the original
+adyaa11 — 5/22/26, 2:04 PM
+Cool
+hbuddy99 — Yesterday at 8:15 PM
+Would we be allowed to store the press releases we stream through RTPR? Like could we store them in our own personal database? Or no
+thx
+cartoad71 — 5/7/26, 1:16 PM
+ok so the firehose gives me a url, I was hoping to scrape that- but getting error (can't scrape) and Perplexity says "Your HTML is from a Next.js app (rtpr.io) that uses React Server Components, and the body content is dynamically rendered by JavaScript—it's not in the initial HTML that BeautifulSoup parses. That's why h1 and prose div aren't found even though they appear in the page you're seeing in the browser".  idk if this is right, perplexity seems to kind of suck for this kind of work
+Any tips?
+rtpr_official — 5/7/26, 1:18 PM
+curl the url first, then parse what it returns
+are you using python?
+also i'd try using claude or chatgpt
+I feel like perplexity is kinda last in the AI wars
+cartoad71 — 5/7/26, 1:58 PM
+yeah I ran out of Claude credits so I asked Perp to fix it lol  Yeah, Python.  I was trying to use Web Socket for speed, I have to 'curl the url' instead?
+I will go over the support docs again
+Ok, curl the url from my Python script first?  I will tell my homeboy Claude 🙂
+rtpr_official — 5/7/26, 2:06 PM
+so the flow is create an alert  rule on rtpr.io/wire,  connect your websocket to listen for articles that come in to fit your rule,  Once one comes in, it will have an article_url attached to it, you can curl that url to get the actual article headline and body

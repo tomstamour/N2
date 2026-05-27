@@ -1,0 +1,8 @@
+################### 
+
+python FinBERT_body_coref.py \
+--input ../jsons/BWEN-2026-05-12.json \
+--log-file ./outputs/ \
+--output-dir ./outputs/ \
+--sentences-to-analyse 10
+

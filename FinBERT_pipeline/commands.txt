@@ -1,0 +1,22 @@
+################### --coref-mode full (default) → uses fastcoref for proper coreference resolution (resolves pronouns and phrases like "the company" → "AEHL")
+
+python FinBERT_body_noCoref.py \
+--input BWEN-2026-05-12.json \
+--log-file nocoref_outs/ \
+--output-dir nocoref_outs/ \
+--sentences-to-analyse 10
+
+
+python FinBERT_body_withCoref.py \
+--input BWEN-2026-05-12.json \
+--log-file coref_outs \
+--output-dir coref_outs \
+--sentences-to-analyse 10
+
+
+################### --coref-mode simple → uses spaCy-only PronounResolver (heuristic pronouns only, no fastcoref). Faster startup, lower-quality coreference — won't catch "the company" / "the firm" → entity name.
+#--no-write → skips writing all 5 JSON files to disk. Result is only kept in memory and returned by process(). Useful for
+  the WebSocket hot path or smoke-testing.
+
+python FinBERT_body_pipeline.py --input CLIK-2026-05-11.json --coref-mode simple
+

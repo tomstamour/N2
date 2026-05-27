@@ -1,0 +1,76 @@
+The Core Problem You Identified
+
+A sentence like "The company will hold its earnings call on Thursday." scores neutral at 0.95, but still contributes a small positive/negative residual to the mean. With 20+ sentences, those noise residuals drag the signal.
+Aggregation Strategies
+1. Neutral Filtering (simplest fix)
+
+Drop any sentence where the neutral score exceeds a threshold before averaging.
+python
+
+threshold = 0.85  # tune this
+
+scored = [(pos, neg, neu) for pos, neg, neu in sentence_scores]
+signal_sentences = [(pos, neg) for pos, neg, neu in scored if neu < threshold]
+
+# then average only pos and neg from the remaining
+
+This is the most common fix and addresses exactly what you're seeing. The risk is you throw away legitimately ambiguous sentences.
+2. Confidence-Weighted Mean
+
+Instead of equal-weight averaging, weight each sentence by 1 - neutral_score (i.e., how "opinionated" the model thinks it is):
+python
+
+weights = [1 - neu for pos, neg, neu in sentence_scores]
+weighted_pos = sum(p * w for (p, neg, neu), w in zip(sentence_scores, weights)) / sum(weights)
+weighted_neg = sum(n * w for (pos, n, neu), w in zip(sentence_scores, weights)) / sum(weights)
+
+This is elegant — sentences the model is confident are neutral contribute almost nothing, while high-conviction sentences dominate. No hard cutoff needed.
+3. Net Sentiment Score (continuous signal)
+
+Instead of averaging raw pos/neg separately, collapse to a single scalar:
+python
+
+net = pos_score - neg_score  # ranges from -1 to +1 per sentence
+
+Then aggregate (with or without neutral filtering/weighting). This gives you one number that's easier to threshold for trade signals.
+4. Max / Top-K Instead of Mean
+
+For PR catalyst trading specifically, the most bullish sentence may matter more than the average tone. A PR can be 80% boilerplate and contain one explosive sentence ("Revenue up 400% YoY"). Consider:
+python
+
+top_k_pos = sorted([pos for pos, neg, neu in scores], reverse=True)[:3]
+signal = mean(top_k_pos)
+
+This is actually well-suited to small-cap PR structure where the catalyst is usually 1–2 sentences buried in boilerplate.
+5. Positional Weighting
+
+Give more weight to early sentences (headline, first paragraph = highest signal density):
+python
+
+import numpy as np
+n = len(sentence_scores)
+weights = np.exp(-0.1 * np.arange(n))  # exponential decay
+# then weighted average
+
+Recommended Combination for Your Use Case
+
+Given you're doing PR catalyst trading (not earnings call tone analysis), I'd combine:
+
+    Neutral filter at ~0.85 to eliminate boilerplate
+    Confidence-weighted mean on the remaining sentences
+    Collapse to net score (pos - neg) for your threshold signal
+
+python
+
+def aggregate_finbert(sentence_scores, neutral_threshold=0.85):
+    signal = [(p, n, neu) for p, n, neu in sentence_scores if neu < neutral_threshold]
+    if not signal:
+        return 0.0  # all neutral = no signal
+    weights = [1 - neu for p, n, neu in signal]
+    total_w = sum(weights)
+    net = sum((p - n) * w for (p, n, neu), w in zip(signal, weights)) / total_w
+    return net  # -1 to +1
+
+This gives you a single float you can threshold (e.g., > 0.3 = bullish trigger) without noise from boilerplate neutral sentences dragging the score toward zero.
+
+

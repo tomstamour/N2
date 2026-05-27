@@ -1,0 +1,24 @@
+#######################################################################
+# xmole — run commands (use the venv python: it has ibapi)
+#######################################################################
+
+### 1. CLERK — warm client pool + trigger listener (start this first)
+/home/tom/venv/bin/python clerk-1.0.py --client-qty 5 --port 4001 --listen-port 8765
+
+### TRIGGER the clerk -> launches a trade-mole + x-wing duo on ONE shared client
+#   payload: ticker, lastDailyClose, itiBaseline
+echo '{"ticker":"YYGH","lastDailyClose":0.14,"itiBaseline":6.87}' | nc 127.0.0.1 8765
+echo '{"ticker":"ACTU","lastDailyClose":1.94,"itiBaseline":4361.87}' | nc 127.0.0.1 8765
+echo '{"ticker":"STAK","lastDailyClose":0.14,"itiBaseline":534.52}' | nc 127.0.0.1 8765
+
+
+
+### 2. TRADE-MOLE — standalone (its own IBKR connection)
+/home/tom/venv/bin/python trade-mole-2.0.py --symbol JWEL --clientID 1112 \
+  --lifeTime 01:00 --output mole-outputs --log-dir mole-logs --port 4001 --baseline-iti 44444.00
+
+
+### 3. X-WING — standalone (own connection; capital/account/limits/etc. hard-coded in script)
+/home/tom/venv/bin/python x-wing-2.0.py --symbol YYGH --last-close-price 0.15
+#   then FIRE the entry (manual buy-signal):
+pkill -USR1 -f "x-wing-2.0.py --symbol JWEL"

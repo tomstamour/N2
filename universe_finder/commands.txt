@@ -1,0 +1,15 @@
+python closing_price_fetch_addOn.py \
+--input-table data/nasdaq_symbols_data.tsv \
+--clientID 10 \
+--port 4001
+
+python3 trade_frequency_addOn.py \
+--input-table data/nasdaq_symbols_data_priced_2026-05-19_30_100rows.tsv \
+--past-days-lookback 5 \
+--clientID 12 \
+--log runs/freq.log
+
+
+####
+python3 pipeline_daily.py --max-float 50
+

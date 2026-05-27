@@ -1,0 +1,29 @@
+18:15:32.758 [INFO] --on-trigger=true: upper bound = NOW (18:15:32 ET)
+18:15:32.758 [INFO] Symbol=MARA  ticks_quantity=50  upper_bound=20260424 18:15:32 US/Eastern
+18:15:32.760 [INFO] sent startApi
+18:15:32.760 [INFO] REQUEST startApi {}
+18:15:32.760 [INFO] SENDING startApi b'\x00\x00\x00\t71\x002\x0021\x00\x00'
+18:15:32.761 [INFO] ANSWER connectAck {}
+18:15:32.762 [INFO] ANSWER managedAccounts {'accountsList': 'U18283054,U22541307,'}
+18:15:32.803 [INFO] REQUEST reqHistoricalTicks {'reqId': 5000, 'contract': 137433100135040: 0,MARA,STK,,0.0,,,SMART,NASDAQ,USD,,,False,,combo:, 'startDateTime': '', 'endDateTime': '20260424 18:15:32 US/Eastern', 'numberOfTicks': 50, 'whatToShow': 'TRADES', 'useRth': 0, 'ignoreSize': False, 'miscOptions': []}
+18:15:32.804 [INFO] SENDING reqHistoricalTicks b'\x00\x00\x00\\96\x005000\x000\x00MARA\x00STK\x00\x000.0\x00\x00\x00SMART\x00NASDAQ\x00USD\x00\x00\x000\x00\x0020260424 18:15:32 US/Eastern\x0050\x00TRADES\x000\x000\x00\x00'
+18:15:32.872 [INFO] Tick fetch complete: 50 ticks in 69 ms
+18:15:32.873 [INFO] disconnecting
+18:15:32.873 [INFO] ANSWER connectionClosed {}
+
+==========================================================================
+  Pre-trigger trade-frequency baseline  |  MARA  |  ending @ 20260424 18:15:32 US/Eastern
+==========================================================================
+symbol                   window_end  n_ticks first_tick_ts last_tick_ts  span_sec  iti_mean_sec  iti_median_sec  iti_min_sec  iti_max_sec  trades_per_sec  trades_per_min  total_volume  avg_price
+  MARA 20260424 18:15:32 US/Eastern       50      17:48:59     18:15:13      1574     32.122449               1            0          247        0.031766        1.905972       43881.0  11.675242
+
+  Total wall time: 269 ms  (single reqHistoricalTicks request, 50 ticks requested)
+
+──────────────────────────────────────────────────────────────────────────
+  Plug these into ibkr_trade_surge.py:
+    SURGE_PRIOR_ITI_MIN = 32.1   # baseline avg seconds between trades
+    # A surge fires when live ITI < 2s AND baseline was > 32.1s
+    # Baseline rate: 1.9 trades/min → surge threshold: 10+ trades/min
+──────────────────────────────────────────────────────────────────────────
+
+18:15:33.086 [INFO] Saved -> ./outputs/MARA_pre_2026-04-24_18-15.csv

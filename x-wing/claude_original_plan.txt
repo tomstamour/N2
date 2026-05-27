@@ -1,0 +1,166 @@
+Here is Claude's plan:                                                                                                                                                                                                                                        
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌                                                                                                                                
+ Plan: X-wing-1.0.py — yield-laddered trailing-stop trader (IBKR / ibapi)                                                                                                                                                                                      
+                                                                                                                                                                                                                                                               
+ Context                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                               
+ Tom needs a standalone script that takes a long position on a single ticker and protects it with a                                                                                                                                                            
+ yield-laddered trailing stop whose tightness is driven by an external lookup table. It must run on                                                                                                                                                            
+ ≥10 symbols simultaneously (one process per symbol), so it must avoid reqTickByTickData                                                                                                                                                                       
+ (capped at ~3 concurrent requests) and must never use the account-wide reqGlobalCancel. Order                                                                                                                                                                 
+ changes must be modifications (replace), never cancel-and-resubmit, to minimise latency. The stop                                                                                                                                                             
+ must stay valid in both ETH and RTH, and the position must survive a script/connection crash.                                                                                                                                                                 
+                                                                                                                                                                                                                                                               
+ This is a new file: /home/tom/Documents/ibkr_scripts/N2/scripts/x-wing/X-wing-1.0.py.                                                                                                                                                                         
+ The directory currently holds only x-wing-prompt.txt and example-yield_vs-stopLimits.tsv.                                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+ Decisions locked in with the user (Q&A)                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                               
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┐                                                                                                                                    
+ │                Topic                 │                                    Decision                                     │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ --limit-entry-prc vs                 │ Duplicate → drop --limit-entry-prc, keep --Entry-limit-price                    │                                                                                                                                    
+ │ --Entry-limit-price                  │                                                                                 │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Position size                        │ --capital (dollar budget); shares = floor(capital / Entry-limit-price)          │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Limits-table values                  │ Use Yield (%), Trigger(%), Limit(%) (ignore the illustrative                    │                                                                                                                                    
+ │                                      │ auxPrice($)/lmtPrice($) cols)                                                   │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Stop mechanism                       │ Synthetic in-script trigger logic (ETH+RTH valid), backed by a real             │                                                                                                                                    
+ │                                      │ broker-resident order                                                           │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Clients per instance                 │ 2 — one for orders, one for market data                                         │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Market data                          │ Streaming L1 reqMktData(snapshot=False), sampled every 1 s (NOT TickByTick)     │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Termination                          │ --lifetime / session-end, then close position with a SELL LMT @ the ASK         │                                                                                                                                    
+ ├──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤                                                                                                                                    
+ │ Shutdown / crash safety              │ Maintain a broker-side SELL STP LMT net so the position is protected if the     │                                                                                                                                    
+ │                                      │ script dies                                                                     │                                                                                                                                    
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┘                                                                                                                                    
+                                                                                                                                                                                                                                                               
+ Limits-table semantics (verified against example-yield_vs-stopLimits.tsv)                                                                                                                                                                                     
+
+ Columns used: Yield (%), Trigger(%), Limit(%).
+
+ - Row selection (banded): pick the row with the highest Yield (%) ≤ current yield. Yield below
+ the first threshold → use the first row (the 0 row = break-even / loss floor).
+ - Price formula (verified: fill=10 → row0 gives 9.90/9.85; +20% → mid≈12 → 10.92/10.80):
+   - auxPrice  = current_mid × (1 − Trigger(%)/100)  ← stop trigger
+   - lmtPrice  = current_mid × (1 − Limit(%)/100)    ← stop limit
+   - Round to the contract min-tick (default 0.01; sub-$1 → 0.0001 via contractDetails.minTick).
+- Yield = (current_mid − original_avg_fill) / original_avg_fill × 100, where current_mid is the
+ live BID/ASK midpoint and original_avg_fill is the first entry's avg fill, frozen and reused
+ across all re-entries (per spec step 6).
+
+ CLI arguments (argparse, repo convention)
+
+ --symbol               str    required   ticker, e.g. AAPL
+ --Entry-limit-price    float  required   buy limit price (step 1)
+ --capital              float  required   dollar budget → shares = floor(capital / Entry-limit-price)
+ --input-limits-table   path   required   TSV: Yield (%), Trigger(%), Limit(%)
+ --log-dir              path   required   log destination
+ --price-action-table   path   optional   dir or file; default = <log-dir>; auto-name below
+ --lifetime             mm:ss  optional   run duration; on expiry → flatten @ ask
+ --session-end          HH:MM  optional   ET session-close auto-flatten (off by default)
+ --client-id-base       int    default 10000   instance uses base (orders) & base+1 (data)
+ --host                 str    default 127.0.0.1
+ --port                 int    default 4002     (4001 live GW / 7497 paper TWS / 7496 live TWS)
+ --loglevel             str    default INFO
+
+ - --price-action-table auto-name (literal format requested): x-wing-table-{symbol}-{MM}-{HH}-{DD}-{YYYY}.tsv
+ (month-hour-day-year). If a full file path is given, use as-is.
+ - Client IDs: 2 per instance. Instance N launched with --client-id-base = 10000 + 2·N →
+ global sequence 10000, 10001, 10002, … exactly as requested. A launch wrapper increments by 2.
+
+ Architecture                                                  
+
+ Two combined EClient+EWrapper objects (repo "single-class" pattern), each on its own daemon
+ thread running .run(), both feeding a shared XWingController guarded by a threading.Lock:
+
+ - OrderClient (clientId = base): reqContractDetails (resolve + minTick), nextValidId,
+ placeOrder/modify, orderStatus, openOrder, execDetails. Owns order-ID allocation, filled
+ qty, avg fill price, and the protective-order lifecycle.
+ - DataClient (clientId = base+1): one reqMktData(snapshot=False) for the symbol; tickPrice
+ maintains latest BID(1)/ASK(2)/LAST(4)/CLOSE(9). Exposes latest_mid().
+
+ The main thread runs a 1 Hz control loop (the brain). Contract: STK / SMART / USD,
+ primaryExchange from contractDetails. Orders: outsideRth=True, tif="GTC",
+ eTradeOnly=False, firmQuoteOnly=False, transmit=True.
+
+ Per-second control loop (phases)
+
+ 1. mid = DataClient.latest_mid(). Fallback: bid/ask invalid (−1) → use LAST; none → hold previous + warn.
+ 2. ENTRY: place BUY LMT @ --Entry-limit-price, qty = floor(capital/entry), once at startup.
+ 3. On (partial) fill (orderStatus/execDetails): set/raise running avg_fill; arm the protective
+ order sized to current filled qty; freeze original_avg_fill when the buy reaches Filled.
+ 4. LONG_MONITOR: compute yield → banded row → aux/lmt. Replace (same orderId, never
+ cancel) the resting protective SELL STP LMT with new aux/lmt and qty = current position.
+ 5. Stop handling (synthetic + broker net unified into ONE order):
+   - RTH: the resting STP LMT triggers natively.
+   - ETH (native stop unreliable): when mid ≤ aux, replace the protective order into a
+ marketable SELL LMT @ ask to force the exit. → single order throughout = no oversell.
+   - Step 5 of spec: if the stop price is hit but the limit doesn't fill, leave the order resting;
+ do not end the script.                                        
+6. RE_ENTRY (spec step 6): when the protective sell fully fills (position→0) and not terminating,                                                                                                                                            21:58:53 [14/269]
+ place a new BUY LMT @ the sell fill price, qty = shares stopped out. On fill, re-arm the
+ protective order using the table and the original avg_fill (yield reference unchanged).
+ 7. Append one row to the price-action TSV; emit one human-readable log line.
+
+ Termination & shutdown                                        
+
+ - Planned (lifetime / session-end reached, or SIGINT/SIGTERM): if a long is open, replace the
+ protective order into a SELL LMT @ ask to flatten; best-effort wait for fill.
+ - Crash / connection death: the broker-resident STP LMT already rests at the broker → position
+ stays protected (this is why we keep a real order, not a purely virtual stop).
+ - NEVER call reqGlobalCancel — it would cancel orders for all 10 instances on the shared
+ account. Use only targeted modify/cancel on this instance's own orderIds.
+ - cancelMktData on DataClient, then disconnect() both clients and join(timeout=5) both threads.
+ - cancelMktData on DataClient, then disconnect() both clients and join(timeout=5) both threads.
+ - Signal handlers (SIGINT/SIGTERM) set a stop-event the main loop drains for a clean exit.
+
+ Logging & price-action table
+
+ - Log (logging, file in --log-dir named x-wing-{symbol}-{YYYY-MM-DD}.log + console),
+ format %(asctime)s - %(levelname)s - %(message)s. Human-scannable line, e.g.:
+ 12:05:31 NVDA | mid=10.53 yld=+5.3% | row(5%) trig4%/lim4.5% | STOP aux=10.11 lmt=10.06 (replaced) | pos=100 @avg10.00
+ - Price-action TSV (csv.DictWriter, tab-delimited, header once) columns:
+ timestamp, symbol, phase, bid, ask, mid, orig_avg_fill, filled_qty, position, yield_pct,  row_yield_threshold, trigger_pct, limit_pct, aux_price, lmt_price, protective_order_id,  protective_status, event
+ where phase ∈ {ENTRY_PENDING, ENTRY_PARTIAL, LONG_MONITOR, STOP_TRIGGERED, RE_ENTRY_PENDING, FLATTEN, SHUTDOWN}.
+
+ Patterns to reuse (don't reinvent)
+
+ - Connect / nextValidId / disconnect / orderStatus+avgFillPrice tracking:
+ /home/tom/Documents/ibkr_scripts/et_bot/IBConnector.py (lines 168–200, 104–117, 289–324).
+ ⚠ It calls reqGlobalCancel on disconnect — we deliberately omit that here.
+ - Multi-connection / per-clientId daemon-thread .run():
+ /home/tom/Documents/ibkr_scripts/N2/scripts/volume/trade_frequency_baseline/futureWindows_tick_trade_frequency_baseline.py.
+ - argparse + custom mm:ss type: …/volume/trade_surge_mole/trade_mole.py (parse_lifetime).
+ - TSV read (pandas) / TSV append (csv.DictWriter + lock): JsonFiles2Table.py, Orchestrator3.py.
+
+ Risks / caveats to validate during build
+
+ 1. Modifying a live order's type (STP LMT → LMT) via same orderId may be rejected by IBKR. The
+ ETH-trigger and flatten paths rely on this. Fallback (tested): if the modify is rejected, do a
+ single targeted cancel + new SELL LMT for this order only (the latency cost applies only to the
+ rare exit event, never to routine trailing updates).
+ 2. --port defaults to paper (4002) for safety; live trading requires an explicit override.
+ 3. Tick rounding off contractDetails.minTick to avoid order rejects on sub-$1 symbols.
+ 4. ETH liquidity: SELL LMT @ ask may sit unfilled in thin pre/post-market — logged, not retried (spec step 5).
+
+ Verification
+
+ 1. Static: python -c "import ibapi" present; python X-wing-1.0.py --help shows all args.
+ 2. Table unit-check: standalone assert that fill=10.00 → row0 aux/lmt = 9.90/9.85 and mid=12.00
+ (+20%) → 10.92/10.80, matching example-yield_vs-stopLimits.tsv.
+ 3. Paper end-to-end (port 4002): run on one liquid symbol with small --capital and a short
+ --lifetime; confirm in the log/TSV: buy fills → protective STP LMT armed → trails up as price
+ rises (replaced, orderId stable) → lifetime expiry flattens @ ask → both clients disconnect.
+ 4. Re-entry: force a stop-out on paper (tight table) → confirm re-buy @ stop fill price and stop
+ re-arm against the original avg fill.
+ 5. Concurrency: launch 3 instances (--client-id-base 10000/10002/10004) → confirm independent
+ operation and that shutting one down does not touch the others' orders (no reqGlobalCancel).
+6. Crash safety: kill -9 one instance with an open long → confirm the broker-side STP LMT
+ remains resting in TWS.
+

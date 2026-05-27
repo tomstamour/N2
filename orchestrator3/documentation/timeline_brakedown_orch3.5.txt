@@ -1,0 +1,41 @@
+ have both files already from the system context. Let me analyze the timeline directly.                                                                                          
+                                                                                                                                                                                    
+  ---                                                                                      
+  PRZO Timeline — 2026-05-29
+
+  Key timestamps extracted                                                                 
+
+  ┌───────────────────────────────────────────┬──────────────┬────────────────────────┐    
+  │                   Event                   │  Timestamp   │ Delta from ArrivalTime │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ PR ArrivalTime                            │ 07:30:03.627 │ 0                      │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ FinBERT completed                         │ 07:30:03.652 │ +25 ms                 │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ NoCoref completed                         │ 07:30:05.312 │ +1.685 s               │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ Trade mole spawned (log file open)        │ 07:30:04.289 │ +662 ms                │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ IBKR connection established               │ 07:30:04.529 │ +902 ms                │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ Market data subscription sent             │ 07:30:04.531 │ +904 ms                │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ First IBKR data response (marketDataType) │ 07:30:05.605 │ +1.978 s               │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ tickReqParams received                    │ 07:30:05.645 │ +2.018 s               │    
+  ├───────────────────────────────────────────┼──────────────┼────────────────────────┤    
+  │ First status line (events=326 already)    │ 07:30:33.535 │ +30 s                  │    
+  └───────────────────────────────────────────┴──────────────┴────────────────────────┘    
+
+  ---                                                                                      
+  Answer to your main question                                                             
+
+  From PR arrival to first data received by trade_mole: ~1.978 seconds.                    
+
+  Breakdown:                                                                               
+  - 662 ms — orchestrator processing (FinBERT → trigger evaluation → subprocess spawn)     
+  - 240 ms — TCP handshake + IBKR startApi/connectAck                                      
+  - ~1.07 s — IBKR server-side latency to deliver the marketDataType acknowledgment        
+
+  One notable observation: the trade mole was spawned at 07:30:04.289 — before NoCoref completed at 07:30:05.312. This means the trigger was evaluated off the headline FinBERT       
+  score alone (sentiment_score=0.8659), and NoCoref ran concurrently or was written to the TSV row afterward

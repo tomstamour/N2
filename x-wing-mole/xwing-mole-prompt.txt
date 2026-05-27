@@ -1,0 +1,40 @@
+I want yout to prepare a plan for an implementation that will combine 3 scripts, use the ultraplan and the AskUserQuestion tool to deeply understand my needs and challenge me on the details of that implementation.
+
+Script-1: X-wing-1.0.py (to refactor as a new version named x-wing-2.0.py)
+
+
+Script-2: trade_mole_4.1.py (to refactor as a new version named trade-mole-2.0.py)
+
+
+Script-3: clerk-1.0.py (to create from scratch)
+
+
+THE GOAL
+Now the scripts X-wing-1.0.py and trade_mole_4.1.py were developped separately, we now want them to interact with each other but to stay two seperate script I could keep working on, develop and test separately. The trade-mole is now logging/connecting to its hown IBKR/ibapi client to fetch/stream/collect market data, and the x-wing is doing the same (normaly). I want now that the x-wing will pass/share its reqMktdata strean to the trade-mole script and use the same client ibapi connection (this will save clients so I can connect more clients at the same time). And now the trade-mole, once triggered, will send the "buy-signal" to the x-wing script, which will start the x-wing functionnalities to place the orders it is already designed for. The role of the clerk-1.0.py will be to take all the inputs for all of both scripts and send them to the scripts. The Clerk will also be permanently connected to IBKR Clients, waiting for a trigger, at startup the clerk will recieve --client-qty <integer> (The number of ibapi clients to have connected ready to send the reqMktdata request for a ticker, use the clientsID 1000 to 1029). One a Client finisehd a job, keep it connected for a next trigger. On the "orch-trigger", the clerk-1.0.py script will be asked to use one of the pre connected clients (and determine which clients are available), with the orch-trigger signal will be passed the following inputs: ticker, lastDailyClose value, ITI_baseline value.
+
+This triggering of the Clerk will launch both the trade-mole and the x-wing scripts in parallel (to run together but using the same IBKR Client). The Trade-mole will recieve from the clerk script the input values: ticker and ITI_baseline (let me know if I forgot some inputs needed). The x-wing will receive from the clerk script the input values:ticker, lastDailyClose value
+
+The x-wing will not receive the following inputs from the clerk (they will be defined in the xwing script, make sure the variables are in the first lines of the script):
+--capital <>
+--account U18283054
+--input-limits-table example-yield_vs-stopLimits.tsv \
+--log-dir logs (make sure the logs have the format: wxing_date_time.log)
+--price-action-table xwing_tables (make sure the outputs have the format: wxing-table_date_time.tsv)
+--lifetime 00:15 \
+--port 4001 \
+--prewarm (this option migth be obsolete)
+--max-limit-entry-percent-price 0 \
+--max-cap-entry-percent 20 \
+--last-close-price 2.35 \
+--exit-cross-percent 0.025 (I think this option was used to set a second Buy Order after the stop limit as ben filled, remove this functionnality, if the Stop Limit is filled, dont enter again on the position)
+
+The trade-mole script will not recieve these inputs from the Clerk script:
+--lifeTime 01:00
+--output outputs (make sure the logs have the format: trade-mole-table_date_time.csv)
+--log-dir logs (make sure the logs have the format: trade-mole_date_time.log)
+--baseline-iti 44444.00 (this is only when the Clerk as no value to pass as ITI baseline)
+
+
+So when the trade-mole script will be triggered it will start the x-wing orders, there should not be the need to perform the reqMktdata by the x-wing since it was already done to feed the trade-mole with the reqMktdata. Also, on trigger of the trade-mole, the trade-mole will past the last Ask price to the x-wing to place the first Buy Limit Order.
+The trade-mole can stop recording the data after it was trigerred. The xwing can be disconnected once the Sell Stop Limit Order was filled. Then the Clerk will reconnect the client and be ready to send a new x-wing + trade-mole duo.
+
