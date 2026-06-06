@@ -77,7 +77,7 @@ logger = logging.getLogger("x-wing")
 # --------------------------------------------------------------------------- #
 CAPITAL                       = 0.50            # dollar budget per trade
 ACCOUNT                       = "U18283054"     # IBKR account for every order
-INPUT_LIMITS_TABLE            = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/yield-triggerLimit-data/example-yield_vs-stopLimits.tsv"
+INPUT_LIMITS_TABLE            = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/yield-triggerLimit-data/v2-smoothed-yield_vs-stopLimits.tsv"
 LOG_DIR                       = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/xwing-logs"          # xwing_<symbol>_<date>_<time>.log
 PRICE_ACTION_TABLE_DIR        = "xwing_tables"  # xwing-table_<symbol>_<date>_<time>.tsv
 LIFETIME                      = "01:00"         # mm:ss; starts at the buy-signal

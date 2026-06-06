@@ -108,6 +108,7 @@ DEFAULT_SURGE_MAX_SPREAD_PCT = 0.02      # 2% of price
 DEFAULT_SURGE_MIN_LIFT_RATIO = 0.55      # ≥55% buyer-initiated in 5s
 DEFAULT_SURGE_MIN_BID_DRIFT_BP = 0.0     # bid must be non-falling over 5s
 DEFAULT_SURGE_MIN_TRADES_5S = 5          # absolute floor
+DEFAULT_SURGE_MAX_PRICE_DROP_PCT = 0.005  # block if last price is >0.5% below session-start price
 
 # Legacy thresholds kept ONLY so the column schema remains stable; they
 # do not gate the new composite surge rule.
@@ -239,6 +240,7 @@ class IBKRSurgeApp(EWrapper, EClient):
         surge_min_lift_ratio: float,
         surge_min_bid_drift_bp: float,
         surge_min_trades_5s: int,
+        surge_max_price_drop_pct: float = DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
         logger: Optional[logging.Logger] = None,
     ):
         EClient.__init__(self, wrapper=self)
@@ -258,12 +260,15 @@ class IBKRSurgeApp(EWrapper, EClient):
         self._surge_min_lift_ratio = surge_min_lift_ratio
         self._surge_min_bid_drift_bp = surge_min_bid_drift_bp
         self._surge_min_trades_5s = surge_min_trades_5s
+        self._surge_max_price_drop_pct = surge_max_price_drop_pct
 
         # Request IDs
         self.req_id_mkt = 1001
 
         # Live state
         self._session_start_mono: Optional[float] = None
+        self._start_price: Optional[float] = None       # first-trade price = session anchor
+        self._last_trade_price: Optional[float] = None  # most recent executed trade price
         self._last_trade_mono: Optional[float] = None
         self._last_bid: Optional[float] = None
         self._last_ask: Optional[float] = None
@@ -376,6 +381,8 @@ class IBKRSurgeApp(EWrapper, EClient):
             return
         if self._session_start_mono is None:
             self._session_start_mono = now_mono
+            self._start_price = price       # anchor = first trade price of the session
+        self._last_trade_price = price
 
         # Inter-trade time
         iti = None
@@ -456,6 +463,9 @@ class IBKRSurgeApp(EWrapper, EClient):
             "tws_trade_rate_per_min": self._tws_trade_rate,
             "tws_volume_rate_per_min": self._tws_volume_rate,
             "tws_trade_count": self._tws_trade_count,
+            "price_change_since_start_pct": (
+                (price - self._start_price) / self._start_price if self._start_price else None
+            ),
             "surge_detected": surge,
             "surge_reason": reason,
         }
@@ -713,6 +723,8 @@ class IBKRSurgeApp(EWrapper, EClient):
           - lift_offer_ratio_5s >= --surge-min-lift-ratio
           - bid_drift_5s_bp >= --surge-min-bid-drift-bp
           - trades_in_5s >= --surge-min-trades-5s
+          - last price is NOT more than --surge-max-price-drop-pct below the
+            session-start price (i.e. not in a net selloff since start)
         """
         reasons = []
         sp = self._spread_pct(self._last_bid) if self._last_bid else None
@@ -729,12 +741,24 @@ class IBKRSurgeApp(EWrapper, EClient):
         bid_drift = w.get("bid_drift_5s_bp")
         cond_drift = bid_drift is not None and bid_drift >= self._surge_min_bid_drift_bp
 
-        if cond_trades and cond_dollar and cond_spread and cond_lift and cond_drift:
+        # Block entries on a net selloff since the session started. Fail-open if
+        # the anchor isn't set yet (should not happen: should_fire is only
+        # reached from inside a trade event, after _start_price is set).
+        price_chg = None
+        cond_not_selloff = True
+        if self._start_price and self._last_trade_price:
+            price_chg = (self._last_trade_price - self._start_price) / self._start_price
+            cond_not_selloff = price_chg >= -self._surge_max_price_drop_pct
+
+        if (cond_trades and cond_dollar and cond_spread and cond_lift
+                and cond_drift and cond_not_selloff):
+            px_chg_str = f"|px_chg={price_chg*100:.2f}%" if price_chg is not None else ""
             reasons.append(
                 f"$rate_5s={w['dollar_rate_5s']:.0f}|"
                 f"sp={sp:.3f}|"
                 f"lift={lift:.2f}|"
                 f"bid_drift={bid_drift:.0f}bp"
+                f"{px_chg_str}"
             )
         return (len(reasons) > 0, "|".join(reasons))
 
@@ -942,6 +966,7 @@ def build_column_order() -> list:
         "hist_baseline_trade_rate", "hist_baseline_avg_iti",
         "accel_1s_vs_10s", "accel_2s_vs_10s", "accel_5s_vs_10s",
         "accel_1s_vs_hist_baseline", "accel_2s_vs_hist_baseline", "accel_5s_vs_hist_baseline",
+        "price_change_since_start_pct",
         "surge_detected", "surge_reason",
         "halted", "shortable", "shortable_shares",
         "mark_price", "last_rth_trade",
@@ -985,6 +1010,11 @@ def main():
     parser.add_argument("--surge-min-trades-5s", type=int,
                         default=DEFAULT_SURGE_MIN_TRADES_5S,
                         help="Composite rule: minimum trades_in_5s floor.")
+    parser.add_argument("--surge-max-price-drop-pct", type=float,
+                        default=DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
+                        help="Composite rule: block trigger if last price is more than "
+                             "this fraction below the session-start price "
+                             "(e.g. 0.005 = 0.5%%; 0 blocks any net drop).")
     parser.add_argument("--keep-recording-after-trigger", action="store_true",
                         help="Do NOT stop recording when the surge/buy-signal fires "
                              "(default: stop at the trigger row). Standalone only.")
@@ -1035,7 +1065,8 @@ def main():
         f"AND spread_pct<={args.surge_max_spread_pct} "
         f"AND lift_5s>={args.surge_min_lift_ratio} "
         f"AND bid_drift_5s>={args.surge_min_bid_drift_bp}bp "
-        f"AND trades_5s>={args.surge_min_trades_5s}"
+        f"AND trades_5s>={args.surge_min_trades_5s} "
+        f"AND price_drop_since_start<={args.surge_max_price_drop_pct}"
     )
 
     app = IBKRSurgeApp(
@@ -1046,6 +1077,7 @@ def main():
         surge_min_lift_ratio=args.surge_min_lift_ratio,
         surge_min_bid_drift_bp=args.surge_min_bid_drift_bp,
         surge_min_trades_5s=args.surge_min_trades_5s,
+        surge_max_price_drop_pct=args.surge_max_price_drop_pct,
     )
     app.stop_at_trigger = not args.keep_recording_after_trigger
     logging.info(f"Connecting to {args.host}:{args.port} ...")

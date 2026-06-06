@@ -45,6 +45,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 try:
@@ -65,6 +66,9 @@ CLIENT_ID_START = 1000          # pool uses 1000 .. 1000 + qty - 1
 CLIENT_ID_MAX = 1029            # inclusive ceiling (30 clients)
 MKT_REQ_ID = 99                 # per-client market-data reqId (one duo at a time)
 CD_REQ_ID = 98                  # per-client contractDetails reqId
+
+# clerk's own daily log (one file per day, rolled at midnight)
+CLERK_LOG_DIR = "clerk_logs"
 
 # trade-mole driven-mode artifacts
 MOLE_OUTPUT_DIR = "mole-outputs"
@@ -240,6 +244,7 @@ class DuoSession:
             surge_min_lift_ratio=trademole.DEFAULT_SURGE_MIN_LIFT_RATIO,
             surge_min_bid_drift_bp=trademole.DEFAULT_SURGE_MIN_BID_DRIFT_BP,
             surge_min_trades_5s=trademole.DEFAULT_SURGE_MIN_TRADES_5S,
+            surge_max_price_drop_pct=trademole.DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
             logger=self.mole_log,
         )
         self.mole.stop_at_trigger = True
@@ -536,9 +541,14 @@ def setup_logging(level: str):
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    os.makedirs("logs", exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fh = logging.FileHandler(os.path.join("logs", f"clerk_{ts}.log"))
+    os.makedirs(CLERK_LOG_DIR, exist_ok=True)
+    # Daily log: today's entries go to clerk.log; at midnight it is rotated to
+    # clerk.log.YYYY-MM-DD and a fresh clerk.log is started. Same-day restarts
+    # append to the same file. Keep ~30 days of history.
+    fh = TimedRotatingFileHandler(
+        os.path.join(CLERK_LOG_DIR, "clerk.log"),
+        when="midnight", backupCount=30, encoding="utf-8")
+    fh.suffix = "%Y-%m-%d"
     fh.setFormatter(logging.Formatter(
         "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(fh)
