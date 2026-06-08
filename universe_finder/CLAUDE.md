@@ -115,3 +115,59 @@ The cron fires at 20:30 ET, so the available IBKR window is ~7.5 h. At 03:59 the
 TZ=America/New_York
 30 20 * * * /home/tom/venv/bin/python3 /home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/pipeline_daily.py >> /home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/runs/cron.log 2>&1
 ```
+
+---
+
+# `daily_universe_pipeline-2.py` — trade-size-enabled successor (NOT in cron)
+
+Parallel to `pipeline_daily.py` but Step 3 also fetches a per-trade trade-size
+baseline (shares/trade) for RTH and ETH from the *same* TRADES bars (via
+`trade_frequency_and_size.addOn.py`'s 4-tuple `fetch_freq_async`), and the
+output gets two extra columns. Writes to a DISTINCT stem so it never collides
+with the production output: `data/nasdaq_symbols_data_priced_sized_YYYY-MM-DD.tsv`.
+
+## Steps 4–7 and the 14-column output
+
+- **Step 4** — ITI imputation: runs `ITI_imputer.py` in place on the 8-column
+  canonical schema (the trade-size columns are NOT present yet, so the imputer's
+  strict 8-col check passes) → 10 columns (`ITI_impute_flag`, `ITI_impute_method`).
+- **Step 6** — appends `RTH_tradeSize` / `ETH_TradeSize` (read-back-as-strings so
+  Steps 1–10 formatting is byte-preserved) → 12 columns. At this point trade size
+  carries the **44444** sentinel for attempted-but-failed fetches and stays
+  **blank** for `--max-float`-skipped rows.
+- **Step 7** — trade-size imputation: runs `trade_size_imputer.py` in place →
+  14 columns (`TradeSize_impute_flag`, `TradeSize_impute_method`). Skipped by
+  `--no-size-impute` (independent of `--no-impute`). A Step 7 failure leaves the
+  12-column Step 6 file intact and re-runnable (the call is wrapped in try/except
+  exactly like Steps 4 and 6).
+
+Final 14-column schema:
+`Symbol, Exchange, Float_M, MarketCap_M, Float_Source, LastDailyClosePrice,
+RTH_avgITI_sec, ETH_avgITI_sec, ITI_impute_flag, ITI_impute_method,
+RTH_tradeSize, ETH_TradeSize, TradeSize_impute_flag, TradeSize_impute_method`.
+
+## `trade_size_imputer.py` — the trade-size analogue of `ITI_imputer.py`
+
+**`ITI_imputer.py` is NEVER modified** — it's imported by the production cron
+`pipeline_daily.py` and enforces a strict 8-column schema. `trade_size_imputer.py`
+*imports* its schema-agnostic helpers (`_build_feature_frame`, `_fit_predict_hgb`,
+`_clip_to_p1_p99`, `_bin_counts`, `_is_feature_degenerate`) so both imputers share
+one feature/HGB engine and can't drift. Differences:
+
+- Targets `RTH_tradeSize` / `ETH_TradeSize` (shares/trade), two-stage cascade
+  (Stage A = RTH; Stage B = ETH adding `log1p(RTH_tradeSize)` as a feature).
+- **Base features only** (float / mcap / price / exchange / source) — the imputed
+  ITI columns are deliberately NOT used as predictors (avoids model-on-model coupling).
+- Target transform is **`log1p` / `expm1`** (not bare `log`): trade size can be
+  fractional/near-zero; predictions are floored at 0 and clipped to the train P1/P99.
+- Same sentinel policy as ITI: 44444 → NaN at load, predict only the was-sentinel
+  rows, leave `--max-float`-skipped (blank) rows blank (`skipped_nan`).
+- **Idempotent**: accepts a 12-col or already-imputed 14-col file. If the file has
+  the sidecars and no 44444 left, it's a no-op (file untouched, provenance kept).
+- **Flag** is cohort-based (`ok`/`rth`/`eth`/`both`/`skipped_nan`); **method**
+  records what was done (`hgb`/`global_median`/combined, `""` when not imputed).
+  A per-stage min-train-rows gate can leave a stage unimputed: those rows then read
+  flag=`rth`/`eth`/`both` with method=`""` and keep the 44444 value.
+- Own log file `runs/{DD-MMM-YYYY}/trade_size_imputer.log`.
+
+Run standalone: `python3 trade_size_imputer.py --input <_sized .tsv> [--min-train-rows N]`.

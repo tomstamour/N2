@@ -70,11 +70,18 @@ CD_REQ_ID = 98                  # per-client contractDetails reqId
 # clerk's own daily log (one file per day, rolled at midnight)
 CLERK_LOG_DIR = "clerk_logs"
 
+# reconnection watchdog (re-warms pool clients after the daily Gateway restart)
+WATCHDOG_INTERVAL_S       = 30   # poll period for the reconnection watchdog
+RECONNECT_CONNECT_TIMEOUT = 10   # per-attempt wait for connected_evt
+RECONNECT_BACKOFF_S       = 10   # sleep between reconnect attempts
+MAX_RECONNECT_ATTEMPTS    = 18   # ~3 min of attempts per watchdog tick
+
 # trade-mole driven-mode artifacts
 MOLE_OUTPUT_DIR = "mole-outputs"
 MOLE_LOG_DIR = "mole-logs"
 MOLE_LIFETIME_STR = "01:00"     # watch window (mm:ss, per trade_mole convention)
 DEFAULT_ITI_BASELINE = 44444.00  # used when the orch-trigger has no ITI baseline
+SENTIMENT_TIMEOUT_S  = 2.0       # seconds to wait for Sentiment gate after mole fires
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +231,9 @@ class DuoSession:
         self._buy_fired = False
         self._finished = False
         self._watch_timer = None
+        self._defer_timer = None     # closed-market: idle-until-04:00 ET timer
+        self._defer_target = None    # target datetime (ET) we are deferring to
+        self._sentiment_ok = threading.Event()
         self._handlers = []          # logging handlers to detach on finish
         self.output_path = trademole.driven_output_path(MOLE_OUTPUT_DIR, self.symbol)
 
@@ -274,9 +284,56 @@ class DuoSession:
         return lg
 
     def start(self):
-        """Bind to the client, resolve the contract, subscribe to market data,
-        and arm the watch timer. Returns True on success."""
+        """Bind to the client and either begin collection now (market open) or,
+        for a closed-market trigger, keep the client bound and idle until 04:00
+        ET before subscribing. Returns True on success (accepted)."""
         self.client.session = self
+
+        # Closed-market window? Reuse trade-mole's pure clock helper so the ET
+        # open-gate logic lives in exactly one place.
+        delay_sec, target_et = trademole._compute_collection_start_delay()
+        if delay_sec > 0:
+            self._defer_target = target_et
+            self._defer_timer = threading.Timer(delay_sec,
+                                                 self._begin_collection_safe)
+            self._defer_timer.daemon = True
+            self._defer_timer.start()
+            logger.info("[%s] closed-market trigger: client %d bound, deferring "
+                        "subscribe %.0fs until %s ET", self.symbol,
+                        self.client.client_id, delay_sec,
+                        target_et.isoformat() if target_et else "04:00")
+            return True
+
+        return self._begin_collection()
+
+    def set_sentiment_ok(self):
+        self._sentiment_ok.set()
+
+    def _begin_collection_safe(self):
+        """Defer-timer entry point (runs on the Timer thread, off the request
+        path). Releases the client cleanly if collection cannot be started."""
+        try:
+            if not self._begin_collection():
+                self.finish("deferred_start_failed")
+        except Exception as e:
+            logger.error("[%s] deferred start raised on client %d: %s",
+                         self.symbol, self.client.client_id, e, exc_info=True)
+            self.finish("deferred_start_error")
+
+    def _begin_collection(self):
+        """Resolve the contract, subscribe to market data, and arm the watch
+        timer. Reused by the open-market path and the deferred (04:00) path.
+        Returns True on success."""
+        # A bound client is skipped by the reconnection watchdog, so after an
+        # overnight Gateway restart the socket is likely dead -- reconnect it
+        # ourselves before subscribing.
+        if self.clerk._down(self.client):
+            logger.info("[%s] bound client %d is down at collection start; "
+                        "reconnecting", self.symbol, self.client.client_id)
+            if not self.clerk._reconnect_bound(self.client):
+                logger.error("[%s] could not reconnect client %d for collection",
+                             self.symbol, self.client.client_id)
+                return False
 
         # resolve contract (+ minTick) once on the shared client
         self.client.contract_evt.clear()
@@ -286,7 +343,6 @@ class DuoSession:
                 self.client._contract_details is None:
             logger.error("[%s] contract resolution failed on client %d",
                          self.symbol, self.client.client_id)
-            self.client.session = None
             return False
         cd = self.client._contract_details
         self.xwing.set_contract_details(cd)
@@ -307,17 +363,35 @@ class DuoSession:
 
     # ------------------------------------------------------------------ #
     def on_buy_signal(self, last_ask):
-        """Called by trade-mole on the client's run thread when the surge fires.
-        Cancel the watch window, fire the x-wing entry, and hand control to a
-        dedicated control-loop thread."""
+        """Called by trade-mole on the ibapi thread when the surge fires.
+        Cancels the watch window and spawns a sentinel thread that waits for
+        the Sentiment gate before handing off to x-wing."""
         with self._lock:
             if self._buy_fired or self._finished:
                 return
             self._buy_fired = True
             if self._watch_timer is not None:
                 self._watch_timer.cancel()
-        logger.info("[%s] BUY-SIGNAL (last_ask=%s) -> x-wing entry on client %d",
+        logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — awaiting sentiment gate",
                     self.symbol, last_ask, self.client.client_id)
+        t = threading.Thread(target=self._await_sentiment_and_launch,
+                             args=(last_ask,),
+                             name=f"sentiment-gate-{self.symbol}", daemon=True)
+        t.start()
+
+    def _await_sentiment_and_launch(self, last_ask):
+        """Sentinel thread: waits for the Sentiment gate then launches x-wing,
+        or aborts the trade on timeout."""
+        confirmed = self._sentiment_ok.wait(timeout=SENTIMENT_TIMEOUT_S)
+        if self._finished:
+            return
+        if not confirmed:
+            logger.warning("[%s] sentiment gate timed out (%.1fs) — aborting trade",
+                           self.symbol, SENTIMENT_TIMEOUT_S)
+            self.finish("sentiment_timeout")
+            return
+        logger.info("[%s] sentiment gate confirmed — launching x-wing (last_ask=%s)",
+                    self.symbol, last_ask)
         self.xwing.on_buy_signal(last_ask)
         t = threading.Thread(target=xwing.run_trade,
                              args=(self.xwing, time.time()),
@@ -345,8 +419,15 @@ class DuoSession:
             if self._finished:
                 return
             self._finished = True
+        self._sentiment_ok.set()                    # unblock sentinel if waiting
+        self.clerk.unregister_session(self.symbol)  # remove from routing table
         logger.info("[%s] finishing duo on client %d (%s)",
                     self.symbol, self.client.client_id, reason)
+
+        # Cancel a still-pending closed-market defer timer (e.g. shutdown or an
+        # early release before 04:00) so it can't fire after teardown.
+        if self._defer_timer is not None:
+            self._defer_timer.cancel()
 
         try:
             self.client.cancelMktData(MKT_REQ_ID)
@@ -399,6 +480,16 @@ class ClientPool:
             if client not in self._free:
                 self._free.append(client)
 
+    def remove_if_free(self, client) -> bool:
+        """Atomically claim an idle client (one in the free pool) for the
+        watchdog so it cannot race handle_trigger's acquire(). A BUSY client is
+        not in _free, so this returns False and the watchdog skips it."""
+        with self._lock:
+            if client in self._free:
+                self._free.remove(client)
+                return True
+            return False
+
     @property
     def free_count(self):
         with self._lock:
@@ -413,30 +504,138 @@ class ClientPool:
 # Clerk
 # --------------------------------------------------------------------------- #
 class Clerk:
-    def __init__(self, host, port, client_qty, listen_host, listen_port):
+    def __init__(self, host, port, client_qty, listen_host, listen_port,
+                 watchdog_interval=WATCHDOG_INTERVAL_S):
         self.host = host
         self.port = port
         self.client_qty = client_qty
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self.watchdog_interval = watchdog_interval
         self.pool = ClientPool()
         self._stop = threading.Event()
         self._server_sock = None
+        self._watchdog_thread = None
+        self._sessions: dict[str, "DuoSession"] = {}   # ticker → active DuoSession
+        self._sessions_lock = threading.Lock()
 
     # ---- pool lifecycle ----
+    def _connect_one(self, client, *, timeout=15) -> bool:
+        """(Re)connect an existing SharedIBClient on its own clientId. Resets the
+        per-connection state (so a fresh nextValidId reseeds the order-id stream
+        cleanly), opens a new socket, starts a fresh run() thread, and waits for
+        nextValidId. Reused by startup AND the reconnection watchdog. Returns
+        True on success."""
+        cid = client.client_id
+        client.connected_evt.clear()
+        client.disconnected_flag = False
+        with client._id_lock:
+            client.next_order_id = None     # force reseed from the fresh nextValidId
+        try:
+            if client.isConnected():
+                client.disconnect()
+        except Exception:
+            pass
+        logger.info("connecting client %d to %s:%d ...", cid, self.host, self.port)
+        client.connect(self.host, self.port, cid)
+        threading.Thread(target=client.run, daemon=True,
+                         name=f"ibapi-{cid}").start()
+        if not client.connected_evt.wait(timeout=timeout):
+            logger.warning("client %d did not connect within %ds", cid, timeout)
+            return False
+        return True
+
     def connect_pool(self):
         for i in range(self.client_qty):
             cid = CLIENT_ID_START + i
             c = SharedIBClient(cid, self.host, self.port)
-            logger.info("connecting client %d to %s:%d ...", cid, self.host, self.port)
-            c.connect(self.host, self.port, cid)
-            threading.Thread(target=c.run, daemon=True,
-                             name=f"ibapi-{cid}").start()
-            if not c.connected_evt.wait(timeout=15):
+            if not self._connect_one(c):
                 raise RuntimeError(f"client {cid} did not connect within 15s")
             self.pool.add(c)
         logger.info("pool ready: %d warm clients (ids %d..%d)", self.client_qty,
                     CLIENT_ID_START, CLIENT_ID_START + self.client_qty - 1)
+
+    # ---- reconnection watchdog ----
+    @staticmethod
+    def _down(client) -> bool:
+        if client.disconnected_flag:
+            return True
+        try:
+            return not client.isConnected()
+        except Exception:
+            return True
+
+    def _reconnect_idle(self, client):
+        """Reconnect a single idle client that the watchdog has claimed via
+        remove_if_free(). Retries with backoff to cover the ~1-2 min the Gateway
+        is down during its daily restart, then ALWAYS returns the client to the
+        free pool (warm on success; still-down and retried next tick on failure
+        -- handle_trigger tolerates acquiring a still-dead client)."""
+        cid = client.client_id
+        ok = False
+        for _ in range(MAX_RECONNECT_ATTEMPTS):
+            if self._stop.is_set():
+                break
+            if self._connect_one(client, timeout=RECONNECT_CONNECT_TIMEOUT):
+                ok = True
+                break
+            self._stop.wait(RECONNECT_BACKOFF_S)
+        self.pool.release(client)
+        if ok:
+            logger.info("client %d reconnected (free=%d)", cid, self.pool.free_count)
+        else:
+            logger.warning("client %d still down; will retry next watchdog tick", cid)
+
+    def _reconnect_bound(self, client) -> bool:
+        """Reconnect a client that is BUSY (bound to a deferred session) and so
+        is skipped by the watchdog. Same primitive/backoff as _reconnect_idle
+        but never touches the pool -- the client must stay bound to its session.
+        Returns True once reconnected, False if it stays down or we are stopping."""
+        cid = client.client_id
+        for _ in range(MAX_RECONNECT_ATTEMPTS):
+            if self._stop.is_set():
+                return False
+            if self._connect_one(client, timeout=RECONNECT_CONNECT_TIMEOUT):
+                logger.info("bound client %d reconnected", cid)
+                return True
+            self._stop.wait(RECONNECT_BACKOFF_S)
+        return False
+
+    def _watchdog_tick(self):
+        for c in self.pool.all_clients:
+            if not self._down(c):
+                continue
+            # Only touch idle (free) clients. A busy/mid-trade client fails
+            # remove_if_free and is skipped; it is re-warmed after its session
+            # ends and releases it back to the pool.
+            if self.pool.remove_if_free(c):
+                self._reconnect_idle(c)
+
+    def _watchdog_loop(self):
+        logger.info("reconnection watchdog started (interval=%ss)",
+                    self.watchdog_interval)
+        while not self._stop.wait(self.watchdog_interval):
+            try:
+                self._watchdog_tick()
+            except Exception as e:
+                logger.error("watchdog tick error: %s", e, exc_info=True)
+
+    def start_watchdog(self):
+        if self.watchdog_interval and self.watchdog_interval > 0:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, daemon=True, name="reconnect-watchdog")
+            self._watchdog_thread.start()
+        else:
+            logger.info("reconnection watchdog disabled (interval=%s)",
+                        self.watchdog_interval)
+
+    def register_session(self, session: "DuoSession"):
+        with self._sessions_lock:
+            self._sessions[session.symbol] = session
+
+    def unregister_session(self, symbol: str):
+        with self._sessions_lock:
+            self._sessions.pop(symbol, None)
 
     def release_client(self, client):
         self.pool.release(client)
@@ -451,24 +650,43 @@ class Clerk:
         last_close = payload.get("lastDailyClose")
         iti = payload.get("itiBaseline")
 
-        client = self.pool.acquire()
+        # Pop free clients until we find a healthy one. Any disconnected client
+        # is released back (the watchdog re-warms it); the `tried` guard stops
+        # us spinning on the same dead clients within a single trigger.
+        client = None
+        tried = []
+        while True:
+            c = self.pool.acquire()
+            if c is None:
+                break
+            if self._down(c):
+                self.pool.release(c)
+                if c in tried:        # cycled through all free clients; all dead
+                    break
+                tried.append(c)
+                continue
+            client = c
+            break
         if client is None:
-            logger.warning("[%s] no free client; trigger rejected", ticker)
+            logger.warning("[%s] no healthy free client; trigger rejected", ticker)
             return {"status": "rejected", "reason": "no_free_client"}
-        if client.disconnected_flag:
-            return {"status": "rejected", "reason": "client_disconnected"}
 
         session = DuoSession(self, client, ticker, last_close, iti)
+        self.register_session(session)
         try:
             ok = session.start()
         except Exception as e:
             logger.error("[%s] session start failed: %s", ticker, e, exc_info=True)
             ok = False
         if not ok:
+            client.session = None
             self.release_client(client)
             return {"status": "rejected", "reason": "session_start_failed"}
-        return {"status": "accepted", "clientId": client.client_id,
-                "symbol": session.symbol}
+        reply = {"status": "accepted", "clientId": client.client_id,
+                 "symbol": session.symbol}
+        if session._defer_target is not None:
+            reply["deferredUntilET"] = session._defer_target.isoformat()
+        return reply
 
     # ---- TCP listener ----
     def serve(self):
@@ -510,7 +728,17 @@ class Clerk:
                 except Exception:
                     pass
                 return
-            reply = self.handle_trigger(payload)
+            if "Sentiment" in payload:
+                ticker = payload.get("ticker", "").upper()
+                with self._sessions_lock:
+                    session = self._sessions.get(ticker)
+                if session and payload["Sentiment"] == "OK":
+                    session.set_sentiment_ok()
+                    reply = {"status": "sentiment_ack", "symbol": ticker}
+                else:
+                    reply = {"status": "sentiment_ignored", "symbol": ticker}
+            else:
+                reply = self.handle_trigger(payload)
             try:
                 conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
             except Exception:
@@ -518,6 +746,8 @@ class Clerk:
 
     def shutdown(self):
         self._stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5)
         try:
             if self._server_sock is not None:
                 self._server_sock.close()
@@ -570,6 +800,9 @@ def main():
                    help="Host/interface for the orch-trigger TCP socket")
     p.add_argument("--listen-port", type=int, default=8765,
                    help="TCP port for orch-triggers (JSON per line)")
+    p.add_argument("--watchdog-interval", type=float, default=WATCHDOG_INTERVAL_S,
+                   help="Seconds between reconnection-watchdog polls that "
+                        "re-warm pool clients after a Gateway restart (0 disables).")
     p.add_argument("--loglevel", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = p.parse_args()
@@ -583,7 +816,8 @@ def main():
                        args.port)
 
     clerk = Clerk(args.host, args.port, args.client_qty,
-                  args.listen_host, args.listen_port)
+                  args.listen_host, args.listen_port,
+                  watchdog_interval=args.watchdog_interval)
 
     def _sig(signum, frame):
         logger.info("signal %s received -> shutting down", signum)
@@ -597,6 +831,8 @@ def main():
         logger.error("pool connect failed: %s", e, exc_info=True)
         clerk.shutdown()
         sys.exit(1)
+
+    clerk.start_watchdog()
 
     try:
         clerk.serve()

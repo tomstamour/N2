@@ -1,0 +1,166 @@
+================================================================================
+ TRADE SIZE COLUMNS — what they are, how they're computed, what they mean
+ (produced by daily_universe_pipeline-2.py)
+================================================================================
+
+OVERVIEW
+--------
+daily_universe_pipeline-2.py is the "trade-size-enabled" successor to the
+production pipeline_daily.py. It does everything pipeline_daily.py does, and
+ADDS a per-trade trade-size baseline for each symbol, in two sessions:
+
+    RTH_tradeSize   — average shares per trade, Regular Trading Hours
+    ETH_TradeSize   — average shares per trade, Extended Trading Hours
+
+These two columns sit at positions 11–12 of the output file
+(data/nasdaq_symbols_data_priced_sized_YYYY-MM-DD.tsv), followed by two
+provenance sidecars added by the imputation step:
+
+    TradeSize_impute_flag     — which rows were predicted vs. measured
+    TradeSize_impute_method   — how each predicted row was filled
+
+Full 14-column schema:
+    Symbol | Exchange | Float_M | MarketCap_M | Float_Source
+          | LastDailyClosePrice | RTH_avgITI_sec | ETH_avgITI_sec
+          | ITI_impute_flag | ITI_impute_method
+          | RTH_tradeSize | ETH_TradeSize
+          | TradeSize_impute_flag | TradeSize_impute_method
+
+
+WHAT THE VALUE MEANS
+--------------------
+Trade size = the average number of shares exchanged per individual transaction
+(a "fill" / executed trade) for that symbol, during that session, averaged over
+the lookback window (default: the past 3 trading days, configurable via
+--past-days-lookback).
+
+It is a measure of typical order size / trade granularity, NOT total volume.
+A stock with RTH_tradeSize = 150 means a typical trade prints ~150 shares.
+
+PURPOSE: it is a historical *baseline* for a downstream real-time surge
+detector (trade_surge_mole/trade_mole_4.1.py). That live detector measures the
+current shares-per-trade and compares it against this baseline to flag bursts
+of trading momentum (unusually large trades = institutional/aggressive
+activity surging in). The historical baseline here is defined to match the
+live detector's "mean_size" statistic exactly.
+
+
+SESSION DEFINITIONS (US/Eastern)
+--------------------------------
+    RTH   09:30 – 16:00                          (23,400 s)
+    ETH   04:00 – 09:30 pre-market  +  16:00 – 20:00 after-hours
+          (pre 19,800 s + post 14,400 s = 34,200 s combined)
+
+
+HOW THE VALUE IS COMPUTED
+-------------------------
+Source: ONE IBKR historical-data request per symbol (whatToShow="TRADES",
+useRTH=False, 30-min bars, ~lookback+4 calendar days). This is the SAME request
+already used to compute the inter-trade-interval (ITI) columns — trade size
+"rides along" on it, so no extra IBKR round-trip is incurred.
+
+For each session, the metric is an AGGREGATE RATIO over the whole lookback
+window (function compute_session_volumes in trade_frequency_and_size.addOn.py):
+
+    tradeSize = ( Σ bar.volume × lot_multiplier ) / ( Σ bar.barCount )
+
+           i.e.  total shares traded in the session
+                 ─────────────────────────────────────
+                 total number of trades in the session
+
+  - bar.volume   = shares traded in each 30-min bar
+  - bar.barCount = number of individual trades in that bar
+  - Bars are classified into RTH vs ETH by their start time (the 30-min bar
+    boundaries align exactly with 04:00/09:30/16:00/20:00, so no bar straddles
+    a session edge — the sums are identical to what 1-min bars would give).
+  - lot_multiplier = 1. The IBKR TRADES feed reports volume in ACTUAL SHARES,
+    not round lots (verified 2026-06-07: AAPL ~25–38M shares/day matches reality;
+    ×100 gave a physically-impossible ~2.5B). If a future feed reverts to
+    round-lot reporting, set _IBKR_VOLUME_LOT_MULTIPLIER back to 100.
+
+Notes on the statistic:
+  - It is a window-level aggregate, NOT a per-day average that's then averaged.
+    Total shares over all N days ÷ total trades over all N days.
+  - NO outlier filtering is applied to trade size (unlike the ITI columns, which
+    use Tukey 1.5×IQR fencing). The plain aggregate ratio is the intended
+    statistic because it must match the live detector's definition.
+  - A session with zero trades across the window yields None → NaN.
+
+
+SENTINEL & MISSING-DATA POLICY
+------------------------------
+Three distinct states a trade-size cell can be in BEFORE imputation:
+
+  1. A real measured number (e.g. 142.5000)
+        → the fetch succeeded.
+
+  2. 44444  (the pipeline sentinel)
+        → the IBKR fetch was ATTEMPTED but FAILED (no TRADES history,
+          timeout, qualify failure, slot exhaustion, etc.).
+
+  3. blank / empty
+        → the symbol was SKIPPED on purpose by the --max-float filter
+          (Float_M >= --max-float, default 200M). Its IBKR data was never
+          requested.
+
+This mirrors the ITI columns exactly, and lets downstream code tell
+"tried and failed" (44444) apart from "deliberately not fetched" (blank).
+
+
+IMPUTATION (Step 7 — trade_size_imputer.py)
+-------------------------------------------
+After the raw columns are written, trade_size_imputer.py runs in place to fill
+the gaps, and appends the two provenance sidecars. (Skip with --no-size-impute.)
+
+  - The 44444 sentinels are converted to NaN, then PREDICTED by a machine-
+    learning model (HistGradientBoosting, the same engine ITI_imputer.py uses —
+    trade_size_imputer imports its helpers so the two cannot drift apart).
+  - Blank (--max-float-skipped) rows are LEFT BLANK — never predicted.
+  - Already-measured rows are left untouched.
+
+Model details:
+  - Two-stage cascade:
+        Stage A predicts RTH_tradeSize.
+        Stage B predicts ETH_TradeSize, additionally using log1p(RTH_tradeSize)
+        as a feature (the cascade link).
+  - Features are BASE columns only: Float_M, MarketCap_M, LastDailyClosePrice,
+    Exchange, Float_Source. The imputed ITI columns are deliberately NOT used
+    as predictors (avoids model-on-model coupling).
+  - Target transform is log1p / expm1 (trade size can be near-zero/fractional,
+    so bare log would explode). Predictions are floored at 0 and clipped to the
+    training P1–P99 range.
+  - If a row's feature bin is too sparse to model reliably, it falls back to the
+    global median of the training trade sizes.
+  - A per-stage minimum-training-rows gate (default 200): if too few measured
+    rows exist to train, that stage is skipped and its target rows KEEP the
+    44444 sentinel (flag set, method left blank).
+  - Idempotent: re-running on an already-imputed file with no 44444 left is a
+    no-op (file untouched, provenance preserved).
+
+Provenance sidecars:
+  TradeSize_impute_flag  (cohort of each row):
+      ok           — both sessions were measured (nothing imputed)
+      rth          — RTH was a failed fetch (predicted/handled), ETH measured
+      eth          — ETH was a failed fetch, RTH measured
+      both         — both sessions were failed fetches
+      skipped_nan  — row was --max-float-skipped (blank, never fetched)
+
+  TradeSize_impute_method  (HOW the value was produced, "" if not imputed):
+      hgb            — model prediction
+      global_median  — fallback (feature bin too sparse)
+      hgb+global_median (etc.) — combined when RTH/ETH stages differed
+      ""             — not imputed (measured, blank, or a gated stage that kept
+                       its 44444)
+
+
+QUICK READING GUIDE
+-------------------
+  - A plain number in RTH_tradeSize/ETH_TradeSize = typical shares-per-trade
+    for that session (measured OR model-predicted; check the flag/method to
+    know which).
+  - 44444 still present after the run = fetch failed AND the imputer stage was
+    gated (too little training data).
+  - Blank = symbol intentionally excluded by the float filter.
+  - Higher value = larger typical trades (often bigger/more institutional
+    participation); lower = small retail-sized prints.
+================================================================================

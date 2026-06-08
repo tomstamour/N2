@@ -1,0 +1,256 @@
+===========================================================================
+ TRIO I/O FLOW DIAGRAM  (read top to bottom -- each step feeds the next)
+===========================================================================
+
+---------------------------------------------------------------------------
+STEP 1a -- ORCHESTRATOR SENDS TRIGGER  (TCP port 8765)
+---------------------------------------------------------------------------
+
+  Orchestrator
+       |
+       |  TCP/JSON line (one per trade)
+       |  --> {"ticker":"JWEL", "lastDailyClose":2.35, "itiBaseline":44444.0}
+       |
+       v
+  clerk-1.0.py
+       |
+       |  Response (same TCP conn, same line)
+       |  --> {"status":"accepted", "clientId":1000, "symbol":"JWEL"}
+       |   OR {"status":"rejected", "reason":"no_free_client | missing ticker | ..."}
+       |
+       v
+  Orchestrator
+
+
+---------------------------------------------------------------------------
+STEP 1b -- ORCHESTRATOR SENDS SENTIMENT  (TCP port 8765, ~70 ms later)
+---------------------------------------------------------------------------
+
+  Orchestrator
+       |
+       |  TCP/JSON line (separate connection, same port)
+       |  --> {"ticker":"JWEL", "Sentiment":"OK"}
+       |
+       v
+  clerk-1.0.py
+       |
+       |  Clerk looks up active DuoSession by ticker in _sessions registry
+       |  Calls session.set_sentiment_ok()  -> sets _sentiment_ok Event
+       |
+       |  Response
+       |  --> {"status":"sentiment_ack", "symbol":"JWEL"}
+       |   OR {"status":"sentiment_ignored", "symbol":"JWEL"}
+       |       (if no active session for that ticker, or Sentiment != "OK")
+       |
+       v
+  Orchestrator
+
+  NOTE: Steps 1a and 1b are INDEPENDENT events. Either can arrive first.
+        The trade executes only when BOTH the mole trigger AND the sentiment
+        gate have been satisfied (see Step 4).
+
+
+---------------------------------------------------------------------------
+STEP 2 -- CLERK BUILDS THE DUO  (in-process, shared IBKR socket)
+---------------------------------------------------------------------------
+
+  clerk-1.0.py
+       |
+       |-- instantiates trade-mole-2.0  (IBKRSurgeApp)
+       |       symbol              = "JWEL"
+       |       baseline_avg_iti    = 44444.0  (from trigger or default)
+       |       surge_dollar_rate   = 300.0  $/s
+       |       surge_max_spread    = 2%
+       |       surge_min_lift      = 55%  buyer-initiated
+       |       surge_min_bid_drift = 0 bp
+       |       surge_min_trades_5s = 5
+       |       stop_at_trigger     = True
+       |       buy_signal_callback --> clerk.on_buy_signal   <-- wired back
+       |
+       |-- instantiates x-wing-2.0  (XWingController)
+       |       symbol              = "JWEL"
+       |       last_close_price    = 2.35   (from trigger)
+       |       shared_client       = SharedIBClient   <-- same IBKR socket
+       |       id_alloc            = client.alloc_order_id
+       |       on_done ------------>  clerk._on_xwing_done  <-- wired back
+       |
+       |-- registers DuoSession in Clerk._sessions["JWEL"]
+       |-- reqContractDetails() -> IBKR -> clerk -> xwing.set_contract_details(cd)
+       |-- reqMktData()  (begins market data stream)
+       |-- arms 60s watchdog timer
+
+
+---------------------------------------------------------------------------
+STEP 3 -- IBKR STREAMS MARKET DATA  (clerk fans to both scripts)
+---------------------------------------------------------------------------
+
+  IBKR Gateway
+       |
+       |  ibapi callbacks:
+       |   tickPrice   (bid=1, ask=2, mark=37, last_rth=75)
+       |   tickSize    (bid_sz=0, ask_sz=3, trade_count=54, shortable=89)
+       |   tickString  (RTVolume=48: "price;size;ms;tot_vol;vwap;single_flag")
+       |   tickGeneric (halted=49, shortable=46, trade_rate=55, vol_rate=56)
+       |
+       v
+  clerk-1.0.py  (SharedIBClient routes every callback)
+       |
+       +-----> trade-mole-2.0.py
+       |           tickPrice / tickSize / tickString / tickGeneric
+       |           [RTVolume parsed -> price, size, aggr BUY/SELL/MID/UNKNOWN]
+       |
+       +-----> x-wing-2.0.py
+                   update_quote(bid=, ask=, last=, close=)
+
+
+---------------------------------------------------------------------------
+STEP 4 -- TWO-GATE TRIGGER  (mole surge + sentiment must BOTH fire)
+---------------------------------------------------------------------------
+
+  trade-mole-2.0.py
+       |
+       |  Rolling 5s window computed on each RTVolume trade event:
+       |   dollar_rate_5s     >= $300/s          (cond_dollar)
+       |   trades_in_5s       >= 5               (cond_trades)
+       |   spread_pct         <= 2%              (cond_spread)
+       |   lift_ratio_5s      >= 55% buy-init.   (cond_lift)
+       |   bid_drift_5s_bp    >= 0 bp            (cond_drift)
+       |   price vs session start <= -0.5%       (cond_not_selloff)
+       |
+       |  should_fire() -> True
+       |
+       |  buy_signal_callback(last_ask)
+       |      last_ask = current ask price at trigger moment  (float)
+       |
+       v
+  clerk-1.0.py.on_buy_signal(last_ask)
+       |
+       |  acquires _lock, sets _buy_fired, cancels watchdog timer
+       |  spawns Thread -> _await_sentiment_and_launch(last_ask)
+       |  [ibapi thread returns immediately -- never blocked]
+       |
+       v
+  clerk-1.0.py.sentiment-gate thread
+       |
+       |  _sentiment_ok.wait(timeout=SENTIMENT_TIMEOUT_S)  [default 2.0 s]
+       |
+       |  GATE OPEN  (_sentiment_ok already set, or arrives within timeout)
+       |       |
+       |       |  calls  xwing.on_buy_signal(last_ask)
+       |       |  starts Thread -> xwing.run_trade(ctl, start_ts)
+       |       |
+       |       v
+       |  x-wing-2.0.py   (Step 5)
+       |
+       |  GATE TIMED OUT  (Sentiment never arrived)
+       |       |
+       |       v
+       |  session.finish("sentiment_timeout")
+       |  cancelMktData()
+       |  client returned to warm pool  --> no trade placed
+       |
+       v
+  (one of the two outcomes above)
+
+  CONCURRENT ARRIVAL CASES:
+    Sentiment before surge (typical, ~70 ms head start):
+        _sentiment_ok is already set when gate thread spawns -> instant pass
+    Mole before sentiment (unusual):
+        gate thread waits; sentiment arrives; trade launches
+    Neither within watch window (60 s):
+        watchdog timer fires finish("no_surge"); _sentiment_ok.set() unblocks
+        any lingering gate thread, which sees _finished=True and exits cleanly
+
+
+---------------------------------------------------------------------------
+STEP 5 -- X-WING PLACES ENTRY BUY  (on_buy_signal received)
+---------------------------------------------------------------------------
+
+  x-wing-2.0.py
+       |
+       |  compute_entry_limit_price():
+       |   entry  = last_ask * (1 + MAX_LIMIT_ENTRY_PERCENT/100)
+       |   cap    = last_close * (1 + MAX_CAP_ENTRY_PERCENT/100)  [20%]
+       |   entry  = min(entry, cap)
+       |   qty    = floor(CAPITAL / entry)   [CAPITAL = $0.50]
+       |
+       |  placeOrder --> IBKR: BUY LMT @ entry, qty shares, GTC + outsideRth
+       |
+       v
+  IBKR Gateway
+       |
+       |  orderStatus callback --> clerk --> xwing.on_order_status()
+       |   position          += newly_filled
+       |   original_avg_fill    frozen on first fill  (immutable reference)
+       |
+       v
+  x-wing-2.0.py  [BUY position now open]
+
+
+---------------------------------------------------------------------------
+STEP 6 -- X-WING ARMS AND RATCHETS PROTECTIVE STOP  (each control loop)
+---------------------------------------------------------------------------
+
+  x-wing-2.0.py
+       |
+       |  arm_or_replace_protective(mid):
+       |   yield_pct = (high_water_mid - original_avg_fill) / original_avg_fill * 100
+       |   lookup limits_table[yield_pct] -> trigger_pct, limit_pct
+       |   aux = high_water_mid * (1 - trigger_pct/100)   <- stop trigger price
+       |   lmt = high_water_mid * (1 - limit_pct /100)    <- stop limit  price
+       |   ratchet: aux and lmt only ever move UP (never down)
+       |
+       |  placeOrder (replace same orderId) --> IBKR: SELL STP LMT @ aux / lmt
+       |  [order replaced each loop as high_water_mid rises]
+       |
+       |  if mid <= aux in control loop (synthetic trigger):
+       |   convert to SELL LMT @ lmt  (forced exit, no cancel)
+       |
+       v
+  IBKR Gateway
+
+
+---------------------------------------------------------------------------
+STEP 7 -- TRADE CLOSES  (stop fills or time/session expiry)
+---------------------------------------------------------------------------
+
+  IBKR Gateway
+       |
+       |  orderStatus: SELL leg fills
+       |   OR lifetime / session_end reached (clerk flatten: SELL LMT @ bid)
+       |
+       v
+  x-wing-2.0.py
+       |
+       |  _signal_done(reason)
+       |   reason in: "stop_filled" | "lifetime" | "session_end" | "stopped"
+       |
+       |  on_done(reason)
+       |
+       v
+  clerk-1.0.py._on_xwing_done(reason)
+       |
+       |  session.finish()
+       |  _sentiment_ok.set()            (unblocks any lingering gate thread)
+       |  unregister_session("JWEL")     (removes from _sessions routing table)
+       |  cancelMktData()
+       |  client.session = None          (reset shared client)
+       |  return client to warm pool  --> ready for next trigger
+
+
+===========================================================================
+ DISK OUTPUTS  (written in parallel with live trading)
+===========================================================================
+
+  trade-mole-2.0.py
+    -> mole-outputs/<symbol>_<ts>.csv    (tick records + surge_detected flags)
+    -> mole-logs/trade-mole_<symbol>_<ts>.log
+
+  x-wing-2.0.py
+    -> xwing_<symbol>_<date>_<time>.log
+    -> xwing_tables/xwing-table_<symbol>_<date>_<time>.tsv  (price-action records)
+
+  clerk-1.0.py
+    -> clerk_logs/clerk.log*
+
+===========================================================================

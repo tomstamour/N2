@@ -11,5 +11,6 @@ python3 trade_frequency_addOn.py \
 
 
 ####
-python3 pipeline_daily.py --max-float 50 --limit 500
+python3 pipeline_daily.py --max-float 50 --limit 100
+python3 ./daily_universe_pipeline-2.py --max-float 50  #--limit 4000
 
