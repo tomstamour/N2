@@ -116,11 +116,11 @@ _excluded_strings: set[str] = set()
 def _resolve_latest_universe_tsv() -> str:
     """Return the most recent nasdaq_symbols_data_priced_YYYY-MM-DD.tsv in
     TM_ITI_DATA_DIR, falling back to the non-dated file if none is found."""
-    pattern = os.path.join(TM_ITI_DATA_DIR, 'nasdaq_symbols_data_priced_????-??-??.tsv')
+    pattern = os.path.join(TM_ITI_DATA_DIR, 'stocks_universe_????-??-??.tsv')
     matches = sorted(glob.glob(pattern))
     if matches:
         return matches[-1]
-    fallback = os.path.join(TM_ITI_DATA_DIR, 'nasdaq_symbols_data_priced.tsv')
+    fallback = os.path.join(TM_ITI_DATA_DIR, 'stocks_universe.tsv')
     logger.warning(f"[Universe] No dated universe TSV found — falling back to {fallback}")
     return fallback
 
@@ -472,7 +472,7 @@ def _lookup_author(news_id: str):
 def _load_latest_iti_tsv() -> None:
     """Load the most recent nasdaq_symbols_data_priced_YYYY-MM-DD.tsv into _iti_df."""
     global _iti_df
-    pattern = os.path.join(TM_ITI_DATA_DIR, 'nasdaq_symbols_data_priced_????-??-??.tsv')
+    pattern = os.path.join(TM_ITI_DATA_DIR, 'stocks_universe_????-??-??.tsv')
     matches = sorted(glob.glob(pattern))
     if not matches:
         logger.warning(f"[ITI] No dated universe TSV found in {TM_ITI_DATA_DIR} — ITI lookups will use default")
