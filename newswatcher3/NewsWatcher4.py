@@ -101,17 +101,27 @@ _background_thread: threading.Thread | None = None
 _config: dict = {}
 
 _news_callback = None
+# Alert-flow callbacks (NW4): fired on the lightweight WS alert, BEFORE the
+# permalink curl, so the orchestrator can arm reqMktData without waiting on the
+# fetch. _alert_callback fires when the alert's primary ticker passes the cheap
+# pre-filter; _alert_release_callback fires when such a pre-armed article is
+# later dropped (curl/normalize failure or full-filter block) and was never
+# accepted, so the orchestrator can release the warm client it consumed.
+_alert_callback = None
+_alert_release_callback = None
 _callback_lock = threading.Lock()
 
 logger = logging.getLogger("NewsWatcherV4")
 
 # ─── NW4 tuning knobs ─────────────────────────────────────────────────────────
 
-MAX_CONCURRENT_FETCHES = 8       # cap concurrent permalink curls
+MAX_CONCURRENT_FETCHES = 32      # cap concurrent permalink curls (was 8 — saturated
+                                 # during top-of-hour bursts; the alert-ticker pre-filter
+                                 # in _handle_alert keeps the actual fetch volume small)
 FETCH_TIMEOUT_SEC      = 10.0    # per-attempt HTTP timeout
 FETCH_MAX_RETRIES      = 3
 FETCH_BACKOFF_SEC      = 0.5     # exponential: 0.5 → 1.0 → 2.0
-HTTP_POOL_LIMIT        = 16      # aiohttp TCPConnector pool size
+HTTP_POOL_LIMIT        = 32      # aiohttp TCPConnector pool size (>= MAX_CONCURRENT_FETCHES)
 WS_RECV_TIMEOUT_SEC    = 90      # matches RTPR's 90s pong deadline
 
 # Backoff schedule (seconds) for RTPR auth-class WS close codes (4004 trial-expired,
@@ -390,6 +400,62 @@ def register_callback(fn) -> None:
     with _callback_lock:
         _news_callback = fn
     logger.info(f"Callback registered: {fn}")
+
+
+def register_alert_callback(fn) -> None:
+    """
+    Register a callable invoked the instant a WS alert's primary ticker passes
+    the cheap pre-filter (in-universe + not-blacklisted + price/float), BEFORE
+    the article body is curled. Lets a consumer start time-critical work (e.g.
+    the clerk arm / reqMktData) without waiting on the fetch queue.
+
+    Called from the background thread with: fn(ticker: str, art_id: str,
+    recv_ts: datetime). Must return quickly (it runs on the asyncio loop thread).
+    Pass None to deregister. Exceptions are caught and logged.
+    """
+    global _alert_callback
+    with _callback_lock:
+        _alert_callback = fn
+    logger.info(f"Alert callback registered: {fn}")
+
+
+def register_alert_release_callback(fn) -> None:
+    """
+    Register a callable invoked when an article that already fired the alert
+    callback (i.e. was pre-armed) is subsequently dropped before acceptance —
+    curl failure, normalize failure, post-curl dedup, or full-filter block — so
+    the consumer can release whatever it provisioned on the alert.
+
+    Called with: fn(ticker: str, art_id: str). Pass None to deregister.
+    """
+    global _alert_release_callback
+    with _callback_lock:
+        _alert_release_callback = fn
+    logger.info(f"Alert-release callback registered: {fn}")
+
+
+def _emit_alert_arm(ticker: str, art_id: str, recv_ts) -> None:
+    """Invoke the registered alert callback (pre-fetch arm). Never raises."""
+    with _callback_lock:
+        cb = _alert_callback
+    if cb is not None:
+        try:
+            cb(ticker, art_id, recv_ts)
+        except Exception as exc:
+            logger.error(f"Exception in alert callback for {ticker} id={art_id}: {exc}",
+                         exc_info=True)
+
+
+def _emit_alert_release(ticker: str, art_id: str) -> None:
+    """Invoke the registered alert-release callback. Never raises."""
+    with _callback_lock:
+        cb = _alert_release_callback
+    if cb is not None:
+        try:
+            cb(ticker, art_id)
+        except Exception as exc:
+            logger.error(f"Exception in alert-release callback for {ticker} id={art_id}: {exc}",
+                         exc_info=True)
 
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
@@ -878,14 +944,15 @@ def _passes_filters(tickers: list, title: str, article_exchange: str = '') -> tu
                 continue  # different exchange than the article's primary exchange; skip
             float_m = entry['Float_M']
             price   = entry['LastDailyClosePrice']
-            if float_m is None or price is None:
-                # Phantom row (e.g. warrant `KIDZW` with no last close). Treat
-                # like "not in priced DB" — skip this ticker but keep
-                # evaluating the rest.
-                continue
-            if reject_float is not None and float_m > reject_float:
+            # Check each threshold against its own field independently. A blank
+            # field (warrant `KIDZW` with no last close, or a finviz-float row
+            # whose price enrichment was skipped → `skipped_nan`) skips only that
+            # one check. It must NOT let a valid, disqualifying Float_M through:
+            # NEE (Float_M=2080, blank LastDailyClosePrice) was previously armed
+            # because a None price short-circuited the float check below.
+            if reject_float is not None and float_m is not None and float_m > reject_float:
                 return False, f"ticker '{t}' float={float_m}M > {reject_float}M"
-            if reject_price is not None and price > reject_price:
+            if reject_price is not None and price is not None and price > reject_price:
                 return False, f"ticker '{t}' price={price} > {reject_price}"
 
     return True, ''
@@ -1098,6 +1165,7 @@ async def _handle_alert(
     session: aiohttp.ClientSession,
     api_key: str,
     sem: asyncio.Semaphore,
+    recv_ts=None,
 ) -> None:
     """
     End-to-end pipeline for one alert message:
@@ -1136,26 +1204,61 @@ async def _handle_alert(
                 return
             _fetched_ids.add(art_id)
 
+    # Cheap pre-filter on the alert's primary ticker (the alert carries a single
+    # `ticker`; the full list is only known post-curl). Reuses _passes_filters
+    # with an empty title/exchange so it evaluates exactly universe + blacklist +
+    # price/float. Only gate-passers are curled AND armed — this both slashes the
+    # fetch volume during top-of-hour bursts and bounds how many warm clients we
+    # consume. Trade-off: an article whose ONLY in-universe ticker is a body-only
+    # partner not named in the alert is dropped here (see _normalize_article).
+    primary = alert.get('ticker')
+    gate_ok, gate_reason = (
+        _passes_filters([primary], '', '') if primary
+        else (False, 'alert has no ticker')
+    )
+    if not gate_ok:
+        logger.debug(f"Pre-filter drop id={art_id} ticker={primary}: {gate_reason}")
+        return
+
+    # Passed the gate → arm now (pre-fetch), then curl the body. Only pre-arm
+    # when we have a stable art_id to key the consumer's stash on (it is the same
+    # id surfaced on the accepted payload); art_id is virtually always present,
+    # but if it's missing we skip the pre-arm and let the post-curl path arm.
+    prearmed = None
+    if art_id is not None:
+        prearmed = primary
+        _emit_alert_arm(prearmed, art_id, recv_ts)
+
     async with sem:
         raw = await _fetch_article(session, article_url, api_key)
     if raw is None:
         logger.warning(
             f"Fetch failed for article id={art_id} url={article_url[:120]}"
         )
+        _emit_alert_release(prearmed, art_id)
         return
 
     data = _normalize_article(raw, alert, fallback_id=art_id)
     if data is None or not data.get('id'):
         # _normalize_article already logged the scrape failure; just drop.
+        _emit_alert_release(prearmed, art_id)
         return
 
-    await _handle_article(data)
+    await _handle_article(data, recv_ts=recv_ts, prearmed=prearmed, art_id=art_id)
 
 
 # ─── Article handler (unchanged from NW3) ─────────────────────────────────────
 
-async def _handle_article(data: dict) -> None:
-    """Process one normalized article dict (post-curl + post-normalize)."""
+async def _handle_article(data: dict, recv_ts=None, prearmed=None, art_id=None) -> None:
+    """Process one normalized article dict (post-curl + post-normalize).
+
+    recv_ts  — when the WS alert was received (stamped in _ws_loop). Used as
+               ArrivalTime so latency reflects reception, not fetch completion.
+    prearmed — the ticker armed pre-fetch in _handle_alert (or None). If this
+               article is dropped (dedup/block) it is released via the
+               alert-release callback so the consumer can free its client.
+    art_id   — URL-slug id, the key the consumer armed under (passed back on
+               both the accepted payload and any release)."""
     global _news_df, _rejected_count
 
     news_id = data.get('id')
@@ -1172,10 +1275,14 @@ async def _handle_article(data: dict) -> None:
     # Silent dedup (not a filter — just skip re-storing)
     with _objects_lock:
         if news_id in _seen_ids:
+            if prearmed:
+                _emit_alert_release(prearmed, art_id)
             return
         _seen_ids.add(news_id)
 
-    arrival = datetime.now()
+    # ArrivalTime = when the WS alert was received, not when the curl finished,
+    # so a saturated fetch pool can't inflate it. Falls back to now() if unset.
+    arrival = recv_ts or datetime.now()
     id_key = f"id-{news_id}"
 
     # Apply reduced filter pipeline
@@ -1187,6 +1294,10 @@ async def _handle_article(data: dict) -> None:
             _blocked_objects[id_key] = data
         with _rejected_lock:
             _rejected_count += 1
+        if prearmed:
+            # Pre-armed on the alert but the full (post-curl) filter blocked it —
+            # release the warm client the consumer provisioned.
+            _emit_alert_release(prearmed, art_id)
         return
 
     # Accepted branch: DataFrame + accepted objects + auto-blacklist + callback
@@ -1225,6 +1336,8 @@ async def _handle_article(data: dict) -> None:
             'Headline':     title,
             'article_body': data.get('article_body', ''),
             'exchange':     article_exchange,
+            'prearmed':     [prearmed] if prearmed else [],
+            'art_id':       art_id,
         }
         try:
             cb(payload)
@@ -1353,8 +1466,9 @@ async def _async_main(api_key: str) -> None:
                         )
                     auth_failure_streak = 0
                 elif mtype == 'alert':
+                    recv_ts = datetime.now()   # stamp at receipt, before any fetch
                     task = asyncio.create_task(
-                        _handle_alert(msg, http, api_key, fetch_sem)
+                        _handle_alert(msg, http, api_key, fetch_sem, recv_ts)
                     )
                     inflight.add(task)
                     task.add_done_callback(inflight.discard)
