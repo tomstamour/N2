@@ -75,14 +75,14 @@ logger = logging.getLogger("x-wing")
 # (ticker) and `last_close_price` (lastDailyClose) come from the orch-trigger.
 # Edit these in one place. Standalone --flags fall back to these same values.
 # --------------------------------------------------------------------------- #
-CAPITAL                       = 0.50            # dollar budget per trade
+CAPITAL                       = 5.00            # dollar budget per trade
 ACCOUNT                       = "U18283054"     # IBKR account for every order
-INPUT_LIMITS_TABLE            = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/yield-triggerLimit-data/v2-smoothed-yield_vs-stopLimits.tsv"
+INPUT_LIMITS_TABLE            = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/yield-triggerLimit-data/v3-smoothed-yield_vs-stopLimits.tsv"
 LOG_DIR                       = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/xwing-logs"          # xwing_<symbol>_<date>_<time>.log
 PRICE_ACTION_TABLE_DIR        = "xwing_tables"  # xwing-table_<symbol>_<date>_<time>.tsv
-LIFETIME                      = "01:00"         # mm:ss; starts at the buy-signal
-MAX_LIMIT_ENTRY_PERCENT_PRICE = 0.0             # entry = ask * (1 + pct/100)
-MAX_CAP_ENTRY_PERCENT         = 20.0            # cap = last_close * (1 + pct/100)
+LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal
+MAX_LIMIT_ENTRY_PERCENT_PRICE = 4.0             # entry = ask * (1 + pct/100)
+MAX_CAP_ENTRY_PERCENT         = 30.0            # cap = last_close * (1 + pct/100)
 # Connection defaults — used by STANDALONE mode only; in driven mode the clerk
 # owns the shared connection.
 DEFAULT_PORT                  = 4001
@@ -107,17 +107,32 @@ ENTRY_REJECT_CODES = {110, 200, 201, 203}
 # --------------------------------------------------------------------------- #
 # Argument parsing
 # --------------------------------------------------------------------------- #
+MAX_LIFETIME_SEC = 12 * 60 * 60  # 12 hours
+
+
 def parse_lifetime(s: str) -> int:
-    """mm:ss -> total seconds (>0)."""
+    """hh:mm:ss or mm:ss -> total seconds (>0, capped at 12 hours)."""
     try:
-        mm, ss = s.split(":")
-        total = int(mm) * 60 + int(ss)
+        parts = s.split(":")
+        if len(parts) == 3:
+            hh, mm, ss = parts
+            total = int(hh) * 3600 + int(mm) * 60 + int(ss)
+        elif len(parts) == 2:
+            mm, ss = parts
+            total = int(mm) * 60 + int(ss)
+        else:
+            raise ValueError
         if total <= 0:
             raise ValueError
+        if total > MAX_LIFETIME_SEC:
+            raise argparse.ArgumentTypeError(
+                f"--lifetime must be <= 12 hours ({MAX_LIFETIME_SEC}s), got {total}s")
         return total
+    except argparse.ArgumentTypeError:
+        raise
     except Exception:
         raise argparse.ArgumentTypeError(
-            f"--lifetime must be mm:ss with a positive value, got {s!r}")
+            f"--lifetime must be hh:mm:ss or mm:ss with a positive value, got {s!r}")
 
 
 def parse_hhmm(s: str) -> dtime:
@@ -165,7 +180,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Output TSV path (file) or directory. "
                         "Auto-name: xwing-table_<symbol>_<date>_<time>.tsv")
     p.add_argument("--lifetime", type=parse_lifetime, default=parse_lifetime(LIFETIME),
-                   help="Run duration mm:ss; on expiry flatten @ bid and exit")
+                   help="Run duration hh:mm:ss or mm:ss (max 12h); on expiry "
+                        "flatten @ bid and exit")
     p.add_argument("--session-end", dest="session_end", type=parse_hhmm, default=None,
                    help="ET session-close HH:MM; flatten @ bid and exit at/after it")
     p.add_argument("--client-id-base", dest="client_id_base", type=int,
@@ -325,8 +341,18 @@ class PriceActionWriter:
             now = datetime.now()
             fname = f"xwing-table_{symbol}_{now:%Y-%m-%d_%H-%M-%S}.tsv"
             self.path = p / fname
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The file (path + timestamp) is resolved now so it stays aligned with the
+        # session-start naming, but it is NOT opened until the first write() — this
+        # avoids leaving empty, header-only files for sessions that never trade.
         self._lock = threading.Lock()
+        self._fh = None
+        self._w = None
+
+    def _ensure_open(self):
+        """Open the file and write the header on first use. Caller holds _lock."""
+        if self._fh is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         new = not self.path.exists()
         self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._w = csv.DictWriter(self._fh, fieldnames=PA_COLUMNS, delimiter="\t",
@@ -338,10 +364,13 @@ class PriceActionWriter:
 
     def write(self, row: dict):
         with self._lock:
+            self._ensure_open()
             self._w.writerow(row)
             self._fh.flush()
 
     def close(self):
+        if self._fh is None:
+            return
         try:
             self._fh.close()
         except Exception:

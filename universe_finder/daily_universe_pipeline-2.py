@@ -368,6 +368,13 @@ def main() -> None:
     df = build_dataframe(force_refresh=args.refresh)
     log.info(f"  {len(df)} symbols loaded")
 
+    # Drop warrants: 5-character symbols ending in 'W' (e.g. ATIIW, ASPSW).
+    warrant_mask = df["Symbol"].str.len().eq(5) & df["Symbol"].str.endswith("W")
+    n_warrants = warrant_mask.sum()
+    if n_warrants:
+        df = df[~warrant_mask].copy()
+        log.info(f"  Warrant filter: dropped {n_warrants} symbols (5-char ending in W)")
+
     if args.limit and args.limit > 0:
         df = df.head(args.limit).copy()
         log.info(f"  --limit {args.limit}: processing first {len(df)} symbols only")

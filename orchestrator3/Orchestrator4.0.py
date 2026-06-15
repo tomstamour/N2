@@ -10,7 +10,7 @@ import importlib.util as _ilu
 import shutil
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import glob
 
@@ -478,7 +478,7 @@ def _release_armed(ticker: str, art_id: str) -> None:
 # ─── TSV writer ───────────────────────────────────────────────────────────────
 
 _TSV_COLUMNS = [
-    'Symbol', 'Tickers', 'ID', 'ArrivalTime', 'Headline', 'Author',
+    'Symbol', 'Tickers', 'ID', 'Created', 'ArrivalDate', 'ArrivalTime', 'CurlTime', 'Headline', 'Author',
     'Float', 'Exchange',
     'LastDailyClose', 'itiBaseline', 'tradeSizeBaseline',
     'FinBERTCompletedAt',
@@ -568,6 +568,26 @@ def _lookup_author(news_id: str):
     if obj is None:
         return None
     return obj.get('author')
+
+
+def _lookup_created(news_id: str):
+    """Pull the RTPR `created` timestamp from NW4's accepted-objects store and
+    return it as HH:MM:SS.mmm adjusted to UTC-4 (matching ArrivalTime's offset).
+    The raw field is ISO-8601 UTC with milliseconds (e.g. '2026-04-29T00:30:00.073Z').
+    Returns '' if missing or unparseable."""
+    obj = nw.get_news_object(f"id-{news_id}")
+    if obj is None:
+        return ''
+    raw = (obj.get('created') or '').strip()
+    if not raw:
+        return ''
+    try:
+        dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        dt = dt.astimezone(timezone.utc) - timedelta(hours=4)
+        return dt.strftime('%H:%M:%S') + f".{dt.microsecond // 1000:03d}"
+    except Exception as exc:
+        logger.warning(f"_lookup_created: could not parse created={raw!r}: {exc}")
+        return ''
 
 
 def _load_latest_iti_tsv() -> None:
@@ -677,7 +697,10 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         'Symbol':             symbol,
         'Tickers':            json.dumps(tickers),
         'ID':                 news_id,
-        'ArrivalTime':        news_dict['ArrivalTime'].strftime('%Y-%m-%d %H:%M:%S') + f".{news_dict['ArrivalTime'].microsecond // 1000:03d}",
+        'Created':            _lookup_created(news_id),
+        'ArrivalDate':        news_dict['ArrivalTime'].strftime('%Y-%m-%d'),
+        'ArrivalTime':        news_dict['ArrivalTime'].strftime('%H:%M:%S') + f".{news_dict['ArrivalTime'].microsecond // 1000:03d}",
+        'CurlTime':           news_dict['CurlTime'].strftime('%H:%M:%S') + f".{news_dict['CurlTime'].microsecond // 1000:03d}",
         'Headline':           news_dict['Headline'],
         'Author':             _lookup_author(news_id),
         'Float':              _lookup_float(symbol),
@@ -756,7 +779,10 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
     print(f"  Symbol                       : {completed_dict['Symbol']}")
     print(f"  Tickers                      : {completed_dict['Tickers']}")
     print(f"  ID                           : {completed_dict['ID']}")
+    print(f"  Created                      : {completed_dict['Created']}")
+    print(f"  ArrivalDate                  : {completed_dict['ArrivalDate']}")
     print(f"  ArrivalTime                  : {completed_dict['ArrivalTime']}")
+    print(f"  CurlTime                     : {completed_dict['CurlTime']}")
     print(f"  Headline                     : {completed_dict['Headline']}")
     print(f"  Author                       : {completed_dict['Author']}")
     print(f"  FinBERT label                : {completed_dict['label']}")
@@ -800,6 +826,10 @@ def on_news_accepted(news_dict: dict) -> None:
     that was pre-armed but is excluded (headline) or absent from the final list
     is released so we don't hold a warm pool client.
     """
+    # Curl finished moments ago in NW4 (curl → normalize → accept → this callback);
+    # stamp it here as the orchestrator-side "curl process finished" time.
+    news_dict['CurlTime'] = datetime.now()
+
     raw_symbol = news_dict['Symbol']
     news_id    = news_dict['ID']
     tickers    = list(dict.fromkeys(t.strip() for t in raw_symbol.split(',') if t.strip()))
@@ -850,7 +880,24 @@ def on_news_accepted(news_dict: dict) -> None:
     # FinBERT-headliner + body pipeline run once per article (shared futures).
     f_finbert = _finbert_executor.submit(analyze_finbert, news_dict)
     f_body    = _body_executor.submit(_run_body_pipeline, news_dict)
-    for symbol in tickers:
+    # Fan out a TSV row only for in-strategy tickers. Out-of-universe partners
+    # (e.g. foreign/dual-listings like 4TO riding on an in-strategy primary's PR)
+    # are never armed and would only leave a near-empty audit row — skip them.
+    # They remain recorded in the surviving row's Tickers JSON column.
+    row_tickers = [s for s in tickers if s in _inscope_set or s in prearmed_set]
+    if not row_tickers:
+        # Safety net: an accepted article should always have >=1 in-scope ticker;
+        # if the universe sets disagree, fall back to writing every ticker rather
+        # than silently dropping the article from the TSV.
+        logger.warning(f"on_news_accepted: id={news_id} has no in-scope tickers "
+                       f"among {tickers} — writing all rows as fallback")
+        row_tickers = tickers
+    else:
+        skipped = [s for s in tickers if s not in row_tickers]
+        if skipped:
+            logger.info(f"[Fan-out] id={news_id}: skipping out-of-universe "
+                        f"partner tickers {skipped} (no TSV row)")
+    for symbol in row_tickers:
         _collect_executor.submit(
             _collect_and_log, news_dict, tickers, symbol,
             f_finbert, f_body, f_arm.get(symbol), arm_blocked,

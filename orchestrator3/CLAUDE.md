@@ -194,3 +194,57 @@ All in the `BODY_FINBERT_*` block at the top of `Orchestrator3.2.py`:
 - `FinBERT_body_pipeline` — `/home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT_pipeline/`
 - Sibling scripts pulled in by the body pipeline: `jsonCleaner`, `pronounCer`, `SentenceSplitter`, `NerSecDictionary`, `FinBERT/FinBERT-analysis.py` (uses ONNX INT8 model — run `python3 FinBERT-analysis.py --export` once if `finbert_onnx/` is not yet exported).
 - Python deps: `spacy` + `en_core_web_sm`, `fastcoref` (optional but required for `coref_mode='full'`), `transformers`, `optimum[onnxruntime]`.
+
+---
+
+## Orchestrator4.0 (clerk hand-off)
+
+`Orchestrator4.0.py` replaces the legacy trade-mole subprocess launcher with a TCP/JSON hand-off to `clerk-1.1.py` (the warm ibapi client pool in `/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/`). The FinBERT-headliner + noCoref body pipeline is identical to `Orchestrator3.5.py`. Beyond the trade trigger, this version moves the clerk **arm onto the raw WS alert** (pre-fetch) and adds a ticker pre-filter in NewsWatcher4 so `reqMktData` starts without waiting on the article-body curl (see *Arm-on-alert & NW4 pre-filter* below). Run with:
+
+```bash
+python3 Orchestrator4.0.py        # the clerk must already be running (see below)
+```
+
+### Two-step handshake (replaces `maybe_launch_trade_mole`)
+
+The clerk needs both a mole surge **and** a sentiment confirmation before it places an order. The orchestrator drives this with two independent TCP messages to `CLERK_HOST:CLERK_PORT` (default `127.0.0.1:8765`), one JSON object per line, one short-lived connection each (`_send_clerk()`):
+
+- **STEP 1a — ARM (`_arm_clerk`)**: now fires **on the raw WS alert, before the article body is curled** — NewsWatcher4 invokes the registered `register_alert_callback(_on_alert)` the instant an alert's primary ticker passes its cheap pre-filter. `_on_alert` submits `_arm_clerk` on the dedicated `_clerk_executor` (off the NW4 loop thread) so the clerk starts `reqMktData` ASAP, and **stashes the arm future in `_arm_results[(art_id, ticker)]`**. Payload `{"ticker", "lastDailyClose", "itiBaseline", "tradeSizeBaseline"}` — one message **per pre-filter-passing ticker**. When the article is later accepted, `on_news_accepted` **reuses the stashed future** for pre-armed tickers and arms only *new* in-universe partner tickers found in the full (scraped) ticker list. A pre-armed ticker that ends up excluded (ORCH `excluded_strings-2.txt`), dropped before acceptance (curl/normalize failure, dedup, full-filter block), or absent from the final ticker list is **released** (`_on_alert_release`/`_release_armed` → Sentiment `BAD`) so its warm client returns to the pool.
+- **STEP 1b — SENTIMENT (`_send_sentiment`)**: fires from `_collect_and_log` after FinBERT, `{"ticker", "Sentiment": "OK"|"BAD"}`. `_collect_and_log` **waits on the arm future first** (created back on the alert, so it has almost always resolved by now) — the clerk must have registered the session for both the OK gate and the BAD early-release. A `rejected` arm (`no_free_client`) skips STEP 1b; a pre-armed-but-excluded ticker is released here with `BAD` instead of confirming.
+
+### Arm-on-alert & NW4 pre-filter (latency fix)
+
+NewsWatcher4 is alert+curl: a lightweight WS alert arrives, then NW4 HTTP-curls the article body before filtering. Previously the arm fired only **after** that curl, so a saturated fetch pool during top-of-hour PR bursts delayed `reqMktData` by ~10 s (root cause of the NVNI `nGNX50PnTT` case). Three NW4 changes (in `NewsWatcher4.py`) fix this:
+
+- **Pre-filter before the curl** — `_handle_alert` runs `_passes_filters([alert_ticker], '', '')` (universe + blacklist + price/float on the alert's single ticker; empty title/exchange) and **only curls + arms gate-passers**. This slashes burst fetch volume (~78 → ~5–10 curls) and bounds how many warm clients arming consumes. Trade-off: the alert carries only one ticker (the full list is scraped post-curl), so an article whose *only* in-universe ticker is a body-only partner is dropped. On a sampled day this dropped 13/225 accepted PRs — all out-of-strategy foreign/dual-listings (float >50M or price >$10) that previously slipped through NW4's `_passes_filters` **exchange-skip** branch; the empty-exchange gate enforces float/price and tightens that loophole. Zero in-strategy PRs were lost.
+- **Arm/release callbacks** — `register_alert_callback(fn)` fires `fn(ticker, art_id, recv_ts)` on a gate-pass (pre-fetch); `register_alert_release_callback(fn)` fires `fn(ticker, art_id)` when a pre-armed article is dropped before acceptance. The accepted-article payload now also carries `prearmed` (list) + `art_id` so the consumer can dedup arms and key its stash.
+- **ArrivalTime at receipt** — stamped when the WS frame arrives (`_ws_loop`) and threaded through `_handle_alert`→`_handle_article`, so a slow curl no longer inflates it. Fetch pool widened: `MAX_CONCURRENT_FETCHES` 8→32, `HTTP_POOL_LIMIT` 16→32.
+
+### Sentiment gate
+
+`OK` iff headline FinBERT `positive >= SENTIMENT_POSITIVE_MIN` (0.2) — the sole criterion. A missing/failed FinBERT positive → `BAD`. `evaluate_sentiment()`.
+
+### clerk-1.1.py change
+
+`clerk-1.1.py` was patched so a `Sentiment:"BAD"` message immediately `finish()`es the duo and returns the warm client to the pool (reply `sentiment_bad_released`) instead of holding it for the full ~60 s watch window. `"OK"` → `sentiment_ack`; no active session / other → `sentiment_ignored`.
+
+### Universe lookups
+
+The daily `stocks_universe_YYYY-MM-DD.tsv` adds `LastDailyClosePrice`, `RTH_tradeSize`, `ETH_TradeSize` (note: **inconsistent casing** — lowercase `t` in RTH, uppercase `T` in ETH). New helpers `_lookup_last_close`, `_lookup_baseline_trade_size` mirror `_lookup_baseline_iti` (RTH 09:30–16:00 ET via `_is_rth_now()`, else ETH). All lookups route through `_coerce_float`, which maps blanks / NaN / the literal `skipped_nan` string (~13% of rows) to `None`/sentinel without raising. Missing trade-size/ITI → `44444` sentinel (trade-mole treats it as "no baseline"); missing close → `null` (x-wing runs without its optional entry-price cap).
+
+### TSV columns
+
+Drops `Trigger`; adds `LastDailyClose`, `itiBaseline`, `tradeSizeBaseline` (what was sent), `Sentiment` (OK/BAD), `ClerkArm` (`accepted:<clientId>` / `rejected:<reason>` / `skipped:excluded_string` / `skipped:not_armed`), and `ClerkSentiment` (`sentiment_ack` / `sentiment_bad_released` / `sentiment_ignored` / `skipped:*`). With arm-on-alert, `sentiment_bad_released` now also appears when a pre-armed ticker is released because its headline was excluded. `_append_to_tsv` auto-rotates on header mismatch.
+
+### Config knobs (top of `Orchestrator4.0.py`)
+
+`CLERK_HOST`, `CLERK_PORT`, `CLERK_TIMEOUT_SEC`, `CLERK_ARM_WAIT_SEC`, `SENTIMENT_POSITIVE_MIN`, `TRADE_SIZE_SENTINEL`, `DEFAULT_BASELINE_ITI`, `UNIVERSE_DATA_DIR`, `ORCH_EXCLUDED_STRINGS_FILE`. The `TM_*` subprocess/surge knobs are gone — surge thresholds now live in trade-mole-2.1 inside the clerk.
+
+### Dependencies (vs 3.5)
+
+- `clerk-1.1.py` — `/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/` (start it first; it loads `x-wing-2.0.py` + `trade-mole-2.1.py` and connects its own ibapi pool). Start example:
+  ```bash
+  /home/tom/venv/bin/python clerk-1.1.py --client-qty 5 --port 4002 --listen-port 8765
+  ```
+  `--port 4001` is the **LIVE** Gateway (real money); use `4002` (paper GW) for testing.
+- The orchestrator no longer spawns `trade_mole_*.py` or opens any ibapi connection of its own.

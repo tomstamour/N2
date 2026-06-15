@@ -1,0 +1,93 @@
+prev_trd_time_gap / bsln_over_prev_trd_gap — sorted threshold tables
+Labeled augmented set: 15 positives / 14 negatives
+(CAST is absent — no tick-45 anchor, so no value.)
+Generated 2026-06-13.
+
+================================================================
+prev_trd_time_gap  —  ascending  (lower = surge)
+================================================================
+rank  label  ticker     value
+  1   POS    XOS        0.30263
+  2   POS    SUNE       0.41306
+  3   POS    SNBR       0.44040
+  4   POS    TGL        0.44763
+  ------------------- clean cut <= 0.448 -> 4/15, zero negatives -------------------
+  5   NEG    XELB       0.47698
+  6   NEG    SMCI       0.68368
+  7   POS    MVIS       0.72881
+  8   POS    CPOP       0.86899
+  9   POS    PPCB       0.96898
+ 10   POS    CLIK       1.10008
+ 11   POS    STAK       1.10235
+ 12   POS    NCRA       1.19469
+ 13   NEG    LHSW       1.62738
+ 14   NEG    JTAI       1.96722
+ 15   NEG    TMDE       5.48945
+ 16   NEG    VIDA      14.98116
+ 17   NEG    COSM      23.61894
+ 18   POS    QUCY      67.68464
+ 19   NEG    AIIO     182.82615
+ 20   NEG    NTCL     184.18875
+ 21   NEG    TOMZ     190.46292
+ 22   NEG    ARTL     248.16727
+ 23   POS    INHD     358.37555
+ 24   NEG    SDA      386.70894
+ 25   POS    KMRK     409.17177
+ 26   POS    TOVX     410.36375
+ 27   NEG    VMAR     483.53552
+ 28   NEG    MDAI     757.20245
+ 29   POS    VBIO    8119.35575
+
+Blockers: negatives XELB (0.477) and SMCI (0.684) sit just above the cut.
+Tolerating both (k=2) -> <= 0.969 adds MVIS, CPOP, PPCB = 7/15 but 2 false fires.
+
+================================================================
+bsln_over_prev_trd_gap  —  descending  (higher = surge)
+================================================================
+rank  label  ticker     value          note
+  1   NEG    SMCI    65007.12871   <- 44444 baseline SENTINEL (fetch fail)
+  2   POS    MVIS    60981.79362   <- 44444 baseline SENTINEL (fetch fail)
+  3   POS    TGL     29712.15448
+  4   POS    CPOP    11296.72187
+  5   POS    SUNE     8033.96132
+  6   POS    PPCB     4042.28164
+  ------------------- clean cut >= 4042 -> 4/15 (sentinels abstained) -------------------
+  7   NEG    XELB      807.16742
+  8   NEG    JTAI      635.71965
+  9   POS    CLIK      306.34102
+ 10   NEG    TMDE      122.63532
+ 11   POS    NCRA      104.96415
+ 12   POS    SNBR       82.19776
+ 13   NEG    LHSW       51.00224
+ 14   POS    KMRK       41.95280
+ 15   POS    XOS        29.40841
+ 16   POS    STAK       21.95301
+ 17   NEG    TOMZ        6.49523
+ 18   NEG    ARTL        2.37179
+ 19   NEG    VIDA        2.06927
+ 20   NEG    SDA         1.59965
+ 21   NEG    MDAI        1.28446
+ 22   POS    QUCY        0.89533
+ 23   NEG    NTCL        0.88713
+ 24   POS    VBIO        0.75166
+ 25   POS    TOVX        0.66697
+ 26   NEG    COSM        0.47843
+ 27   POS    INHD        0.34210
+ 28   NEG    AIIO        0.18323
+ 29   NEG    VMAR        0.12347
+
+Read carefully: the two highest values are negative/sentinel-polluted — SMCI and
+MVIS top the list only because their ITI baseline is the 44444 fetch-fail sentinel
+(huge numerator). The analysis layer abstains on them. With those set aside, the
+top-4 are positives with a ~5x margin to the nearest negative (XELB 807).
+
+================================================================
+Key takeaway
+================================================================
+Both columns give a clean 4/15 snapshot cut, but on DIFFERENT positives:
+  - prev_trd_time_gap     <= 0.448 -> {XOS, SUNE, SNBR, TGL}
+  - bsln_over_prev_trd_gap >= 4042 -> {TGL, CPOP, SUNE, PPCB}
+Overlap is only SUNE + TGL. Dividing by each name's baseline ITI reorders which
+positives look "fresh" — which is why keeping both columns is worthwhile, and why
+the sentinel guard matters (raw, bsln_over_prev_trd_gap would crown SMCI the
+strongest surge, which is false).

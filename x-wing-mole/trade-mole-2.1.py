@@ -129,6 +129,32 @@ DEFAULT_SURGE_MIN_BID_DRIFT_BP = 0.0     # bid must be non-falling over 5s
 DEFAULT_SURGE_MIN_TRADES_5S = 5          # absolute floor
 DEFAULT_SURGE_MAX_PRICE_DROP_PCT = 0.005  # block if last price is >0.5% below session-start price
 
+# Quote-churn surge rule (active in should_fire as of 2026-06-11). Calibrated on
+# the 2026-06-08..11 labeled set; see mole-outputs/iti-threshold-analysis-2026-06-11.md.
+# quote_updates_10s >= 11 caught 13/13 positives at ~0.75s median latency with the
+# fewest false positives. The 5s/8 variant fires ~0.25s sooner (one more FP).
+DEFAULT_SURGE_QUOTE_WINDOW = 10          # seconds; must be one of WINDOWS
+DEFAULT_SURGE_MIN_QUOTE_UPDATES = 11     # quote_updates in that window
+
+# Start-staleness trigger (added 2026-06-14). bsln_over_prev_trd_gap is constant
+# per session = hist baseline ITI / tape-staleness-at-subscribe (prev_trd_time_gap).
+# A high value means the tape was very stale relative to the stock's own cadence at
+# the instant we hit record — i.e. a surge that was already in progress. This value
+# is available from the first trade, so the rule fires immediately. It is ORed with
+# the quote-churn rule in should_fire. Strict greater-than; hardcoded (not CLI-tunable).
+# Skipped when there is no valid ITI baseline (see _has_iti_baseline), so the 44444
+# sentinel / a stale tape can't false-fire it.
+BSLN_OVER_PREV_TRD_GAP_THRESHOLD = 100.0
+
+# Last-3-trades ITI-collapse trigger (added 2026-06-14). Fires when
+# bslnITI_on_last3trades_avrgITI > BSLN_ITI_LAST3_THRESHOLD, i.e. the hist baseline
+# ITI is >100x the mean of the two most recent measured ITIs — the tape has sped up
+# dramatically vs the stock's own cadence over the last couple of trades, a live
+# (not start-of-session) surge signature. ORed with the other rules in should_fire.
+# Strict greater-than; hardcoded (not CLI-tunable). Skipped when the value is None
+# (first accepted trade, or no valid ITI baseline), so it cannot false-fire.
+BSLN_ITI_LAST3_THRESHOLD = 100.0
+
 # Trade-size baseline (v2.1). The universe pipeline writes 44444 when the
 # historical trade-size fetch was ATTEMPTED but FAILED (see
 # universe_finder/tradeSizeExplained.txt); treat it as "no baseline".
@@ -136,13 +162,11 @@ TRADE_SIZE_BASELINE_SENTINEL = 44444.0
 # A print counts as "large" (block-ish) when size >= this multiple of baseline.
 DEFAULT_LARGE_TRADE_MULT = 2.0
 
-# Legacy thresholds kept ONLY so the column schema remains stable; they
-# do not gate the new composite surge rule.
-LEGACY_RATE_RATIO_1_BASE = 5.0
-LEGACY_RATE_RATIO_5_BASE = 3.0
-LEGACY_ITI_COLLAPSE = 2.0
-LEGACY_PRIOR_ITI_MIN = 10.0
-LEGACY_MIN_TRADES_1S = 2
+# Each fill is double-reported on RTVolume (tick 48) + RTTradeVolume (tick 77)
+# ~0.5ms apart. A trade arriving < this gap after the previously accepted trade
+# from the OTHER RT channel is treated as that duplicate and does not advance the
+# measured-ITI series (it forward-fills the parent values instead).
+DEDUP_EPSILON_SEC = 0.005
 
 # Generic ticks for reqMktData
 GENERIC_TICKS = "233,236,293,294,295,318,375,165,221"
@@ -158,10 +182,14 @@ ET = ZoneInfo("America/New_York")
 
 def _compute_collection_start_delay(now=None):
     """
-    If `now` (default: real wall clock) falls in the closed-market window
-    [20:00, 24:00) U [00:00, 04:00) ET, return (seconds_until_next_0400_ET,
-    target_dt_in_ET). Otherwise return (0.0, None) and the caller starts
-    collection immediately.
+    Return (seconds_to_wait, target_dt_in_ET) for when to begin collecting.
+
+    On a WEEKDAY in the open window [04:00, 20:00) ET, return (0.0, None) and the
+    caller starts collection immediately. Otherwise the market is closed (the
+    [20:00, 04:00) overnight window, OR any time on a weekend), so defer to the
+    next 04:00 ET, rolling Saturday/Sunday targets forward to Monday 04:00 ET so
+    we never subscribe to a dead weekend market. NYSE holidays are NOT handled
+    here (they need an external market calendar) — a follow-up.
     """
     now = now if now is not None else datetime.now(tz=ET)
     if now.tzinfo is None:
@@ -170,7 +198,8 @@ def _compute_collection_start_delay(now=None):
         now = now.astimezone(ET)
 
     h = now.hour
-    if 4 <= h < 20:
+    is_weekend = now.weekday() >= 5          # Saturday(5) / Sunday(6)
+    if 4 <= h < 20 and not is_weekend:
         return 0.0, None
 
     if h >= 20:
@@ -178,6 +207,8 @@ def _compute_collection_start_delay(now=None):
     else:
         base = now
     target = base.replace(hour=4, minute=0, second=0, microsecond=0)
+    while target.weekday() >= 5:             # roll Sat/Sun forward to Monday 04:00
+        target += timedelta(days=1)
     delay = (target - now).total_seconds()
     return max(delay, 0.0), target
 
@@ -267,6 +298,8 @@ class IBKRSurgeApp(EWrapper, EClient):
         surge_min_bid_drift_bp: float,
         surge_min_trades_5s: int,
         surge_max_price_drop_pct: float = DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
+        surge_min_quote_updates: int = DEFAULT_SURGE_MIN_QUOTE_UPDATES,
+        surge_quote_window: int = DEFAULT_SURGE_QUOTE_WINDOW,
         baseline_avg_trade_size: Optional[float] = None,
         large_trade_mult: float = DEFAULT_LARGE_TRADE_MULT,
         logger: Optional[logging.Logger] = None,
@@ -281,6 +314,16 @@ class IBKRSurgeApp(EWrapper, EClient):
         # hist_baseline_* columns and accel_*_vs_hist_baseline ratios.
         self._hist_baseline_avg_iti = baseline_avg_iti
         self._hist_baseline_trade_rate = 1.0 / baseline_avg_iti
+        # Whether the ITI baseline is usable for the start-staleness trigger.
+        # The universe pipeline writes the same 44444 sentinel on a failed fetch;
+        # a missing / non-positive / sentinel value disables the bsln_over_prev_trd_gap
+        # rule (it must not false-fire on garbage), while the legacy hist_baseline_*
+        # columns are still emitted unguarded as before.
+        self._has_iti_baseline = (
+            baseline_avg_iti is not None
+            and baseline_avg_iti > 0
+            and abs(baseline_avg_iti - TRADE_SIZE_BASELINE_SENTINEL) > 1e-6
+        )
 
         # Trade-size baseline (v2.1). The orchestrator supplies the historical
         # average shares-per-trade (RTH/ETH already selected). It is defined to
@@ -302,6 +345,10 @@ class IBKRSurgeApp(EWrapper, EClient):
         self._surge_min_bid_drift_bp = surge_min_bid_drift_bp
         self._surge_min_trades_5s = surge_min_trades_5s
         self._surge_max_price_drop_pct = surge_max_price_drop_pct
+
+        # Active quote-churn rule thresholds (see should_fire).
+        self._surge_min_quote_updates = surge_min_quote_updates
+        self._surge_quote_window = surge_quote_window
 
         # Request IDs
         self.req_id_mkt = 1001
@@ -341,6 +388,28 @@ class IBKRSurgeApp(EWrapper, EClient):
         # Rolling quote log: (mono_ts, bid, ask, bid_size, ask_size, spread_pct)
         # Updated from any tickPrice (1/2) or tickSize (0/3) call.
         self._quote_log: deque = deque()
+
+        # Measured-ITI state. last_timestamp_at_subscribe is the LAST_TIMESTAMP
+        # (tick 45) frozen from the first such tick — the exchange time of the
+        # last trade BEFORE we subscribed; it seeds the first measured ITI.
+        self._last_timestamp_at_subscribe: Optional[float] = None
+        # Wall-clock epoch of the moment we started recording (first event seen).
+        # prev_trd_time_gap = this − LAST_TIMESTAMP: how stale the tape was at the
+        # instant we hit record (available before any trade prints). NOTE: tick-45
+        # is whole-second resolution and this is the local clock vs the exchange
+        # clock, so it is a coarse, conservative upper bound on staleness.
+        self._subscribe_wall: Optional[float] = None
+        self._prev_trd_time_gap: Optional[float] = None
+        self._last_accepted_trade_mono: Optional[float] = None
+        self._last_accepted_rt_source: Optional[str] = None
+        self._prev_measured_iti: Optional[float] = None
+        self._prev_ratio_baseline: Optional[float] = None
+        # bslnITI_on_last3trades_avrgITI = hist baseline ITI / mean of the 2 most
+        # recent accepted measured ITIs. Forward-filled on deduped twin prints.
+        self._prev_bsln_on_last3: Optional[float] = None
+        # Current trade's bslnITI_on_last3trades_avrgITI, exposed to should_fire
+        # (Rule C). Set each accepted/duplicate trade just before surge detection.
+        self._cur_bsln_on_last3: Optional[float] = None
 
         # Captured event records -> DataFrame at end
         self.records: list = []
@@ -422,6 +491,7 @@ class IBKRSurgeApp(EWrapper, EClient):
             return
         if self._session_start_mono is None:
             self._session_start_mono = now_mono
+            self._subscribe_wall = now_wall  # epoch of recording start, for prev_trd_time_gap
             self._start_price = price       # anchor = first trade price of the session
         self._last_trade_price = price
 
@@ -430,6 +500,81 @@ class IBKRSurgeApp(EWrapper, EClient):
         if self._last_trade_mono is not None:
             iti = now_mono - self._last_trade_mono
         self._last_trade_mono = now_mono
+
+        # Measured-ITI columns. Local-clock trade-to-trade gaps, deduped per real
+        # trade (the RTVolume/RTTradeVolume twin of a fill forward-fills instead of
+        # injecting a ~0.0005s spike). The FIRST accepted trade is seeded from the
+        # exchange-epoch pre-first-trade gap (first trade time − LAST_TIMESTAMP at
+        # subscribe). All ratios/velocities guard zero/None denominators.
+        measured_iti = None
+        ratio_base_over_iti = None
+        bsln_on_last3 = None
+        m_collapse_ratio = m_collapse_diff = m_collapse_vel = None
+        r_collapse_ratio = r_collapse_diff = r_collapse_vel = None
+
+        is_duplicate = (
+            self._last_accepted_trade_mono is not None
+            and rt_source != self._last_accepted_rt_source
+            and (now_mono - self._last_accepted_trade_mono) < DEDUP_EPSILON_SEC
+        )
+
+        if is_duplicate:
+            # Same fill on the other RT channel: forward-fill, do not advance state.
+            measured_iti = self._prev_measured_iti
+            ratio_base_over_iti = self._prev_ratio_baseline
+            bsln_on_last3 = self._prev_bsln_on_last3
+        else:
+            if self._last_accepted_trade_mono is None:
+                # Seed the first measured ITI from the exchange-clock pre-first-trade
+                # gap (first trade time − LAST_TIMESTAMP). This stays within the
+                # exchange clock, so it is the cleaner "true first interval".
+                exch = (rt_time_ms / 1000.0) if rt_time_ms else None
+                first_iti = None
+                if exch is not None and self._last_timestamp_at_subscribe is not None:
+                    first_iti = exch - self._last_timestamp_at_subscribe
+                measured_iti = first_iti
+                # prev_trd_time_gap: staleness of the tape at recording-start, the
+                # snapshot lead signal (computed once, available at t=0).
+                if (
+                    self._prev_trd_time_gap is None
+                    and self._subscribe_wall is not None
+                    and self._last_timestamp_at_subscribe is not None
+                ):
+                    self._prev_trd_time_gap = (
+                        self._subscribe_wall - self._last_timestamp_at_subscribe
+                    )
+            else:
+                measured_iti = now_mono - self._last_accepted_trade_mono
+
+            if measured_iti is not None and measured_iti > 0:
+                ratio_base_over_iti = self._hist_baseline_avg_iti / measured_iti
+
+            pm = self._prev_measured_iti
+            if measured_iti is not None and pm is not None:
+                m_collapse_diff = measured_iti - pm
+                if pm > 0:
+                    m_collapse_ratio = measured_iti / pm
+                if measured_iti > 0:
+                    m_collapse_vel = (measured_iti - pm) / measured_iti
+                # bslnITI_on_last3trades_avrgITI: baseline ITI over the mean of the
+                # 2 most recent measured ITIs (current + previous accepted trade).
+                # None on the first accepted trade (pm is None there).
+                avg2 = (measured_iti + pm) / 2.0
+                if avg2 > 0:
+                    bsln_on_last3 = self._hist_baseline_avg_iti / avg2
+            pr = self._prev_ratio_baseline
+            if ratio_base_over_iti is not None and pr is not None:
+                r_collapse_diff = ratio_base_over_iti - pr
+                if pr != 0:
+                    r_collapse_ratio = ratio_base_over_iti / pr
+                if measured_iti is not None and measured_iti > 0:
+                    r_collapse_vel = (ratio_base_over_iti - pr) / measured_iti
+
+            self._last_accepted_trade_mono = now_mono
+            self._last_accepted_rt_source = rt_source
+            self._prev_measured_iti = measured_iti
+            self._prev_ratio_baseline = ratio_base_over_iti
+            self._prev_bsln_on_last3 = bsln_on_last3
 
         # M1 — aggressor classification against the prevailing NBBO snapshot
         aggr = self._classify_aggressor(price)
@@ -463,6 +608,8 @@ class IBKRSurgeApp(EWrapper, EClient):
 
         # Surge detection — composite rule on new metrics
         session_age = now_mono - self._session_start_mono
+        # Expose this trade's bslnITI_on_last3trades_avrgITI to should_fire (Rule C).
+        self._cur_bsln_on_last3 = bsln_on_last3
         surge, reason = self._detect_surge(win, iti)
 
         rec = {
@@ -494,6 +641,15 @@ class IBKRSurgeApp(EWrapper, EClient):
             "cum_trade_count": self._cum_trade_count,
             "cum_dollar_volume": self._cum_dollar_volume,
             "vwap": self._vwap,
+            "measured_ITIsec": measured_iti,
+            "bslnITI_on_last3trades_avrgITI": bsln_on_last3,
+            "ratio_baseline_over_measured_ITI": ratio_base_over_iti,
+            "measured_ITIsec_collapse_ratio": m_collapse_ratio,
+            "measured_ITIsec_collapse_diff": m_collapse_diff,
+            "measured_ITIsec_collapse_velocity": m_collapse_vel,
+            "ratio_baseline_collapse_ratio": r_collapse_ratio,
+            "ratio_baseline_collapse_diff": r_collapse_diff,
+            "ratio_baseline_collapse_velocity": r_collapse_vel,
             "inter_trade_time_sec": iti,
             "session_age_sec": session_age,
             "halted": self._halted,
@@ -515,10 +671,14 @@ class IBKRSurgeApp(EWrapper, EClient):
 
         if surge:
             iti_str = f"{iti:.2f}s" if iti is not None else "n/a"
+            lift_5s = win["lift_offer_ratio_5s"]
+            lift_str = f"{lift_5s:.2f}" if lift_5s is not None else "n/a"
             self._log.warning(
                 f"\U0001F680 SURGE {self.symbol} @ ${price:.4f} sz={size} "
+                f"| quote_updates_{self._surge_quote_window}s="
+                f"{win.get(f'quote_updates_{self._surge_quote_window}s')} "
                 f"| trades_5s={win['trades_in_5s']} $rate_5s={win['dollar_rate_5s']:.0f}/s "
-                f"| lift_5s={win['lift_offer_ratio_5s']:.2f} "
+                f"| lift_5s={lift_str} "
                 f"| bid_drift_5s={win['bid_drift_5s_bp']}bp "
                 f"| iti={iti_str} | {reason}"
             )
@@ -803,52 +963,88 @@ class IBKRSurgeApp(EWrapper, EClient):
     # method only; everything upstream (recording, columns, buy-signal wiring)
     # stays the same. Return (should_fire: bool, reason: str).
     # ====================================================================== #
+    def _bsln_over_prev_trd_gap(self) -> Optional[float]:
+        """
+        Live value of the bsln_over_prev_trd_gap column = hist baseline ITI /
+        tape-staleness-at-subscribe (prev_trd_time_gap). Constant per session once
+        prev_trd_time_gap is established (on the first accepted trade). Mirrors the
+        formula in write_records_output, except it returns None when there is no
+        valid ITI baseline (missing / <=0 / 44444 sentinel) so the trigger can skip
+        it — the written column itself stays unguarded, matching the prior behavior.
+        """
+        if not self._has_iti_baseline:
+            return None
+        gap = self._prev_trd_time_gap
+        base = self._hist_baseline_avg_iti
+        if gap and gap > 0 and base is not None:
+            return base / gap
+        return None
+
     def should_fire(self, w: dict, iti: Optional[float]) -> tuple:
         """
-        Current (temporary) composite rule. Fires if ALL of:
-          - dollar_rate_5s >= --surge-dollar-rate
-          - spread_pct (current) <= --surge-max-spread-pct
-          - lift_offer_ratio_5s >= --surge-min-lift-ratio
-          - bid_drift_5s_bp >= --surge-min-bid-drift-bp
-          - trades_in_5s >= --surge-min-trades-5s
-          - last price is NOT more than --surge-max-price-drop-pct below the
-            session-start price (i.e. not in a net selloff since start)
+        OR of three trigger rules — any one alone fires the buy-signal.
+
+        Rule A — Quote-churn (active since 2026-06-11): fire when the NBBO is being
+        repainted rapidly, i.e.
+
+            quote_updates_{window}s >= surge_min_quote_updates
+
+        Calibrated on the 2026-06-08..11 labeled set (see
+        mole-outputs/iti-threshold-analysis-2026-06-11.md). It replaced the prior
+        price-momentum rule (bid_drift + mid_velocity), which only fired on a
+        *fresh* upward price thrust and therefore missed surges that were already
+        in progress when recording started (flat/choppy/retracing price, zero
+        bid_drift). Quote-churn is high from the first tick on a genuine surge, so
+        this fires sub-second even when the price move predates the recording, and
+        it does not disadvantage illiquid low-float names.
+
+        Rule B — Start-staleness (added 2026-06-14): fire when
+
+            bsln_over_prev_trd_gap > BSLN_OVER_PREV_TRD_GAP_THRESHOLD
+
+        i.e. the tape was very stale at subscribe relative to the stock's own
+        historical cadence — another signature of a surge that began before we hit
+        record. This ratio is constant per session and known from the first accepted
+        trade, so Rule B can fire on the very first trade row. It is skipped when
+        there is no valid ITI baseline (missing / <=0 / 44444 sentinel) so a failed
+        baseline fetch cannot false-fire it.
+
+        Rule C — last-3-trades ITI collapse (added 2026-06-14): fire when
+
+            bslnITI_on_last3trades_avrgITI > BSLN_ITI_LAST3_THRESHOLD
+
+        i.e. the hist baseline ITI is >100x the mean of the two most recent measured
+        ITIs — the tape has accelerated sharply vs the stock's own cadence over the
+        last couple of trades. Unlike Rule B (a fixed, start-of-session ratio), this
+        updates every accepted trade, so it catches surges that develop after we hit
+        record. Skipped when the value is None (first accepted trade, or no valid ITI
+        baseline), so it cannot false-fire.
         """
-        reasons = []
-        sp = self._spread_pct(self._last_bid) if self._last_bid else None
-        # Fall back to the live midprice for spread_pct denominator
-        mid = self._midprice()
-        if mid and self._last_bid is not None and self._last_ask is not None and self._last_ask > self._last_bid:
-            sp = (self._last_ask - self._last_bid) / mid
-
-        cond_trades = w.get("trades_in_5s", 0) >= self._surge_min_trades_5s
-        cond_dollar = w.get("dollar_rate_5s", 0.0) >= self._surge_dollar_rate
-        cond_spread = sp is not None and sp <= self._surge_max_spread_pct
-        lift = w.get("lift_offer_ratio_5s")
-        cond_lift = lift is not None and lift >= self._surge_min_lift_ratio
-        bid_drift = w.get("bid_drift_5s_bp")
-        cond_drift = bid_drift is not None and bid_drift >= self._surge_min_bid_drift_bp
-
-        # Block entries on a net selloff since the session started. Fail-open if
-        # the anchor isn't set yet (should not happen: should_fire is only
-        # reached from inside a trade event, after _start_price is set).
-        price_chg = None
-        cond_not_selloff = True
-        if self._start_price and self._last_trade_price:
-            price_chg = (self._last_trade_price - self._start_price) / self._start_price
-            cond_not_selloff = price_chg >= -self._surge_max_price_drop_pct
-
-        if (cond_trades and cond_dollar and cond_spread and cond_lift
-                and cond_drift and cond_not_selloff):
-            px_chg_str = f"|px_chg={price_chg*100:.2f}%" if price_chg is not None else ""
-            reasons.append(
-                f"$rate_5s={w['dollar_rate_5s']:.0f}|"
-                f"sp={sp:.3f}|"
-                f"lift={lift:.2f}|"
-                f"bid_drift={bid_drift:.0f}bp"
-                f"{px_chg_str}"
+        # Rule B — start-staleness (OR). Constant per session; may fire immediately.
+        bsln_gap = self._bsln_over_prev_trd_gap()
+        if bsln_gap is not None and bsln_gap > BSLN_OVER_PREV_TRD_GAP_THRESHOLD:
+            return (
+                True,
+                f"bsln_over_prev_trd_gap={bsln_gap:.2f}>"
+                f"{BSLN_OVER_PREV_TRD_GAP_THRESHOLD:.0f}",
             )
-        return (len(reasons) > 0, "|".join(reasons))
+
+        # Rule C — last-3-trades ITI collapse (OR). Updates every accepted trade.
+        bsln_last3 = self._cur_bsln_on_last3
+        if bsln_last3 is not None and bsln_last3 > BSLN_ITI_LAST3_THRESHOLD:
+            return (
+                True,
+                f"bslnITI_on_last3trades_avrgITI={bsln_last3:.2f}>"
+                f"{BSLN_ITI_LAST3_THRESHOLD:.0f}",
+            )
+
+        # Rule A — quote-churn (OR).
+        col = f"quote_updates_{self._surge_quote_window}s"
+        qu = w.get(col)
+        if qu is not None and qu >= self._surge_min_quote_updates:
+            return (True, f"{col}={qu:.0f}>={self._surge_min_quote_updates:.0f}")
+
+        return (False, "")
 
     # ------------------------------------------------------------------
     # Generic tick callbacks (from reqMktData)
@@ -974,6 +1170,15 @@ class IBKRSurgeApp(EWrapper, EClient):
             except Exception as e:
                 self._log.debug(f"RTVolume parse error on {value!r}: {e}")
 
+        # 45 = LAST_TIMESTAMP: epoch (sec) of the last trade. Freeze the FIRST one
+        # we receive — IBKR's subscription snapshot carries the last trade BEFORE
+        # we connected, which seeds the pre-first-trade measured ITI.
+        if tickType == 45 and value and self._last_timestamp_at_subscribe is None:
+            try:
+                self._last_timestamp_at_subscribe = float(int(value))
+            except (ValueError, TypeError):
+                self._log.debug(f"LAST_TIMESTAMP parse error on {value!r}")
+
         self.records.append({
             "event_type": "TICK_STRING",
             "local_arrival_time": now_wall,
@@ -1030,6 +1235,13 @@ def build_column_order() -> list:
         "bid", "ask", "bid_size", "ask_size",
         "spread", "spread_pct", "midprice", "microprice",
         "cum_volume", "cum_trade_count", "cum_dollar_volume", "vwap",
+        "prev_trd_time_gap", "bsln_over_prev_trd_gap",
+        "measured_ITIsec", "bslnITI_on_last3trades_avrgITI",
+        "ratio_baseline_over_measured_ITI",
+        "measured_ITIsec_collapse_ratio", "measured_ITIsec_collapse_diff",
+        "measured_ITIsec_collapse_velocity",
+        "ratio_baseline_collapse_ratio", "ratio_baseline_collapse_diff",
+        "ratio_baseline_collapse_velocity",
         "inter_trade_time_sec", "session_age_sec",
     ]
     for w in WINDOWS:
@@ -1116,6 +1328,15 @@ def main():
                         help="Composite rule: block trigger if last price is more than "
                              "this fraction below the session-start price "
                              "(e.g. 0.005 = 0.5%%; 0 blocks any net drop).")
+    parser.add_argument("--surge-min-quote-updates", type=int,
+                        default=DEFAULT_SURGE_MIN_QUOTE_UPDATES,
+                        help="Active rule: minimum quote_updates in the quote window "
+                             "to fire (NBBO repaint surge).")
+    parser.add_argument("--surge-quote-window", type=int,
+                        default=DEFAULT_SURGE_QUOTE_WINDOW,
+                        choices=WINDOWS,
+                        help="Active rule: rolling window (s) for the quote_updates "
+                             "trigger; must be one of the recorded windows.")
     parser.add_argument("--keep-recording-after-trigger", action="store_true",
                         help="Do NOT stop recording when the surge/buy-signal fires "
                              "(default: stop at the trigger row). Standalone only.")
@@ -1166,12 +1387,8 @@ def main():
         f"(large_trade_mult={args.large_trade_mult})"
     )
     logging.info(
-        f"Composite rule: dollar_rate_5s>={args.surge_dollar_rate} "
-        f"AND spread_pct<={args.surge_max_spread_pct} "
-        f"AND lift_5s>={args.surge_min_lift_ratio} "
-        f"AND bid_drift_5s>={args.surge_min_bid_drift_bp}bp "
-        f"AND trades_5s>={args.surge_min_trades_5s} "
-        f"AND price_drop_since_start<={args.surge_max_price_drop_pct}"
+        f"Active trigger (quote-churn): "
+        f"quote_updates_{args.surge_quote_window}s>={args.surge_min_quote_updates}"
     )
 
     app = IBKRSurgeApp(
@@ -1183,6 +1400,8 @@ def main():
         surge_min_bid_drift_bp=args.surge_min_bid_drift_bp,
         surge_min_trades_5s=args.surge_min_trades_5s,
         surge_max_price_drop_pct=args.surge_max_price_drop_pct,
+        surge_min_quote_updates=args.surge_min_quote_updates,
+        surge_quote_window=args.surge_quote_window,
         baseline_avg_trade_size=args.baseline_avg_trade_size,
         large_trade_mult=args.large_trade_mult,
     )
@@ -1287,6 +1506,19 @@ def write_records_output(app: "IBKRSurgeApp", output_path: str,
 
     if "local_arrival_iso" in df.columns:
         df["Time"] = df["local_arrival_iso"].str.slice(11, 23)
+
+    # prev_trd_time_gap is a single value (recording-start − LAST_TIMESTAMP at
+    # subscribe); emit it as a constant on every row, including pre-first-trade rows.
+    df["prev_trd_time_gap"] = app._prev_trd_time_gap
+
+    # bsln_over_prev_trd_gap = hist baseline ITI / prev_trd_time_gap: start-staleness
+    # in units of the stock's own trade cadence (higher = surge). Constant per file;
+    # the 44444 baseline sentinel is left unguarded, matching ratio_baseline_over_measured_ITI.
+    _gap = app._prev_trd_time_gap
+    _base = app._hist_baseline_avg_iti
+    df["bsln_over_prev_trd_gap"] = (
+        (_base / _gap) if (_gap and _gap > 0 and _base is not None) else None
+    )
 
     preferred = build_column_order()
     existing = [c for c in preferred if c in df.columns]

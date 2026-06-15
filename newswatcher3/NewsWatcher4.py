@@ -49,6 +49,8 @@ import os
 import re
 import signal
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -100,6 +102,12 @@ _shutdown_event = threading.Event()
 _background_thread: threading.Thread | None = None
 _config: dict = {}
 
+# Dedicated pool for immediate per-article JSON persistence (see
+# _persist_article_now). Decouples disk I/O from NW4's single asyncio loop
+# thread so writing an accepted article never blocks the next alert's arm. Two
+# workers is ample — writes are tiny and the loop only ever submits, never waits.
+_persist_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='nw4-persist')
+
 _news_callback = None
 # Alert-flow callbacks (NW4): fired on the lightweight WS alert, BEFORE the
 # permalink curl, so the orchestrator can arm reqMktData without waiting on the
@@ -115,13 +123,19 @@ logger = logging.getLogger("NewsWatcherV4")
 
 # ─── NW4 tuning knobs ─────────────────────────────────────────────────────────
 
-MAX_CONCURRENT_FETCHES = 32      # cap concurrent permalink curls (was 8 — saturated
-                                 # during top-of-hour bursts; the alert-ticker pre-filter
-                                 # in _handle_alert keeps the actual fetch volume small)
+MAX_CONCURRENT_FETCHES = 64      # cap concurrent permalink curls (was 8 → 32 → 64; still
+                                 # saw a self-draining queue ramp during the 2026-06-15
+                                 # 08:00 burst where ~60 curls fired within ~4s. The
+                                 # alert-ticker pre-filter in _handle_alert keeps the
+                                 # actual fetch volume small; see [Timing] logs below.)
 FETCH_TIMEOUT_SEC      = 10.0    # per-attempt HTTP timeout
 FETCH_MAX_RETRIES      = 3
 FETCH_BACKOFF_SEC      = 0.5     # exponential: 0.5 → 1.0 → 2.0
-HTTP_POOL_LIMIT        = 32      # aiohttp TCPConnector pool size (>= MAX_CONCURRENT_FETCHES)
+SLOW_FETCH_LOG_SEC     = 1.0     # alert→body-ready total at/above this logs [Timing] at
+                                 # INFO (else DEBUG) — splits semwait / curl / normalize
+                                 # so a burst backlog (our queue) is distinguishable from
+                                 # RTPR server slowness (curl). See _handle_alert.
+HTTP_POOL_LIMIT        = 64      # aiohttp TCPConnector pool size (>= MAX_CONCURRENT_FETCHES)
 WS_RECV_TIMEOUT_SEC    = 90      # matches RTPR's 90s pong deadline
 
 # Backoff schedule (seconds) for RTPR auth-class WS close codes (4004 trial-expired,
@@ -189,7 +203,7 @@ def start(
         reject_price_greater_then: Block articles whose ticker has LastDailyClosePrice > this.
         flush_interval_seconds:    How often in-memory state is flushed to disk.
     """
-    global _background_thread, _config
+    global _background_thread, _config, _persist_executor
     global _news_df, _news_objects, _blocked_objects
     global _blacklist_set, _blacklist_records, _universe_set
     global _seen_ids, _fetched_ids, _shutdown_event, _rejected_count
@@ -199,6 +213,14 @@ def start(
         raise RuntimeError(
             "NewsWatcherV4 is already running. Call stop() first."
         )
+
+    # Fresh persist pool for this session. stop() shuts the previous one down,
+    # and start() can't run while the loop thread is alive, so the old pool is
+    # always already drained here. The initial module-level pool has no threads
+    # until first submit, so replacing it on first start() is free.
+    _persist_executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix='nw4-persist'
+    )
 
     # Reset state (safe — background thread not yet alive)
     _shutdown_event = threading.Event()
@@ -337,6 +359,9 @@ def stop() -> None:
         _blocked_objects.clear()
     with _blacklist_lock:
         _blacklist_records.clear()
+
+    # Drain any in-flight immediate-persist writes before declaring stopped.
+    _persist_executor.shutdown(wait=True)
 
     logger.info("NewsWatcherV4 stopped.")
 
@@ -742,6 +767,40 @@ def _write_article_json(directory: str, obj: dict, today_str: str) -> str | None
     except Exception as e:
         logger.error(f"Error writing article JSON {final_path}: {e}")
         return None
+
+
+def _persist_article_now(obj: dict) -> None:
+    """Write one accepted article's per-article JSON (accepted_dir) and per-symbol
+    JSON (output_dir) to disk IMMEDIATELY, off NW4's asyncio loop thread.
+
+    Without this, an accepted article only reaches disk at the next periodic
+    _flush() (default hourly), so a lookup in between finds nothing and a crash
+    before the flush loses up to a full interval of accepted articles. This makes
+    each article durable within milliseconds of acceptance.
+
+    Filenames mirror _flush() steps 4 & 5 exactly (same `obj`, same date basis),
+    so the later flush simply overwrites these files instead of duplicating them —
+    the flush remains the idempotent catch-all/backstop. Atomic temp+replace
+    avoids leaving a partial file if the process dies mid-write. Never raises:
+    runs on the persist pool, so a failure here can't touch the news pipeline."""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    try:
+        # 1. Per-article JSON → accepted_dir (atomic, via shared helper)
+        _write_article_json(_config['accepted_dir'], obj, today_str)
+
+        # 2. Per-symbol JSON → output_dir (NW2 parity; comma-joined tickers)
+        tickers = obj.get('tickers') or []
+        symbol_str = ','.join(tickers) if tickers else (obj.get('ticker') or 'UNK')
+        symbol_str = _safe_filename_part(symbol_str)
+        final_path = Path(_config['output_dir']) / f"{symbol_str}-{today_str}.json"
+        temp_path = final_path.with_suffix('.json.tmp')
+        with open(temp_path, 'w') as f:
+            json.dump(obj, f, indent=2, default=str)
+        os.replace(temp_path, final_path)
+    except Exception as e:
+        logger.error(
+            f"Immediate persist failed for id={obj.get('id')}: {e}", exc_info=True
+        )
 
 
 # ─── Periodic flush ───────────────────────────────────────────────────────────
@@ -1229,16 +1288,34 @@ async def _handle_alert(
         prearmed = primary
         _emit_alert_arm(prearmed, art_id, recv_ts)
 
+    # Per-stage timing so a top-of-hour burst is diagnosable: semwait = time spent
+    # waiting for a free fetch slot (OUR local queue), curl = the RTPR round-trip
+    # (incl. any retries/backoff), normalize = local HTML scrape. The single TSV
+    # "CurlTime" number can't separate these; the [Timing] line below can.
+    t0 = time.monotonic()
     async with sem:
+        t1 = time.monotonic()                      # semaphore acquired
         raw = await _fetch_article(session, article_url, api_key)
+    t2 = time.monotonic()                          # curl returned
     if raw is None:
         logger.warning(
             f"Fetch failed for article id={art_id} url={article_url[:120]}"
+        )
+        logger.debug(
+            f"[Timing] id={art_id} ticker={primary} semwait={t1 - t0:.3f}s "
+            f"curl={t2 - t1:.3f}s (fetch-failed)"
         )
         _emit_alert_release(prearmed, art_id)
         return
 
     data = _normalize_article(raw, alert, fallback_id=art_id)
+    t3 = time.monotonic()                          # normalize done
+    semwait, curl, normalize, total = t1 - t0, t2 - t1, t3 - t2, t3 - t0
+    timing_msg = (
+        f"[Timing] id={art_id} ticker={primary} semwait={semwait:.3f}s "
+        f"curl={curl:.3f}s normalize={normalize:.3f}s total={total:.3f}s"
+    )
+    (logger.info if total >= SLOW_FETCH_LOG_SEC else logger.debug)(timing_msg)
     if data is None or not data.get('id'):
         # _normalize_article already logged the scrape failure; just drop.
         _emit_alert_release(prearmed, art_id)
@@ -1345,6 +1422,14 @@ async def _handle_article(data: dict, recv_ts=None, prearmed=None, art_id=None) 
             logger.error(
                 f"Exception in callback for id={news_id}: {exc}", exc_info=True
             )
+
+    # Persist this accepted article to disk NOW, instead of waiting for the next
+    # hourly _flush(). Scheduled AFTER the consumer callback so it never delays
+    # the orchestrator's clerk arm / sentiment path, and offloaded to
+    # _persist_executor so the disk I/O never blocks NW4's asyncio loop (a
+    # blocked loop would delay the NEXT alert's arm). The periodic flush still
+    # runs as the idempotent backstop and is what prunes _news_objects.
+    _persist_executor.submit(_persist_article_now, data)
 
 
 # ─── Async main (runs inside background thread) ───────────────────────────────

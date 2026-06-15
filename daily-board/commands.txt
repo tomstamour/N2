@@ -1,0 +1,1 @@
+python3 ./daily-board.py --input /home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/tables/news_output_2026-06-15.tsv

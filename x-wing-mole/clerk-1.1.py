@@ -41,6 +41,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -70,6 +71,12 @@ CD_REQ_ID = 98                  # per-client contractDetails reqId
 # clerk's own daily log (one file per day, rolled at midnight)
 CLERK_LOG_DIR = "clerk_logs"
 
+# durable queue of deferred (closed-market) duos waiting for the next market
+# open. Persisted so a clerk crash/restart while duos are deferred does not lose
+# them: they are replayed and re-armed on startup. See PendingStore / replay_pending.
+CLERK_STATE_DIR = "clerk_state"
+PENDING_DUOS_FILE = "pending_duos.json"
+
 # reconnection watchdog (re-warms pool clients after the daily Gateway restart)
 WATCHDOG_INTERVAL_S       = 30   # poll period for the reconnection watchdog
 RECONNECT_CONNECT_TIMEOUT = 10   # per-attempt wait for connected_evt
@@ -79,7 +86,7 @@ MAX_RECONNECT_ATTEMPTS    = 18   # ~3 min of attempts per watchdog tick
 # trade-mole driven-mode artifacts
 MOLE_OUTPUT_DIR = "mole-outputs"
 MOLE_LOG_DIR = "mole-logs"
-MOLE_LIFETIME_STR = "01:00"     # watch window (mm:ss, per trade_mole convention)
+MOLE_LIFETIME_STR = "02:30"     # watch window (mm:ss, per trade_mole convention)
 DEFAULT_ITI_BASELINE = 44444.00  # used when the orch-trigger has no ITI baseline
 DEFAULT_TRADE_SIZE_BASELINE = 44444.00  # used when the trigger has no trade-size baseline
                                         # (the 44444 sentinel disables the M9 columns)
@@ -226,6 +233,10 @@ class DuoSession:
         self.client = client
         self.symbol = ticker.upper()
         self.last_close = last_close
+        # raw (pre-defaulting) payload values, persisted to the durable store so
+        # replay reconstructs the session through this same constructor path.
+        self._raw_iti_baseline = iti_baseline
+        self._raw_trade_size_baseline = trade_size_baseline
         self.iti_baseline = iti_baseline if (iti_baseline and iti_baseline > 0) \
             else DEFAULT_ITI_BASELINE
         # Trade-size baseline (M9). The 44444 sentinel is passed through as-is;
@@ -238,6 +249,7 @@ class DuoSession:
         self._lock = threading.Lock()
         self._buy_fired = False
         self._finished = False
+        self._mole_written = False    # guard: write the mole CSV exactly once
         self._watch_timer = None
         self._defer_timer = None     # closed-market: idle-until-04:00 ET timer
         self._defer_target = None    # target datetime (ET) we are deferring to
@@ -308,6 +320,9 @@ class DuoSession:
                                                  self._begin_collection_safe)
             self._defer_timer.daemon = True
             self._defer_timer.start()
+            # Persist so this deferred duo survives a clerk crash/restart and is
+            # re-armed at startup (removed once collection begins or it finishes).
+            self.clerk.store.upsert(self._to_record())
             logger.info("[%s] closed-market trigger: client %d bound, deferring "
                         "subscribe %.0fs until %s ET", self.symbol,
                         self.client.client_id, delay_sec,
@@ -316,8 +331,24 @@ class DuoSession:
 
         return self._begin_collection()
 
+    def _to_record(self) -> dict:
+        """Serialize the fields needed to reconstruct this deferred duo on replay."""
+        return {
+            "symbol": self.symbol,
+            "last_close": self.last_close,
+            "iti_baseline": self._raw_iti_baseline,
+            "trade_size_baseline": self._raw_trade_size_baseline,
+            "defer_target_et": self._defer_target.isoformat()
+                if self._defer_target is not None else None,
+            "sentiment": "ok" if self._sentiment_ok.is_set() else "pending",
+            "created_at": datetime.now(tz=trademole.ET).isoformat(),
+        }
+
     def set_sentiment_ok(self):
         self._sentiment_ok.set()
+        # Upgrade the durable record if this duo is still deferred (no-op once it
+        # has begun collecting and removed its record, or for open-market duos).
+        self.clerk.store.set_sentiment(self.symbol, "ok")
 
     def _begin_collection_safe(self):
         """Defer-timer entry point (runs on the Timer thread, off the request
@@ -366,6 +397,10 @@ class DuoSession:
         self._watch_timer = threading.Timer(watch, self._on_watch_timeout)
         self._watch_timer.daemon = True
         self._watch_timer.start()
+        # Collection has begun: the market is open and the duo no longer needs
+        # crash-replay. Drop its durable record (no-op for the open-market path,
+        # which never created one).
+        self.clerk.store.remove(self.symbol)
         logger.info("[%s] duo armed on client %d (watch %ds, iti_baseline=%.2f, "
                     "trade_size_baseline=%.2f, lastClose=%s)", self.symbol,
                     self.client.client_id, watch, self.iti_baseline,
@@ -390,9 +425,29 @@ class DuoSession:
                              name=f"sentiment-gate-{self.symbol}", daemon=True)
         t.start()
 
+    def _write_mole_once(self):
+        """Write the collected trade-mole dataset exactly once. Safe to call
+        from the trigger path and again from finish(): the flag guarantees a
+        single write. The mole halts recording at the buy-signal, so the
+        record buffer is already final by the time the trigger fires."""
+        with self._lock:
+            if self._mole_written:
+                return
+            self._mole_written = True
+        try:
+            trademole.write_records_output(self.mole, self.output_path,
+                                           log=self.mole_log)
+        except Exception as e:
+            logger.error("[%s] writing trade-mole output failed: %s",
+                         self.symbol, e, exc_info=True)
+
     def _await_sentiment_and_launch(self, last_ask):
         """Sentinel thread: waits for the Sentiment gate then launches x-wing,
         or aborts the trade on timeout."""
+        # The mole has stopped recording at the trigger; persist its table now
+        # (off the ibapi thread) so the dataset survives regardless of whether
+        # the sentiment gate passes or x-wing ever fills.
+        self._write_mole_once()
         confirmed = self._sentiment_ok.wait(timeout=SENTIMENT_TIMEOUT_S)
         if self._finished:
             return
@@ -432,6 +487,7 @@ class DuoSession:
             self._finished = True
         self._sentiment_ok.set()                    # unblock sentinel if waiting
         self.clerk.unregister_session(self.symbol)  # remove from routing table
+        self.clerk.store.remove(self.symbol)        # drop durable record (catch-all)
         logger.info("[%s] finishing duo on client %d (%s)",
                     self.symbol, self.client.client_id, reason)
 
@@ -445,13 +501,10 @@ class DuoSession:
         except Exception as e:
             logger.debug("cancelMktData error: %s", e)
 
-        # write the collected dataset (pre-trigger window + trigger row)
-        try:
-            trademole.write_records_output(self.mole, self.output_path,
-                                           log=self.mole_log)
-        except Exception as e:
-            logger.error("[%s] writing trade-mole output failed: %s",
-                         self.symbol, e, exc_info=True)
+        # write the collected dataset (pre-trigger window + trigger row).
+        # Idempotent: a triggered duo already wrote it at trigger time; this
+        # covers the non-triggered exits (no_surge, sentiment_timeout/bad).
+        self._write_mole_once()
 
         # detach per-duo log handlers so loggers don't accumulate across reuse
         for lg in (self.mole_log, self.xwing_log):
@@ -465,6 +518,98 @@ class DuoSession:
 
         self.client.session = None
         self.clerk.release_client(self.client)
+
+
+# --------------------------------------------------------------------------- #
+# Durable pending-duo store
+# --------------------------------------------------------------------------- #
+class PendingStore:
+    """A crash-durable snapshot of the deferred (closed-market) duos that are
+    waiting for the next market open. Scope is deliberately narrow: only duos
+    that have NOT yet begun collecting market data are tracked, so a clerk
+    restart re-arms them. Open-market in-flight duos (which may hold live x-wing
+    orders) are NOT tracked -- resuming those needs IBKR order reconciliation.
+
+    Storage is one JSON snapshot file, rewritten atomically on every mutation
+    (temp file + fsync + os.replace). The in-memory `_data` dict is the source of
+    truth; the file is just its serialization. Volume is tens of records at most,
+    so a full rewrite per mutation is cheap and avoids any log-replay semantics.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+
+    def load(self):
+        """Read the snapshot on startup. A missing/empty/corrupt file is treated
+        as an empty store (logged) -- a bad journal must never crash the clerk."""
+        with self._lock:
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                self._data = {}
+                return
+            except Exception as e:
+                logger.warning("pending store unreadable (%s); starting empty", e)
+                self._data = {}
+                return
+            try:
+                doc = json.loads(raw) if raw.strip() else {}
+                self._data = dict(doc.get("duos", {}))
+            except Exception as e:
+                logger.warning("pending store corrupt (%s); starting empty", e)
+                self._data = {}
+
+    def records(self) -> list[dict]:
+        """Snapshot copy of the current records (for replay)."""
+        with self._lock:
+            return [dict(v) for v in self._data.values()]
+
+    def upsert(self, record: dict):
+        with self._lock:
+            self._data[record["symbol"]] = dict(record)
+            self._flush_locked()
+
+    def set_sentiment(self, symbol: str, value: str):
+        """Upgrade a record's sentiment in place. No-op (no write) if the symbol
+        is not tracked -- open-market duos have no record."""
+        with self._lock:
+            rec = self._data.get(symbol)
+            if rec is None:
+                return
+            rec["sentiment"] = value
+            self._flush_locked()
+
+    def remove(self, symbol: str):
+        """Drop a record. No-op (no write) if the symbol is not tracked."""
+        with self._lock:
+            if symbol not in self._data:
+                return
+            del self._data[symbol]
+            self._flush_locked()
+
+    def _flush_locked(self):
+        """Atomically rewrite the snapshot. Caller holds self._lock."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        doc = {"version": 1, "duos": self._data}
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    "w", dir=str(self.path.parent), prefix=".pending_duos.",
+                    suffix=".tmp", delete=False, encoding="utf-8") as f:
+                tmp = f.name
+                json.dump(doc, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except Exception as e:
+            logger.error("pending store flush failed: %s", e, exc_info=True)
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -529,6 +674,10 @@ class Clerk:
         self._watchdog_thread = None
         self._sessions: dict[str, "DuoSession"] = {}   # ticker → active DuoSession
         self._sessions_lock = threading.Lock()
+        # durable queue of deferred duos (survives restarts); loaded here,
+        # replayed in replay_pending() after the pool is warm.
+        self.store = PendingStore(HERE / CLERK_STATE_DIR / PENDING_DUOS_FILE)
+        self.store.load()
 
     # ---- pool lifecycle ----
     def _connect_one(self, client, *, timeout=15) -> bool:
@@ -653,6 +802,24 @@ class Clerk:
         logger.info("client %d returned to pool (free=%d)",
                     client.client_id, self.pool.free_count)
 
+    def _acquire_healthy_client(self):
+        """Pop free clients until we find a healthy one. Any disconnected client
+        is released back (the watchdog re-warms it); the `tried` guard stops us
+        spinning on the same dead clients. Returns the client or None if none are
+        free/healthy. Shared by handle_trigger and replay_pending."""
+        tried = []
+        while True:
+            c = self.pool.acquire()
+            if c is None:
+                return None
+            if self._down(c):
+                self.pool.release(c)
+                if c in tried:        # cycled through all free clients; all dead
+                    return None
+                tried.append(c)
+                continue
+            return c
+
     # ---- trigger handling ----
     def handle_trigger(self, payload: dict) -> dict:
         ticker = payload.get("ticker")
@@ -662,23 +829,7 @@ class Clerk:
         iti = payload.get("itiBaseline")
         trade_size = payload.get("tradeSizeBaseline")
 
-        # Pop free clients until we find a healthy one. Any disconnected client
-        # is released back (the watchdog re-warms it); the `tried` guard stops
-        # us spinning on the same dead clients within a single trigger.
-        client = None
-        tried = []
-        while True:
-            c = self.pool.acquire()
-            if c is None:
-                break
-            if self._down(c):
-                self.pool.release(c)
-                if c in tried:        # cycled through all free clients; all dead
-                    break
-                tried.append(c)
-                continue
-            client = c
-            break
+        client = self._acquire_healthy_client()
         if client is None:
             logger.warning("[%s] no healthy free client; trigger rejected", ticker)
             return {"status": "rejected", "reason": "no_free_client"}
@@ -699,6 +850,69 @@ class Clerk:
         if session._defer_target is not None:
             reply["deferredUntilET"] = session._defer_target.isoformat()
         return reply
+
+    # ---- crash-recovery replay ----
+    def replay_pending(self):
+        """Re-arm deferred duos persisted before a crash/restart. Called at
+        startup after the pool is warm and before serve(), so replayed sessions
+        exist before any new trigger/sentiment arrives. A record whose defer
+        target has already passed (e.g. crashed over a weekend, restarted after
+        Monday's open) begins collecting immediately."""
+        records = self.store.records()
+        if not records:
+            return
+        logger.info("replaying %d persisted deferred duo(s)", len(records))
+        for rec in records:
+            symbol = rec.get("symbol")
+            if not symbol:
+                continue
+            if rec.get("sentiment") == "bad":      # defensive; bad never persists
+                self.store.remove(symbol)
+                continue
+            client = self._acquire_healthy_client()
+            if client is None:
+                # Leave the record on disk; a later restart with a warm pool can
+                # pick it up. Stop trying -- no clients are available.
+                logger.warning("[%s] no healthy free client for replay; left "
+                               "queued", symbol)
+                break
+
+            session = DuoSession(self, client, symbol, rec.get("last_close"),
+                                 rec.get("iti_baseline"),
+                                 rec.get("trade_size_baseline"))
+            self.register_session(session)
+            if rec.get("sentiment") == "ok":
+                session.set_sentiment_ok()
+            else:
+                logger.warning("[%s] replayed with sentiment still pending; the "
+                               "sentiment gate will time out if it surges "
+                               "(orchestrator does not re-send sentiment)", symbol)
+
+            target = None
+            tgt_str = rec.get("defer_target_et")
+            if tgt_str:
+                try:
+                    target = datetime.fromisoformat(tgt_str)
+                except ValueError:
+                    target = None
+            now_et = datetime.now(tz=trademole.ET)
+            delay = (target - now_et).total_seconds() if target is not None else 0.0
+
+            if delay > 0:
+                session._defer_target = target
+                session._defer_timer = threading.Timer(
+                    delay, session._begin_collection_safe)
+                session._defer_timer.daemon = True
+                session._defer_timer.start()
+                logger.info("[%s] replayed: client %d bound, deferring subscribe "
+                            "%.0fs until %s ET", symbol, client.client_id, delay,
+                            target.isoformat())
+            else:
+                logger.info("[%s] replayed: defer target passed (%s) — beginning "
+                            "collection now on client %d", symbol,
+                            tgt_str or "n/a", client.client_id)
+                threading.Thread(target=session._begin_collection_safe,
+                                 name=f"replay-begin-{symbol}", daemon=True).start()
 
     # ---- TCP listener ----
     def serve(self):
@@ -742,11 +956,18 @@ class Clerk:
                 return
             if "Sentiment" in payload:
                 ticker = payload.get("ticker", "").upper()
+                sentiment = payload.get("Sentiment")
                 with self._sessions_lock:
                     session = self._sessions.get(ticker)
-                if session and payload["Sentiment"] == "OK":
+                if session and sentiment == "OK":
                     session.set_sentiment_ok()
                     reply = {"status": "sentiment_ack", "symbol": ticker}
+                elif session and sentiment == "BAD":
+                    # Bad sentiment: tear the duo down now and return the warm
+                    # client to the pool instead of holding it for the full
+                    # watch window. finish() is idempotent and safe here.
+                    session.finish("sentiment_bad")
+                    reply = {"status": "sentiment_bad_released", "symbol": ticker}
                 else:
                     reply = {"status": "sentiment_ignored", "symbol": ticker}
             else:
@@ -802,7 +1023,7 @@ def main():
                     "x-wing duos on shared connections.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--client-qty", type=int, required=True,
+    p.add_argument("--client-qty", type=int, default=20,
                    help=f"Number of warm clients to connect (ids start at "
                         f"{CLIENT_ID_START}; max id {CLIENT_ID_MAX}).")
     p.add_argument("--host", default="127.0.0.1", help="IBKR Gateway/TWS host")
@@ -844,6 +1065,7 @@ def main():
         clerk.shutdown()
         sys.exit(1)
 
+    clerk.replay_pending()
     clerk.start_watchdog()
 
     try:

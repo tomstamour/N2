@@ -1,0 +1,184 @@
+===========================================================================
+ CONNECTING Orchestrator3.5.py  ->  clerk-1.1.py
+ (developer hand-off summary)
+===========================================================================
+
+PURPOSE
+-------
+Today Orchestrator3.5.py fires trades the OLD way: when a news item passes its
+gate it launches the legacy trade_mole_4.1.py as a detached subprocess
+(_do_launch_trade_mole, Orchestrator3.5.py:330). It never talks to the clerk.
+
+The new architecture is clerk-1.1.py: a warm pool of pre-connected ibapi
+clients that runs a trade-mole-2.1 + x-wing-2.0 "duo" in-process on one shared
+socket. To migrate, the orchestrator must STOP spawning subprocesses and
+instead send the clerk a TCP/JSON trigger. This note describes the inputs the
+clerk needs, the TWO-STEP trigger handshake, and what to change.
+
+
+CONNECTION
+----------
+  - The clerk listens on a plain TCP socket, default 127.0.0.1:8765
+    (clerk-1.1.py --listen-host / --listen-port).
+  - Protocol: send ONE JSON object on ONE line (terminated with "\n"), then
+    read back ONE line of JSON (the reply) on the SAME connection, then close.
+  - Each message uses its own short-lived connection.
+
+
+INPUTS THE CLERK NEEDS
+----------------------
+Every field below already exists in the daily universe TSV that the
+orchestrator ALREADY loads into _iti_df
+(stocks_universe_YYYY-MM-DD.tsv; loader _load_latest_iti_tsv()). Header:
+
+    Symbol | Exchange | Float_M | MarketCap_M | Float_Source
+          | LastDailyClosePrice | RTH_avgITI_sec | ETH_avgITI_sec
+          | ITI_impute_flag | ITI_impute_method
+          | RTH_tradeSize | ETH_TradeSize
+          | TradeSize_impute_flag | TradeSize_impute_method
+
+STEP-1a payload (arm the duo):
+  field              source                                  helper
+  ----------------   -------------------------------------   ---------------------------
+  ticker             Symbol                                  completed_dict['Symbol']
+  lastDailyClose     LastDailyClosePrice column              NEW _lookup_last_close()
+  itiBaseline        RTH_avgITI_sec / ETH_avgITI_sec         _lookup_baseline_iti()  (EXISTS, :490)
+                     (picked by ET time)
+  tradeSizeBaseline  RTH_tradeSize / ETH_TradeSize           NEW _lookup_baseline_trade_size()
+                     (picked by ET time)
+
+STEP-1b payload (open the sentiment gate):
+  field        source
+  ----------   --------------------------------------------------
+  ticker       same Symbol as 1a (MUST match, used for lookup)
+  Sentiment    the string "OK" when the orchestrator's sentiment
+               gate passes for that ticker
+
+Notes:
+  - tradeSizeBaseline: pass the value through unchanged. The pipeline writes
+    44444 when the historical fetch failed; trade-mole-2.1 treats 44444 (or any
+    value <= 0 / missing) as "no baseline" and simply emits the trade-size
+    columns as None. So you never need to special-case the sentinel here.
+  - RTH vs ETH selection is the SAME rule already used for ITI: RTH if the ET
+    clock is 09:30-16:00, otherwise ETH. Reuse that logic.
+
+
+TWO-STEP TRIGGER PROCESS  (replicated from input_output_diagrams.txt, 1a/1b)
+---------------------------------------------------------------------------
+The clerk needs BOTH a mole surge AND a sentiment confirmation before any order
+is placed. These arrive as TWO INDEPENDENT messages. Either may arrive first.
+
+  STEP 1a -- ARM THE DUO  (TCP 8765)
+  ----------------------------------
+    Orchestrator --> clerk
+        {"ticker":"JWEL","lastDailyClose":2.35,"itiBaseline":44444.0,"tradeSizeBaseline":150.0}
+
+    clerk --> Orchestrator (same connection, one line)
+        {"status":"accepted","clientId":1000,"symbol":"JWEL"}
+      OR
+        {"status":"rejected","reason":"no_free_client | missing 'ticker' | ..."}
+
+    On "accepted" the clerk binds a free warm client, resolves the contract,
+    subscribes to market data, and arms a watch window (MOLE_LIFETIME_STR,
+    default 01:00). It then watches for the surge internally.
+
+  STEP 1b -- SENTIMENT GATE  (TCP 8765, separate connection, ~70 ms later)
+  -----------------------------------------------------------------------
+    Orchestrator --> clerk
+        {"ticker":"JWEL","Sentiment":"OK"}
+
+    clerk --> Orchestrator
+        {"status":"sentiment_ack","symbol":"JWEL"}
+      OR
+        {"status":"sentiment_ignored","symbol":"JWEL"}
+          (no active session for that ticker, or Sentiment != "OK")
+
+  The clerk looks up the active DuoSession by ticker and sets its sentiment
+  flag. When the mole's surge fires it waits up to SENTIMENT_TIMEOUT_S (2.0 s)
+  for that flag; if it never arrives the trade is aborted and the client is
+  returned to the pool (no order placed).
+
+  ORDERING:
+    - Sentiment before surge (typical): the flag is already set when the surge
+      fires -> the trade launches immediately.
+    - Surge before sentiment: the clerk waits up to 2.0 s for 1b.
+    - Neither the surge nor sentiment within the 60 s watch window: the session
+      is released cleanly, no trade.
+
+
+WHAT TO CHANGE IN Orchestrator3.5.py
+------------------------------------
+  1. Add a trade-size lookup mirroring the existing ITI helper:
+       _lookup_baseline_trade_size(symbol)  -> RTH_tradeSize / ETH_TradeSize by ET time
+     and a close-price lookup:
+       _lookup_last_close(symbol)            -> LastDailyClosePrice
+     (model both on _lookup_baseline_iti():490 and _lookup_float():453).
+
+  2. Add a tiny TCP sender, e.g. _send_clerk(payload: dict) -> dict:
+       open socket to (CLERK_HOST, CLERK_PORT), send json.dumps(payload)+"\n",
+       read one reply line, json.loads it, return it.
+
+  3. Replace the launch path (_do_launch_trade_mole / maybe_launch_trade_mole):
+       - When a news item is ACCEPTED, send the STEP-1a trigger.
+       - When the sentiment gate passes for that ticker, send the STEP-1b
+         {"ticker":..., "Sentiment":"OK"} message.
+       Drop the subprocess.Popen / TM_SCRIPT / TM_*client-id machinery.
+
+  4. Drop the orchestrator-side 04:00-ET deferral
+     (maybe_launch_trade_mole / _seconds_until_market_open): the clerk now
+     defers closed-market triggers itself (it keeps the client bound and idles
+     until 04:00 ET), so just send the trigger whenever the news arrives.
+
+
+ILLUSTRATIVE SNIPPETS  (not drop-in; adapt names/imports)
+---------------------------------------------------------
+  # --- new trade-size baseline lookup (mirror of _lookup_baseline_iti) ---
+  def _lookup_baseline_trade_size(symbol: str):
+      now_et = datetime.now(tz=ZoneInfo('America/New_York'))
+      h, m = now_et.hour, now_et.minute
+      is_rth = (h == 9 and m >= 30) or (10 <= h < 16)
+      col = 'RTH_tradeSize' if is_rth else 'ETH_TradeSize'
+      with _iti_df_lock:
+          df = _iti_df
+      if df is None or symbol not in df['Symbol'].values:
+          return 44444.0                      # sentinel -> mole emits None columns
+      val = df.loc[df['Symbol'] == symbol, col].iloc[0]
+      return 44444.0 if pd.isna(val) else float(val)
+
+  # --- minimal trigger send (Step 1a) ---
+  import socket, json
+  CLERK_HOST, CLERK_PORT = '127.0.0.1', 8765
+
+  def _send_clerk(payload: dict) -> dict:
+      with socket.create_connection((CLERK_HOST, CLERK_PORT), timeout=5) as s:
+          s.sendall((json.dumps(payload) + "\n").encode())
+          buf = b""
+          while b"\n" not in buf:
+              chunk = s.recv(4096)
+              if not chunk:
+                  break
+              buf += chunk
+      return json.loads(buf.split(b"\n", 1)[0].decode() or "{}")
+
+  # 1a
+  _send_clerk({"ticker": sym,
+               "lastDailyClose": _lookup_last_close(sym),
+               "itiBaseline": _lookup_baseline_iti(sym),
+               "tradeSizeBaseline": _lookup_baseline_trade_size(sym)})
+  # 1b (when sentiment passes)
+  _send_clerk({"ticker": sym, "Sentiment": "OK"})
+
+
+GOTCHAS
+-------
+  - Start the clerk FIRST (see xmole-commands.txt):
+        /home/tom/venv/bin/python clerk-1.1.py --client-qty 5 --port 4001 --listen-port 8765
+  - reply {"status":"rejected","reason":"no_free_client"} = the pool is busy;
+    raise --client-qty (max id 1029, i.e. up to 30 clients).
+  - The 1b sentiment ticker MUST exactly match the 1a ticker (upper-cased), or
+    you get "sentiment_ignored" and the trade aborts on the 2.0 s gate timeout.
+  - --port 4001 is the LIVE Gateway (real money). 4002 = paper GW, 7497 = paper TWS.
+  - One duo per client at a time; concurrent triggers for different tickers each
+    take their own client from the pool.
+
+===========================================================================
