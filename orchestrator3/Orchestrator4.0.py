@@ -479,7 +479,7 @@ def _release_armed(ticker: str, art_id: str) -> None:
 
 _TSV_COLUMNS = [
     'Symbol', 'Tickers', 'ID', 'Created', 'ArrivalDate', 'ArrivalTime', 'CurlTime', 'Headline', 'Author',
-    'Float', 'Exchange',
+    'Float', 'MktCap', 'Exchange',
     'LastDailyClose', 'itiBaseline', 'tradeSizeBaseline',
     'FinBERTCompletedAt',
     'positive', 'negative', 'neutral', 'sentiment_score', 'label',
@@ -552,6 +552,12 @@ def _lookup_float(symbol: str):
     """Pull Float_M for `symbol` from the daily universe TSV. None if absent /
     NaN / non-numeric (e.g. 'skipped_nan')."""
     return _coerce_float(_universe_cell(symbol, 'Float_M'))
+
+
+def _lookup_mktcap(symbol: str):
+    """Pull MarketCap_M (millions USD) for `symbol` from the daily universe TSV.
+    None if absent / NaN / non-numeric (e.g. 'skipped_nan')."""
+    return _coerce_float(_universe_cell(symbol, 'MarketCap_M'))
 
 
 def _lookup_last_close(symbol: str):
@@ -704,6 +710,7 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         'Headline':           news_dict['Headline'],
         'Author':             _lookup_author(news_id),
         'Float':              _lookup_float(symbol),
+        'MktCap':             _lookup_mktcap(symbol),
         'Exchange':           news_dict.get('exchange', ''),
         'LastDailyClose':     _lookup_last_close(symbol),
         'itiBaseline':        _lookup_baseline_iti(symbol),

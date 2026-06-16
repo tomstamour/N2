@@ -100,6 +100,13 @@ _RUNS_DIR   = _SCRIPT_DIR / "runs"
 # pipeline_daily.py's canonical `nasdaq_symbols_data_priced_YYYY-MM-DD.tsv`.
 _OUTPUT_STEM = "stocks_universe"
 
+# Hardcoded output filters — rows failing any criterion are dropped entirely.
+# Float_M / MarketCap_M applied BEFORE IBKR fetches; price applied after.
+# Strict: NaN in any criterion = drop.
+_FILTER_MAX_FLOAT_M = 50.0    # Float_M must be < 50 M shares
+_FILTER_MAX_MCAP_M  = 40.0    # MarketCap_M must be < 40 M
+_FILTER_MAX_PRICE   = 4.00    # LastDailyClosePrice must be < $4.00
+
 # The trade-size addon module has a literal '.' in its filename
 # (trade_frequency_and_size.addOn.py), so it can't be imported by name — load
 # it by path. Done lazily inside main() to keep import errors local to a run.
@@ -379,6 +386,20 @@ def main() -> None:
         df = df.head(args.limit).copy()
         log.info(f"  --limit {args.limit}: processing first {len(df)} symbols only")
 
+    # ── Early filter: Float_M and MarketCap_M ─────────────────────────────────
+    # Drop rows that fail the fundamentals thresholds (or have missing values —
+    # strict policy). Applied before IBKR fetches to avoid wasting request slots.
+    n_pre_fund = len(df)
+    df = df[
+        df["Float_M"].notna()     & (df["Float_M"]     < _FILTER_MAX_FLOAT_M) &
+        df["MarketCap_M"].notna() & (df["MarketCap_M"] < _FILTER_MAX_MCAP_M)
+    ].copy()
+    log.info(
+        f"  Fundamentals filter: dropped {n_pre_fund - len(df)} rows "
+        f"(Float_M >= {_FILTER_MAX_FLOAT_M} or MarketCap_M >= {_FILTER_MAX_MCAP_M} "
+        f"or either missing), {len(df)} remain"
+    )
+
     symbols = df["Symbol"].tolist()
     total   = len(symbols)
 
@@ -592,6 +613,19 @@ def main() -> None:
             es = 44444 if es != es else es
         size_by_symbol[str(sym)] = (rs, es)
 
+    # ── Price filter: drop rows failing LastDailyClosePrice threshold ─────────
+    # NaN price (failed IBKR fetch or --max-float-skipped row) also fails the
+    # strict filter, so those rows are removed too.
+    n_pre_price = len(df)
+    df = df[
+        df["LastDailyClosePrice"].notna() &
+        (df["LastDailyClosePrice"] < _FILTER_MAX_PRICE)
+    ].copy()
+    log.info(
+        f"  Price filter: dropped {n_pre_price - len(df)} rows "
+        f"(LastDailyClosePrice >= {_FILTER_MAX_PRICE} or missing), {len(df)} remain"
+    )
+
     # Suffix manual `--limit` runs so a 500-symbol test doesn't silently
     # overwrite that same date's cron output (the cron passes no --limit, so
     # its filename is unchanged). Bare `--limit 0` / unset stays bare.
@@ -599,20 +633,29 @@ def main() -> None:
     limit_tag   = f"_limit{args.limit}" if args.limit and args.limit > 0 else ""
     output_path = _DATA_DIR / f"{_OUTPUT_STEM}_{date_tag}{limit_tag}.tsv"
 
-    valid_rth = sum(1 for v in rth_results if v == v)
-    valid_eth = sum(1 for v in eth_results if v == v)
+    # Post-filter counts used by overwrite-protection (compares what's actually
+    # written, not the raw fetch universe).
+    valid_rth = int(
+        (df["RTH_avgITI_sec"].notna() & (df["RTH_avgITI_sec"] != 44444)).sum()
+    )
+    valid_eth = int(
+        (df["ETH_avgITI_sec"].notna() & (df["ETH_avgITI_sec"] != 44444)).sum()
+    )
 
     # Overwrite protection — only for the canonical (non --limit) filename.
     # A cron starting at 20:30 ET finishes after midnight and writes
     # `*_dayN+1.tsv`; an identically-named manual re-run later on dayN+1 used
-    # to silently clobber it. We now read the existing file's populated-row
-    # counts and only replace if the new run is at least as good in BOTH
-    # ITI columns. A worse run goes to a timestamped sidecar instead.
+    # to silently clobber it. We compare SUCCESS FRACTIONS (valid / total rows)
+    # rather than absolute counts so that a filtered run (small universe, high
+    # success rate) correctly supersedes an unfiltered run (large universe, low
+    # success rate). A worse run goes to a timestamped sidecar instead.
     # `--limit` test runs already get their own filename and skip this path.
+    new_total = max(1, len(df))
     superseded_path = None
     if not limit_tag and output_path.exists():
         try:
             existing = pd.read_csv(output_path, sep="\t")
+            existing_total = max(1, len(existing))
             existing_rth = int(
                 existing["RTH_avgITI_sec"].notna().sum()
                 - (existing["RTH_avgITI_sec"] == 44444).sum())
@@ -623,34 +666,40 @@ def main() -> None:
             log.warning(f"Could not read existing {output_path.name} to "
                         f"compare ({exc!r}); proceeding to overwrite.")
             existing_rth = existing_eth = -1
+            existing_total = 1
 
-        if valid_rth >= existing_rth and valid_eth >= existing_eth:
-            # New run is at least as good in both — promote it. Stash the
-            # outgoing file for one safety cycle so a bad replacement is
-            # recoverable until tomorrow.
+        if (valid_rth / new_total >= existing_rth / existing_total and
+                valid_eth / new_total >= existing_eth / existing_total):
+            # New run is at least as good (by fraction) in both — promote it.
+            # Stash the outgoing file for one safety cycle so a bad replacement
+            # is recoverable until tomorrow.
             ts = datetime.now().strftime("%H%M")
             superseded_path = _DATA_DIR / (
                 f"{_OUTPUT_STEM}_{date_tag}_{ts}_superseded.tsv")
             try:
                 os.replace(output_path, superseded_path)
                 log.info(f"Replacing existing {output_path.name} "
-                         f"(old RTH={existing_rth}, ETH={existing_eth}; new "
-                         f"RTH={valid_rth}, ETH={valid_eth}). Old file "
+                         f"(old RTH={existing_rth}/{existing_total}, "
+                         f"ETH={existing_eth}/{existing_total}; new "
+                         f"RTH={valid_rth}/{new_total}, "
+                         f"ETH={valid_eth}/{new_total}). Old file "
                          f"moved to {superseded_path.name}.")
             except OSError as exc:
                 log.warning(f"Could not stash existing file ({exc!r}); "
                             f"overwriting in place.")
                 superseded_path = None
         else:
-            # Existing file is better in at least one column and equal-or-
-            # better in the other → keep it, write the new run to a sidecar.
+            # Existing file has a better success fraction in at least one
+            # column → keep it, write the new run to a sidecar.
             ts = datetime.now().strftime("%H%M")
             sidecar = _DATA_DIR / (
                 f"{_OUTPUT_STEM}_{date_tag}_{ts}.tsv")
             log.warning(
                 f"PROTECTING existing {output_path.name} "
-                f"(RTH={existing_rth}, ETH={existing_eth}) — new run is "
-                f"weaker (RTH={valid_rth}, ETH={valid_eth}). Writing "
+                f"(RTH={existing_rth}/{existing_total}, "
+                f"ETH={existing_eth}/{existing_total}) — new run is "
+                f"weaker (RTH={valid_rth}/{new_total}, "
+                f"ETH={valid_eth}/{new_total}). Writing "
                 f"this run to {sidecar.name} instead.")
             output_path = sidecar
 

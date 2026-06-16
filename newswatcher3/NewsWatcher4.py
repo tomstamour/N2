@@ -51,7 +51,7 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -108,6 +108,16 @@ _config: dict = {}
 # workers is ample — writes are tiny and the loop only ever submits, never waits.
 _persist_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='nw4-persist')
 
+# Dedicated pool for the CPU-bound permalink scrape (_normalize_article). Running
+# the regex scrape inline on NW4's single asyncio loop blocked the loop for the
+# scrape's full duration per article; during a top-of-hour burst that starved the
+# WS reader and inflated ArrivalTime (published-at→recv_ts) to ~2s. Offloading it
+# here lets the GIL preempt (~5ms) so the loop keeps stamping recv_ts / firing arms.
+# This module-level pool is a placeholder — start() recreates it sized by
+# CPU_POOL_WORKERS, and _handle_alert only runs after start(), so the placeholder is
+# never used for work (mirrors _persist_executor).
+_cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='nw4-cpu')
+
 _news_callback = None
 # Alert-flow callbacks (NW4): fired on the lightweight WS alert, BEFORE the
 # permalink curl, so the orchestrator can arm reqMktData without waiting on the
@@ -137,6 +147,13 @@ SLOW_FETCH_LOG_SEC     = 1.0     # alert→body-ready total at/above this logs [
                                  # RTPR server slowness (curl). See _handle_alert.
 HTTP_POOL_LIMIT        = 64      # aiohttp TCPConnector pool size (>= MAX_CONCURRENT_FETCHES)
 WS_RECV_TIMEOUT_SEC    = 90      # matches RTPR's 90s pong deadline
+CPU_POOL_WORKERS       = 4       # threads for the off-loop HTML scrape (_normalize_article).
+                                 # The scrape is GIL-bound (re holds the GIL), so this restores
+                                 # event-loop responsiveness via ~5ms GIL preemption rather than
+                                 # adding CPU throughput — see _cpu_executor + _handle_alert.
+RECV_LAG_WARN_SEC      = 1.0     # [RecvLag] logs at INFO (else DEBUG) when an alert's
+                                 # published-at→recv_ts gap reaches this. A burst ramp here that
+                                 # tracks len(inflight) means OUR loop is saturated, not RTPR.
 
 # Backoff schedule (seconds) for RTPR auth-class WS close codes (4004 trial-expired,
 # 4005 connection-revoked or auth-service-unreachable). Indexed by consecutive
@@ -203,7 +220,7 @@ def start(
         reject_price_greater_then: Block articles whose ticker has LastDailyClosePrice > this.
         flush_interval_seconds:    How often in-memory state is flushed to disk.
     """
-    global _background_thread, _config, _persist_executor
+    global _background_thread, _config, _persist_executor, _cpu_executor
     global _news_df, _news_objects, _blocked_objects
     global _blacklist_set, _blacklist_records, _universe_set
     global _seen_ids, _fetched_ids, _shutdown_event, _rejected_count
@@ -220,6 +237,10 @@ def start(
     # until first submit, so replacing it on first start() is free.
     _persist_executor = ThreadPoolExecutor(
         max_workers=2, thread_name_prefix='nw4-persist'
+    )
+    # Fresh CPU-scrape pool for this session (same lifecycle as the persist pool).
+    _cpu_executor = ThreadPoolExecutor(
+        max_workers=CPU_POOL_WORKERS, thread_name_prefix='nw4-cpu'
     )
 
     # Reset state (safe — background thread not yet alive)
@@ -362,6 +383,10 @@ def stop() -> None:
 
     # Drain any in-flight immediate-persist writes before declaring stopped.
     _persist_executor.shutdown(wait=True)
+    # Drain any in-flight off-loop scrapes too. _async_main already gathered the
+    # inflight tasks (which own these futures) before the loop thread joined, so
+    # these are complete or near-done.
+    _cpu_executor.shutdown(wait=True)
 
     logger.info("NewsWatcherV4 stopped.")
 
@@ -1308,7 +1333,13 @@ async def _handle_alert(
         _emit_alert_release(prearmed, art_id)
         return
 
-    data = _normalize_article(raw, alert, fallback_id=art_id)
+    # Offload the synchronous regex scrape to the CPU pool so it never blocks the
+    # asyncio loop — that inline block was what starved the WS reader and inflated
+    # ArrivalTime during bursts. run_in_executor takes positional args only, so
+    # art_id maps to _normalize_article's 3rd param (fallback_id). t3 now also
+    # captures any time this scrape spent queued behind the pool's other workers.
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(_cpu_executor, _normalize_article, raw, alert, art_id)
     t3 = time.monotonic()                          # normalize done
     semwait, curl, normalize, total = t1 - t0, t2 - t1, t3 - t2, t3 - t0
     timing_msg = (
@@ -1557,6 +1588,30 @@ async def _async_main(api_key: str) -> None:
                     )
                     inflight.add(task)
                     task.add_done_callback(inflight.discard)
+                    # [RecvLag] receive-side probe: the gap from the article's own
+                    # published-at to when THIS loop stamped recv_ts, logged with the
+                    # live in-flight count. If recv_lag ramps with inflight during a
+                    # top-of-hour burst, the single asyncio loop is CPU-saturated (our
+                    # consumer) rather than RTPR being slow. Never fatal — a missing or
+                    # malformed timestamp logs recv_lag=NA.
+                    try:
+                        _pub = msg.get('article_published_at')
+                        if _pub:
+                            _pub_dt = datetime.fromisoformat(_pub.replace('Z', '+00:00'))
+                            if _pub_dt.tzinfo is None:
+                                _pub_dt = _pub_dt.replace(tzinfo=timezone.utc)
+                            _recv_lag = (datetime.now(timezone.utc) - _pub_dt).total_seconds()
+                            _lag_str = f"{_recv_lag:.3f}s"
+                        else:
+                            _recv_lag, _lag_str = None, "NA"
+                    except Exception:
+                        _recv_lag, _lag_str = None, "NA"
+                    (logger.info
+                     if _recv_lag is not None and _recv_lag >= RECV_LAG_WARN_SEC
+                     else logger.debug)(
+                        f"[RecvLag] ticker={msg.get('ticker')} "
+                        f"recv_lag={_lag_str} inflight={len(inflight)}"
+                    )
                 elif mtype == 'subscribed':
                     # Not expected on ws-alerts (rules are server-side), but
                     # log if it ever appears.
