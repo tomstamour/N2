@@ -138,14 +138,29 @@ MAX_CONCURRENT_FETCHES = 64      # cap concurrent permalink curls (was 8 → 32 
                                  # 08:00 burst where ~60 curls fired within ~4s. The
                                  # alert-ticker pre-filter in _handle_alert keeps the
                                  # actual fetch volume small; see [Timing] logs below.)
-FETCH_TIMEOUT_SEC      = 10.0    # per-attempt HTTP timeout
-FETCH_MAX_RETRIES      = 3
+FETCH_TIMEOUT_SEC      = 20.0    # per-attempt HTTP timeout. Raised 10→20 on 2026-06-17:
+                                 # [FetchTrace] showed top-of-hour stalls are pure TTFB
+                                 # (RTPR slow to respond, 4–8s, occasionally >10s) on
+                                 # fast fresh connections — the old 10s cap KILLED
+                                 # near-complete fetches and forced a retry storm onto an
+                                 # already-slammed endpoint. 20s rides out the peak in one
+                                 # attempt; arm already fired pre-curl so only the sentiment
+                                 # confirm waits (clerk holds the client ~60s).
+FETCH_MAX_RETRIES      = 2       # was 3. With the 20s timeout almost nothing reaches it, so
+                                 # retries rarely fire (no storm); one retry still covers a
+                                 # genuine dropped connection. Worst case ~40s < clerk window.
 FETCH_BACKOFF_SEC      = 0.5     # exponential: 0.5 → 1.0 → 2.0
 SLOW_FETCH_LOG_SEC     = 1.0     # alert→body-ready total at/above this logs [Timing] at
                                  # INFO (else DEBUG) — splits semwait / curl / normalize
                                  # so a burst backlog (our queue) is distinguishable from
                                  # RTPR server slowness (curl). See _handle_alert.
 HTTP_POOL_LIMIT        = 64      # aiohttp TCPConnector pool size (>= MAX_CONCURRENT_FETCHES)
+KEEPALIVE_TIMEOUT_SEC  = 15      # drop idle keepalive conns after 15s (was 300). A NAT/LB
+                                 # idle timeout silently kills conns we still think are alive,
+                                 # so a burst after a gap reuses a DEAD conn → hangs to the
+                                 # fetch timeout (the PRZO 2026-06-17 08:12 case: reused=True
+                                 # reached=start). 15s < any NAT idle window, so a reused conn
+                                 # is always fresh; within a burst conns are <15s apart anyway.
 WS_RECV_TIMEOUT_SEC    = 90      # matches RTPR's 90s pong deadline
 CPU_POOL_WORKERS       = 4       # threads for the off-loop HTML scrape (_normalize_article).
                                  # The scrape is GIL-bound (re holds the GIL), so this restores
@@ -510,21 +525,48 @@ def _emit_alert_release(ticker: str, art_id: str) -> None:
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
 
+class _DailyFileHandler(logging.FileHandler):
+    """FileHandler that writes to ``NewsWatcher4_<today>.log`` and rolls to a new
+    dated file when the local date changes.
+
+    Fixes the long-standing bug where the date was computed once at process start
+    and frozen into the filename: a process started yesterday kept appending to
+    yesterday's file across midnight, so today's top-of-hour burst landed in
+    ``NewsWatcher4_<yesterday>.log`` and was invisible to a ``$(date +%F)`` grep.
+    """
+
+    def __init__(self, log_dir: str, prefix: str = "NewsWatcher4", encoding=None):
+        self._log_dir = Path(log_dir)
+        self._prefix = prefix
+        self._cur_date = datetime.now().strftime("%Y-%m-%d")
+        super().__init__(self._path_for(self._cur_date), encoding=encoding)
+
+    def _path_for(self, date_str: str) -> str:
+        return str(self._log_dir / f"{self._prefix}_{date_str}.log")
+
+    def emit(self, record):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._cur_date:
+            self._cur_date = today
+            self.close()
+            self.baseFilename = os.path.abspath(self._path_for(today))
+            self.stream = self._open()
+        super().emit(record)
+
+
 def _setup_logging(log_dir: str) -> None:
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return
 
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_file = Path(log_dir) / f"NewsWatcher4_{today}.log"
 
     fmt = logging.Formatter(
         '%(asctime)s %(levelname)s %(name)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
 
-    fh = logging.FileHandler(log_file)
+    fh = _DailyFileHandler(log_dir)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -1065,8 +1107,102 @@ def _extract_article_id_from_url(url: str) -> str | None:
         return None
 
 
+# ─── Fetch tracing (per-attempt connection-lifecycle decomposition) ───────────
+# An aiohttp TraceConfig stamps timestamps into the per-request dict passed via
+# `trace_request_ctx`, so a [FetchTrace] line — and crucially a timeout — can say
+# exactly where the time went: DNS, pool-wait (queued), TCP+TLS connect, or TTFB.
+# This is the signal the opaque `curl=` number (and the empty-message
+# asyncio.TimeoutError) could never provide.
+
+def _make_trace_config() -> aiohttp.TraceConfig:
+    def _stamp(key):
+        async def _cb(session, ctx, params):
+            d = getattr(ctx, "trace_request_ctx", None)
+            if isinstance(d, dict):
+                d.setdefault(key, time.monotonic())
+        return _cb
+
+    async def _mark_reused(session, ctx, params):
+        d = getattr(ctx, "trace_request_ctx", None)
+        if isinstance(d, dict):
+            d["reused"] = True
+
+    tc = aiohttp.TraceConfig()
+    tc.on_request_start.append(_stamp("t_start"))
+    tc.on_dns_resolvehost_start.append(_stamp("t_dns_start"))
+    tc.on_dns_resolvehost_end.append(_stamp("t_dns_end"))
+    tc.on_connection_queued_start.append(_stamp("t_queued_start"))
+    tc.on_connection_queued_end.append(_stamp("t_queued_end"))
+    tc.on_connection_create_start.append(_stamp("t_create_start"))
+    tc.on_connection_create_end.append(_stamp("t_create_end"))
+    tc.on_connection_reuseconn.append(_mark_reused)
+    tc.on_response_chunk_received.append(_stamp("t_ttfb"))
+    tc.on_request_end.append(_stamp("t_end"))
+    return tc
+
+
+# Ordered (timestamp-key, label) pairs describing the request lifecycle; used to
+# render durations and to name the last stage a (timed-out) attempt reached.
+_TRACE_STAGES = [
+    ("t_start", "start"),
+    ("t_dns_start", "dns_start"),
+    ("t_dns_end", "dns_end"),
+    ("t_queued_start", "queued_start"),
+    ("t_queued_end", "queued_end"),
+    ("t_create_start", "connect_start"),
+    ("t_create_end", "connect_end"),
+    ("t_ttfb", "ttfb"),
+    ("t_end", "end"),
+]
+
+
+def _last_stage(ctx: dict) -> str:
+    """Name of the last lifecycle stage whose timestamp was stamped — on a timeout
+    this is *where* the attempt stalled (e.g. 'connect_start' = died mid TCP/TLS)."""
+    last = "none"
+    for key, label in _TRACE_STAGES:
+        if ctx.get(key) is not None:
+            last = label
+    return last
+
+
+def _format_fetch_trace(ctx: dict) -> str:
+    """Render per-stage durations from a trace_request_ctx dict. Missing stages
+    print '—' (e.g. a reused keepalive conn has no dns/connect)."""
+    def _dur(a, b):
+        ta, tb = ctx.get(a), ctx.get(b)
+        return f"{tb - ta:.3f}" if (ta is not None and tb is not None) else "—"
+
+    start = ctx.get("t_start")
+    ttfb = ctx.get("t_ttfb")
+    ttfb_s = f"{ttfb - start:.3f}" if (start is not None and ttfb is not None) else "—"
+    return (
+        f"dns={_dur('t_dns_start', 't_dns_end')} "
+        f"queued={_dur('t_queued_start', 't_queued_end')} "
+        f"connect={_dur('t_create_start', 't_create_end')} "
+        f"ttfb={ttfb_s} "
+        f"reused={ctx.get('reused', False)} "
+        f"reached={_last_stage(ctx)}"
+    )
+
+
+def _log_fetch_trace(art_id, ticker, attempt, status, ctx, elapsed, *,
+                     force_info=False):
+    """Emit one [FetchTrace] line for a single fetch attempt. INFO when the attempt
+    was slow or non-200 (so bursts/timeouts surface on console + file); DEBUG for
+    fast successes (still captured in the DEBUG-level file)."""
+    msg = (
+        f"[FetchTrace] id={art_id} ticker={ticker} "
+        f"attempt={attempt}/{FETCH_MAX_RETRIES} status={status} "
+        f"elapsed={elapsed:.3f}s {_format_fetch_trace(ctx)}"
+    )
+    (logger.info if (force_info or elapsed >= SLOW_FETCH_LOG_SEC)
+     else logger.debug)(msg)
+
+
 async def _fetch_article(session: aiohttp.ClientSession, url: str,
-                         api_key: str) -> str | None:
+                         api_key: str, *, art_id: str | None = None,
+                         ticker: str | None = None) -> str | None:
     """
     GET the signed article permalink with X-API-Key.  Returns the raw
     response body as text (HTML) on success, None on failure.
@@ -1087,28 +1223,40 @@ async def _fetch_article(session: aiohttp.ClientSession, url: str,
     last_exc: Exception | None = None
 
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
+        ctx: dict = {}
+        attempt_t0 = time.monotonic()
         try:
             timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SEC)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
+            async with session.get(url, headers=headers, timeout=timeout,
+                                   trace_request_ctx=ctx) as resp:
                 if resp.status == 200:
-                    return await resp.text()
+                    text = await resp.text()
+                    _log_fetch_trace(art_id, ticker, attempt, "200", ctx,
+                                     time.monotonic() - attempt_t0)
+                    return text
                 if resp.status in (401, 403, 404):
                     body = (await resp.text())[:200]
                     logger.error(
                         f"_fetch_article: non-retryable HTTP {resp.status} "
                         f"url={url[:120]} body={body}"
                     )
+                    _log_fetch_trace(art_id, ticker, attempt, str(resp.status), ctx,
+                                     time.monotonic() - attempt_t0, force_info=True)
                     return None
                 logger.warning(
                     f"_fetch_article: HTTP {resp.status} attempt {attempt}/"
                     f"{FETCH_MAX_RETRIES} url={url[:120]}"
                 )
+                _log_fetch_trace(art_id, ticker, attempt, str(resp.status), ctx,
+                                 time.monotonic() - attempt_t0, force_info=True)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_exc = exc
             logger.warning(
                 f"_fetch_article: transient error attempt {attempt}/"
                 f"{FETCH_MAX_RETRIES} url={url[:120]}: {exc}"
             )
+            _log_fetch_trace(art_id, ticker, attempt, type(exc).__name__, ctx,
+                             time.monotonic() - attempt_t0, force_info=True)
 
         if attempt < FETCH_MAX_RETRIES:
             await asyncio.sleep(delay)
@@ -1320,7 +1468,8 @@ async def _handle_alert(
     t0 = time.monotonic()
     async with sem:
         t1 = time.monotonic()                      # semaphore acquired
-        raw = await _fetch_article(session, article_url, api_key)
+        raw = await _fetch_article(session, article_url, api_key,
+                                   art_id=art_id, ticker=primary)
     t2 = time.monotonic()                          # curl returned
     if raw is None:
         logger.warning(
@@ -1346,7 +1495,9 @@ async def _handle_alert(
         f"[Timing] id={art_id} ticker={primary} semwait={semwait:.3f}s "
         f"curl={curl:.3f}s normalize={normalize:.3f}s total={total:.3f}s"
     )
-    (logger.info if total >= SLOW_FETCH_LOG_SEC else logger.debug)(timing_msg)
+    # Always INFO: during a burst we want every row's alert→body-ready breakdown,
+    # paired with the per-attempt [FetchTrace] lines, captured on console + file.
+    logger.info(timing_msg)
     if data is None or not data.get('id'):
         # _normalize_article already logged the scrape failure; just drop.
         _emit_alert_release(prearmed, art_id)
@@ -1522,7 +1673,8 @@ async def _async_main(api_key: str) -> None:
     connector = aiohttp.TCPConnector(
         limit=HTTP_POOL_LIMIT,
         limit_per_host=HTTP_POOL_LIMIT,
-        keepalive_timeout=300,
+        keepalive_timeout=KEEPALIVE_TIMEOUT_SEC,  # was 300 — drop idle conns before they go stale
+        enable_cleanup_closed=True,               # reap half-closed TLS conns the peer dropped
     )
 
     async def _ws_loop(http: aiohttp.ClientSession):
@@ -1623,7 +1775,9 @@ async def _async_main(api_key: str) -> None:
 
     shutdown_watcher_task = asyncio.create_task(_watch_shutdown())
 
-    async with aiohttp.ClientSession(connector=connector) as http:
+    async with aiohttp.ClientSession(
+        connector=connector, trace_configs=[_make_trace_config()]
+    ) as http:
         while not async_shutdown.is_set() and not abort_reconnect:
             try:
                 logger.info("Establishing WebSocket connection to RTPR ws-alerts...")

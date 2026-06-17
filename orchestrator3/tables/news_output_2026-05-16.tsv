@@ -1,0 +1,3 @@
+Symbol	Tickers	ID	ArrivalTime	Headline	Author	Float	Exchange	FinBERTCompletedAt	positive	negative	neutral	sentiment_score	label	Trigger
+BLDP	"[""BLDP""]"	nNFCb7mS2W	2026-05-16 00:12:23	Weichai Power Hong Kong International Development Co. Limited Announces Sale of Common Shares of Ballard Power Systems Inc.	Newsfile Corp	296.84	TSX	2026-05-16 00:12:23.200757	0.1085	0.0247	0.8668	0.0838	positive	NO:sentiment_score,Float
+TZOO	"[""TZOO""]"	nPn97bnpya	2026-05-16 19:01:00	Club Offers for Travel Enthusiasts in the UK	PR Newswire	7.03	NASDAQ	2026-05-16 19:01:00.155092	0.1313	0.0398	0.8289	0.0914	positive	NO:sentiment_score

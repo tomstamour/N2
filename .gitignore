@@ -23,6 +23,10 @@ tables/
 !price_stats_loader/outputs/
 !price_stats_loader/outputs/*.tsv
 
+# --- and DO track the .tsv tables in orchestrator3/tables/ ---
+!orchestrator3/tables/
+!orchestrator3/tables/*.tsv
+
 # --- always-ignore noise ---
 __pycache__/
 *.pyc
