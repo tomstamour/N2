@@ -18,6 +18,11 @@ outputs/
 ibkr_data/
 tables/
 
+# --- but DO track the .tsv outputs in price_stats_loader/outputs/ ---
+# (re-include the folder first, since a file can't be un-ignored while its parent dir is)
+!price_stats_loader/outputs/
+!price_stats_loader/outputs/*.tsv
+
 # --- always-ignore noise ---
 __pycache__/
 *.pyc
