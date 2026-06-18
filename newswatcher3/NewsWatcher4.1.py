@@ -46,12 +46,14 @@ import html as _htmllib
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -118,6 +120,22 @@ _persist_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='nw4-pe
 # never used for work (mirrors _persist_executor).
 _cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='nw4-cpu')
 
+# Dedicated single-worker pool for downstream callbacks (alert arm, alert release,
+# accepted). The orchestrator's arm handler talks to IBKR and can block; if that
+# ran on the asyncio loop it stalled in-flight curls and the WS reader. Single
+# worker preserves arm→release / arm→accepted ordering for the same art_id (the
+# orchestrator's release-only-if-armed invariant depends on it). DO NOT raise
+# max_workers > 1. start() recreates a fresh pool; this module-level one is never
+# used for real work (mirrors _persist_executor / _cpu_executor).
+_callback_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nw4-callback')
+
+# Dedicated single-worker pool for the periodic _flush. _flush holds several locks
+# and does N file writes; running it inline on the asyncio loop blocked the loop
+# for the flush's full duration (multi-second during a real session). Single worker
+# is enough — flushes run every flush_interval_seconds and the periodic coroutine
+# awaits each one, so there's never more than one queued. start() recreates it.
+_flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nw4-flush')
+
 _news_callback = None
 # Alert-flow callbacks (NW4): fired on the lightweight WS alert, BEFORE the
 # permalink curl, so the orchestrator can arm reqMktData without waiting on the
@@ -130,6 +148,14 @@ _alert_release_callback = None
 _callback_lock = threading.Lock()
 
 logger = logging.getLogger("NewsWatcherV4")
+
+# QueueHandler/QueueListener pair: the logger only owns a QueueHandler so every
+# logger.xxx() call on the asyncio loop is a non-blocking queue.put_nowait. The
+# listener thread (started in _setup_logging) dequeues records and runs the real
+# _DailyFileHandler + StreamHandler. Cleared on stop() so a fresh start() can
+# rebuild the pipeline.
+_log_queue: queue.Queue | None = None
+_log_listener: QueueListener | None = None
 
 # ─── NW4 tuning knobs ─────────────────────────────────────────────────────────
 
@@ -236,6 +262,7 @@ def start(
         flush_interval_seconds:    How often in-memory state is flushed to disk.
     """
     global _background_thread, _config, _persist_executor, _cpu_executor
+    global _callback_executor, _flush_executor
     global _news_df, _news_objects, _blocked_objects
     global _blacklist_set, _blacklist_records, _universe_set
     global _seen_ids, _fetched_ids, _shutdown_event, _rejected_count
@@ -256,6 +283,15 @@ def start(
     # Fresh CPU-scrape pool for this session (same lifecycle as the persist pool).
     _cpu_executor = ThreadPoolExecutor(
         max_workers=CPU_POOL_WORKERS, thread_name_prefix='nw4-cpu'
+    )
+    # Fresh single-worker callback pool for this session. Single worker preserves
+    # arm→release / arm→accepted ordering for the same art_id; do not raise.
+    _callback_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='nw4-callback'
+    )
+    # Fresh single-worker flush pool for this session.
+    _flush_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='nw4-flush'
     )
 
     # Reset state (safe — background thread not yet alive)
@@ -402,6 +438,37 @@ def stop() -> None:
     # inflight tasks (which own these futures) before the loop thread joined, so
     # these are complete or near-done.
     _cpu_executor.shutdown(wait=True)
+    # Drain any queued downstream callbacks. Must come before the log listener
+    # so any callback exception log lands in the queue while the listener is
+    # still alive to drain it.
+    _callback_executor.shutdown(wait=True)
+    # Drain any queued periodic flush. In practice there's at most one queued
+    # submission and it was either awaited already (loop exited cleanly) or
+    # cancelled (loop torn down). Belt-and-suspenders.
+    _flush_executor.shutdown(wait=True)
+
+    # Drain logs LAST so every prior step's log records hit disk. QueueListener.stop()
+    # enqueues a sentinel, joins the consumer thread, then both handlers it owns
+    # (fh + ch) are closed internally — they were never attached to `logger`, so
+    # we don't have to detach them here.
+    global _log_listener, _log_queue
+    if _log_listener is not None:
+        _log_listener.stop()
+        _log_listener = None
+    _log_queue = None
+    # The QueueHandler is still attached to `logger` but its target queue is now
+    # discarded, so emit() would silently no-op. Re-attach a synchronous
+    # StreamHandler so the final "stopped" line still surfaces on stdout for the
+    # operator (cheap; one line on shutdown only).
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, QueueHandler)
+               for h in logger.handlers):
+        _tail = logging.StreamHandler()
+        _tail.setLevel(logging.INFO)
+        _tail.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        logger.addHandler(_tail)
 
     logger.info("NewsWatcherV4 stopped.")
 
@@ -499,28 +566,47 @@ def register_alert_release_callback(fn) -> None:
     logger.info(f"Alert-release callback registered: {fn}")
 
 
+def _log_cb_exception(fut, kind: str, ticker: str, art_id: str) -> None:
+    """done_callback for _callback_executor submissions: surfaces callback
+    exceptions the same way the old try/except did, without blocking the loop.
+    Runs on whatever thread completed the future (the callback worker)."""
+    exc = fut.exception()
+    if exc is not None:
+        logger.error(
+            f"Exception in {kind} callback for {ticker} id={art_id}: {exc}",
+            exc_info=exc,
+        )
+
+
 def _emit_alert_arm(ticker: str, art_id: str, recv_ts) -> None:
-    """Invoke the registered alert callback (pre-fetch arm). Never raises."""
+    """Schedule the registered alert callback on _callback_executor. Never blocks.
+
+    The submit returns immediately so the asyncio loop stays free for the curl
+    that's about to fire. Exceptions are surfaced via _log_cb_exception. Ordering
+    is preserved relative to a later _emit_alert_release / accepted callback for
+    the same article because _callback_executor has max_workers=1.
+    """
     with _callback_lock:
         cb = _alert_callback
-    if cb is not None:
-        try:
-            cb(ticker, art_id, recv_ts)
-        except Exception as exc:
-            logger.error(f"Exception in alert callback for {ticker} id={art_id}: {exc}",
-                         exc_info=True)
+    if cb is None:
+        return
+    fut = _callback_executor.submit(cb, ticker, art_id, recv_ts)
+    fut.add_done_callback(
+        lambda f, _t=ticker, _i=art_id: _log_cb_exception(f, "alert", _t, _i)
+    )
 
 
 def _emit_alert_release(ticker: str, art_id: str) -> None:
-    """Invoke the registered alert-release callback. Never raises."""
+    """Schedule the registered alert-release callback on _callback_executor.
+    Never blocks. See _emit_alert_arm for the ordering guarantee."""
     with _callback_lock:
         cb = _alert_release_callback
-    if cb is not None:
-        try:
-            cb(ticker, art_id)
-        except Exception as exc:
-            logger.error(f"Exception in alert-release callback for {ticker} id={art_id}: {exc}",
-                         exc_info=True)
+    if cb is None:
+        return
+    fut = _callback_executor.submit(cb, ticker, art_id)
+    fut.add_done_callback(
+        lambda f, _t=ticker, _i=art_id: _log_cb_exception(f, "alert-release", _t, _i)
+    )
 
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
@@ -555,6 +641,15 @@ class _DailyFileHandler(logging.FileHandler):
 
 
 def _setup_logging(log_dir: str) -> None:
+    """Wire NW4.1 logging so the asyncio loop never blocks on a file write.
+
+    The logger itself only holds a QueueHandler — every logger.info/debug call
+    on the hot path becomes a queue.put_nowait (microseconds, no I/O). A
+    dedicated QueueListener thread dequeues records and runs the real
+    _DailyFileHandler + StreamHandler off the loop. respect_handler_level=True
+    preserves the per-handler filters we configured (file=DEBUG, console=INFO).
+    """
+    global _log_queue, _log_listener
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return
@@ -574,8 +669,17 @@ def _setup_logging(log_dir: str) -> None:
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
 
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    # Producer side: only the QueueHandler is attached to `logger`. logger.info()
+    # becomes a non-blocking enqueue on the asyncio loop thread.
+    _log_queue = queue.Queue(-1)
+    qh = QueueHandler(_log_queue)
+    qh.setLevel(logging.DEBUG)
+    logger.addHandler(qh)
+    logger.propagate = False    # don't double-log through root
+
+    # Consumer side: dedicated daemon thread runs fh+ch, honoring their levels.
+    _log_listener = QueueListener(_log_queue, fh, ch, respect_handler_level=True)
+    _log_listener.start()
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -1598,12 +1702,14 @@ async def _handle_article(data: dict, recv_ts=None, prearmed=None, art_id=None) 
             'prearmed':     [prearmed] if prearmed else [],
             'art_id':       art_id,
         }
-        try:
-            cb(payload)
-        except Exception as exc:
-            logger.error(
-                f"Exception in callback for id={news_id}: {exc}", exc_info=True
-            )
+        # Off-loop submit: the orchestrator's accepted callback may talk to IBKR
+        # and block. Submitting to _callback_executor (single worker) keeps the
+        # asyncio loop free for the next alert's curl while preserving order vs
+        # the matching _emit_alert_arm / _emit_alert_release for the same art_id.
+        fut = _callback_executor.submit(cb, payload)
+        fut.add_done_callback(
+            lambda f, _i=news_id: _log_cb_exception(f, "accepted", "-", _i)
+        )
 
     # Persist this accepted article to disk NOW, instead of waiting for the next
     # hourly _flush(). Scheduled AFTER the consumer callback so it never delays
@@ -1634,12 +1740,17 @@ async def _async_main(api_key: str) -> None:
                 async_shutdown.set()
 
     async def _periodic_flush():
+        # Run _flush on _flush_executor so the asyncio loop stays free for WS
+        # reads + curls during the (multi-second) flush. Awaiting the future
+        # preserves the existing "one flush at a time" semantics — the next
+        # iteration won't sleep+submit until the previous flush returns.
+        loop = asyncio.get_running_loop()
         try:
             while not async_shutdown.is_set():
                 await asyncio.sleep(FLUSH_INTERVAL)
                 if async_shutdown.is_set():
                     break
-                _flush(final=False)
+                await loop.run_in_executor(_flush_executor, _flush, False)
         except asyncio.CancelledError:
             pass
 

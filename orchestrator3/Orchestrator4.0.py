@@ -39,7 +39,14 @@ from finBERT_neutral_management_addON import aggregate as _nocoref_aggregate
 OUTPUT_DIR = "/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/tables"
 # ─────────────────────────────────────────────────────────────────────────────
 
-import NewsWatcher4 as nw
+# ── NewsWatcher4.1 import (dot in filename prevents normal import) ────────────
+_nw_spec = _ilu.spec_from_file_location(
+    "NewsWatcher4_1",
+    "/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3/NewsWatcher4.2.py",
+)
+nw = _ilu.module_from_spec(_nw_spec)
+_nw_spec.loader.exec_module(nw)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── NewsWatcher4 inputs (RTPR alerts WS + permalink curl) ─────────────────────
 #
@@ -478,7 +485,7 @@ def _release_armed(ticker: str, art_id: str) -> None:
 # ─── TSV writer ───────────────────────────────────────────────────────────────
 
 _TSV_COLUMNS = [
-    'Symbol', 'Tickers', 'ID', 'Created', 'ArrivalDate', 'ArrivalTime', 'CurlTime', 'Headline', 'Author',
+    'Symbol', 'Tickers', 'ID', 'ArrivalDate', 'Created', 'ArrivalTime', 'CurlTime', 'Headline', 'Author',
     'Float', 'MktCap', 'Exchange',
     'LastDailyClose', 'itiBaseline', 'tradeSizeBaseline',
     'FinBERTCompletedAt',

@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
-NewsWatcher4.py
----------------
+NewsWatcher4.2.py
+-----------------
 Real-time press-release / news monitor using the RTPR.io *alerts* WebSocket
 plus a per-article HTTP curl of the signed permalink.
+
+NW4.2 changes vs NW4.1 (surgical, narrow):
+  • _fetch_article issues exactly ONE curl attempt — no retries, no backoff.
+    A failed curl previously held a fetch-semaphore slot for up to ~40s
+    (20s timeout × 2 attempts + 0.5s backoff), starving co-arriving alerts
+    during a top-of-hour PR burst.
+  • On curl failure, NW4.2 fires the accepted callback with a synthetic
+    payload (Headline='FAILED curl') instead of firing alert_release. The
+    orchestrator releases the warm client via its excluded-strings path
+    (Headline must match an entry in its excluded_strings file) and writes
+    an audit row to its news_output_*.tsv so failures are visible alongside
+    successes.
+  • Constants removed: FETCH_MAX_RETRIES, FETCH_BACKOFF_SEC.
+  • Everything else (filter pipeline, normalize, persist, flush, blacklist,
+    WS protocol, output formats, public API) is unchanged from NW4.1.
 
 This is the post-licensing-change replacement for NewsWatcher3 (firehose).
 RTPR can no longer redistribute article bodies through a raw WebSocket pipe,
@@ -46,12 +61,14 @@ import html as _htmllib
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -118,6 +135,22 @@ _persist_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='nw4-pe
 # never used for work (mirrors _persist_executor).
 _cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='nw4-cpu')
 
+# Dedicated single-worker pool for downstream callbacks (alert arm, alert release,
+# accepted). The orchestrator's arm handler talks to IBKR and can block; if that
+# ran on the asyncio loop it stalled in-flight curls and the WS reader. Single
+# worker preserves arm→release / arm→accepted ordering for the same art_id (the
+# orchestrator's release-only-if-armed invariant depends on it). DO NOT raise
+# max_workers > 1. start() recreates a fresh pool; this module-level one is never
+# used for real work (mirrors _persist_executor / _cpu_executor).
+_callback_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nw4-callback')
+
+# Dedicated single-worker pool for the periodic _flush. _flush holds several locks
+# and does N file writes; running it inline on the asyncio loop blocked the loop
+# for the flush's full duration (multi-second during a real session). Single worker
+# is enough — flushes run every flush_interval_seconds and the periodic coroutine
+# awaits each one, so there's never more than one queued. start() recreates it.
+_flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nw4-flush')
+
 _news_callback = None
 # Alert-flow callbacks (NW4): fired on the lightweight WS alert, BEFORE the
 # permalink curl, so the orchestrator can arm reqMktData without waiting on the
@@ -131,6 +164,14 @@ _callback_lock = threading.Lock()
 
 logger = logging.getLogger("NewsWatcherV4")
 
+# QueueHandler/QueueListener pair: the logger only owns a QueueHandler so every
+# logger.xxx() call on the asyncio loop is a non-blocking queue.put_nowait. The
+# listener thread (started in _setup_logging) dequeues records and runs the real
+# _DailyFileHandler + StreamHandler. Cleared on stop() so a fresh start() can
+# rebuild the pipeline.
+_log_queue: queue.Queue | None = None
+_log_listener: QueueListener | None = None
+
 # ─── NW4 tuning knobs ─────────────────────────────────────────────────────────
 
 MAX_CONCURRENT_FETCHES = 64      # cap concurrent permalink curls (was 8 → 32 → 64; still
@@ -138,18 +179,18 @@ MAX_CONCURRENT_FETCHES = 64      # cap concurrent permalink curls (was 8 → 32 
                                  # 08:00 burst where ~60 curls fired within ~4s. The
                                  # alert-ticker pre-filter in _handle_alert keeps the
                                  # actual fetch volume small; see [Timing] logs below.)
-FETCH_TIMEOUT_SEC      = 20.0    # per-attempt HTTP timeout. Raised 10→20 on 2026-06-17:
-                                 # [FetchTrace] showed top-of-hour stalls are pure TTFB
-                                 # (RTPR slow to respond, 4–8s, occasionally >10s) on
-                                 # fast fresh connections — the old 10s cap KILLED
-                                 # near-complete fetches and forced a retry storm onto an
-                                 # already-slammed endpoint. 20s rides out the peak in one
-                                 # attempt; arm already fired pre-curl so only the sentiment
-                                 # confirm waits (clerk holds the client ~60s).
-FETCH_MAX_RETRIES      = 2       # was 3. With the 20s timeout almost nothing reaches it, so
-                                 # retries rarely fire (no storm); one retry still covers a
-                                 # genuine dropped connection. Worst case ~40s < clerk window.
-FETCH_BACKOFF_SEC      = 0.5     # exponential: 0.5 → 1.0 → 2.0
+FETCH_TIMEOUT_SEC      = 20.0    # HTTP timeout for the single curl attempt. NW4.2 has no
+                                 # retries (see below), so this is also the hard ceiling on
+                                 # how long an alert can occupy a fetch-semaphore slot. 20s
+                                 # rides out the RTPR top-of-hour TTFB peak (4–8s, occ. >10s
+                                 # on fast fresh connections) in one shot; arm already fired
+                                 # pre-curl, so only the sentiment confirm waits (clerk holds
+                                 # the client ~60s).
+# NW4.2: single curl attempt per alert. No retries, no backoff. Rationale: under a top-of-
+# hour burst, a single slow RTPR endpoint multiplied by 2 retries + 0.5s backoff occupied a
+# semaphore slot for up to ~40s, starving co-arriving alerts. A failed curl now fires the
+# accepted callback with Headline='FAILED curl' so the orchestrator releases the warm client
+# (via its excluded-strings path) and logs an audit row in news_output_*.tsv.
 SLOW_FETCH_LOG_SEC     = 1.0     # alert→body-ready total at/above this logs [Timing] at
                                  # INFO (else DEBUG) — splits semwait / curl / normalize
                                  # so a burst backlog (our queue) is distinguishable from
@@ -236,6 +277,7 @@ def start(
         flush_interval_seconds:    How often in-memory state is flushed to disk.
     """
     global _background_thread, _config, _persist_executor, _cpu_executor
+    global _callback_executor, _flush_executor
     global _news_df, _news_objects, _blocked_objects
     global _blacklist_set, _blacklist_records, _universe_set
     global _seen_ids, _fetched_ids, _shutdown_event, _rejected_count
@@ -256,6 +298,15 @@ def start(
     # Fresh CPU-scrape pool for this session (same lifecycle as the persist pool).
     _cpu_executor = ThreadPoolExecutor(
         max_workers=CPU_POOL_WORKERS, thread_name_prefix='nw4-cpu'
+    )
+    # Fresh single-worker callback pool for this session. Single worker preserves
+    # arm→release / arm→accepted ordering for the same art_id; do not raise.
+    _callback_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='nw4-callback'
+    )
+    # Fresh single-worker flush pool for this session.
+    _flush_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='nw4-flush'
     )
 
     # Reset state (safe — background thread not yet alive)
@@ -312,7 +363,7 @@ def start(
     logger.info(f"Blocked dir      : {blocked_dir}")
     logger.info(f"Accepted dir     : {accepted_dir}")
     logger.info(f"Fetch concurrency: {MAX_CONCURRENT_FETCHES}  "
-                f"(timeout={FETCH_TIMEOUT_SEC}s retries={FETCH_MAX_RETRIES})")
+                f"(timeout={FETCH_TIMEOUT_SEC}s, single attempt — no retries)")
     if priced_tsv is not None:
         logger.info(f"Priced TSV       : {priced_tsv}")
         logger.info(f"Reject float >   : {reject_float_greater_then}M")
@@ -402,6 +453,37 @@ def stop() -> None:
     # inflight tasks (which own these futures) before the loop thread joined, so
     # these are complete or near-done.
     _cpu_executor.shutdown(wait=True)
+    # Drain any queued downstream callbacks. Must come before the log listener
+    # so any callback exception log lands in the queue while the listener is
+    # still alive to drain it.
+    _callback_executor.shutdown(wait=True)
+    # Drain any queued periodic flush. In practice there's at most one queued
+    # submission and it was either awaited already (loop exited cleanly) or
+    # cancelled (loop torn down). Belt-and-suspenders.
+    _flush_executor.shutdown(wait=True)
+
+    # Drain logs LAST so every prior step's log records hit disk. QueueListener.stop()
+    # enqueues a sentinel, joins the consumer thread, then both handlers it owns
+    # (fh + ch) are closed internally — they were never attached to `logger`, so
+    # we don't have to detach them here.
+    global _log_listener, _log_queue
+    if _log_listener is not None:
+        _log_listener.stop()
+        _log_listener = None
+    _log_queue = None
+    # The QueueHandler is still attached to `logger` but its target queue is now
+    # discarded, so emit() would silently no-op. Re-attach a synchronous
+    # StreamHandler so the final "stopped" line still surfaces on stdout for the
+    # operator (cheap; one line on shutdown only).
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, QueueHandler)
+               for h in logger.handlers):
+        _tail = logging.StreamHandler()
+        _tail.setLevel(logging.INFO)
+        _tail.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        logger.addHandler(_tail)
 
     logger.info("NewsWatcherV4 stopped.")
 
@@ -499,28 +581,47 @@ def register_alert_release_callback(fn) -> None:
     logger.info(f"Alert-release callback registered: {fn}")
 
 
+def _log_cb_exception(fut, kind: str, ticker: str, art_id: str) -> None:
+    """done_callback for _callback_executor submissions: surfaces callback
+    exceptions the same way the old try/except did, without blocking the loop.
+    Runs on whatever thread completed the future (the callback worker)."""
+    exc = fut.exception()
+    if exc is not None:
+        logger.error(
+            f"Exception in {kind} callback for {ticker} id={art_id}: {exc}",
+            exc_info=exc,
+        )
+
+
 def _emit_alert_arm(ticker: str, art_id: str, recv_ts) -> None:
-    """Invoke the registered alert callback (pre-fetch arm). Never raises."""
+    """Schedule the registered alert callback on _callback_executor. Never blocks.
+
+    The submit returns immediately so the asyncio loop stays free for the curl
+    that's about to fire. Exceptions are surfaced via _log_cb_exception. Ordering
+    is preserved relative to a later _emit_alert_release / accepted callback for
+    the same article because _callback_executor has max_workers=1.
+    """
     with _callback_lock:
         cb = _alert_callback
-    if cb is not None:
-        try:
-            cb(ticker, art_id, recv_ts)
-        except Exception as exc:
-            logger.error(f"Exception in alert callback for {ticker} id={art_id}: {exc}",
-                         exc_info=True)
+    if cb is None:
+        return
+    fut = _callback_executor.submit(cb, ticker, art_id, recv_ts)
+    fut.add_done_callback(
+        lambda f, _t=ticker, _i=art_id: _log_cb_exception(f, "alert", _t, _i)
+    )
 
 
 def _emit_alert_release(ticker: str, art_id: str) -> None:
-    """Invoke the registered alert-release callback. Never raises."""
+    """Schedule the registered alert-release callback on _callback_executor.
+    Never blocks. See _emit_alert_arm for the ordering guarantee."""
     with _callback_lock:
         cb = _alert_release_callback
-    if cb is not None:
-        try:
-            cb(ticker, art_id)
-        except Exception as exc:
-            logger.error(f"Exception in alert-release callback for {ticker} id={art_id}: {exc}",
-                         exc_info=True)
+    if cb is None:
+        return
+    fut = _callback_executor.submit(cb, ticker, art_id)
+    fut.add_done_callback(
+        lambda f, _t=ticker, _i=art_id: _log_cb_exception(f, "alert-release", _t, _i)
+    )
 
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
@@ -555,6 +656,15 @@ class _DailyFileHandler(logging.FileHandler):
 
 
 def _setup_logging(log_dir: str) -> None:
+    """Wire NW4.1 logging so the asyncio loop never blocks on a file write.
+
+    The logger itself only holds a QueueHandler — every logger.info/debug call
+    on the hot path becomes a queue.put_nowait (microseconds, no I/O). A
+    dedicated QueueListener thread dequeues records and runs the real
+    _DailyFileHandler + StreamHandler off the loop. respect_handler_level=True
+    preserves the per-handler filters we configured (file=DEBUG, console=INFO).
+    """
+    global _log_queue, _log_listener
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return
@@ -574,8 +684,17 @@ def _setup_logging(log_dir: str) -> None:
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
 
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    # Producer side: only the QueueHandler is attached to `logger`. logger.info()
+    # becomes a non-blocking enqueue on the asyncio loop thread.
+    _log_queue = queue.Queue(-1)
+    qh = QueueHandler(_log_queue)
+    qh.setLevel(logging.DEBUG)
+    logger.addHandler(qh)
+    logger.propagate = False    # don't double-log through root
+
+    # Consumer side: dedicated daemon thread runs fh+ch, honoring their levels.
+    _log_listener = QueueListener(_log_queue, fh, ch, respect_handler_level=True)
+    _log_listener.start()
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -1186,14 +1305,14 @@ def _format_fetch_trace(ctx: dict) -> str:
     )
 
 
-def _log_fetch_trace(art_id, ticker, attempt, status, ctx, elapsed, *,
+def _log_fetch_trace(art_id, ticker, status, ctx, elapsed, *,
                      force_info=False):
-    """Emit one [FetchTrace] line for a single fetch attempt. INFO when the attempt
-    was slow or non-200 (so bursts/timeouts surface on console + file); DEBUG for
-    fast successes (still captured in the DEBUG-level file)."""
+    """Emit one [FetchTrace] line for the single fetch attempt. INFO when slow
+    or non-200 (so bursts/timeouts surface on console + file); DEBUG for fast
+    successes (still captured in the DEBUG-level file). NW4.2 has no retries,
+    so there is no `attempt=N/M` field."""
     msg = (
-        f"[FetchTrace] id={art_id} ticker={ticker} "
-        f"attempt={attempt}/{FETCH_MAX_RETRIES} status={status} "
+        f"[FetchTrace] id={art_id} ticker={ticker} status={status} "
         f"elapsed={elapsed:.3f}s {_format_fetch_trace(ctx)}"
     )
     (logger.info if (force_info or elapsed >= SLOW_FETCH_LOG_SEC)
@@ -1214,59 +1333,44 @@ async def _fetch_article(session: aiohttp.ClientSession, url: str,
     `application/json` for forward-compatibility in case RTPR ever
     exposes a JSON variant.
 
-      • Retries on 429 / 5xx and on transient network errors with
-        exponential backoff (0.5s → 1.0s → 2.0s).
-      • Non-retryable on 401 / 403 / 404 (key/url/article problem).
+    NW4.2: one attempt only — no retries, no backoff. Any non-200, transient
+    network error, or timeout returns None immediately. _handle_alert turns
+    that None into a synthetic accepted callback (Headline='FAILED curl') so
+    the orchestrator releases its pre-armed warm client and writes a TSV
+    audit row.
     """
     headers = {'X-API-Key': api_key, 'Accept': 'application/json'}
-    delay = FETCH_BACKOFF_SEC
-    last_exc: Exception | None = None
-
-    for attempt in range(1, FETCH_MAX_RETRIES + 1):
-        ctx: dict = {}
-        attempt_t0 = time.monotonic()
-        try:
-            timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SEC)
-            async with session.get(url, headers=headers, timeout=timeout,
-                                   trace_request_ctx=ctx) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    _log_fetch_trace(art_id, ticker, attempt, "200", ctx,
-                                     time.monotonic() - attempt_t0)
-                    return text
-                if resp.status in (401, 403, 404):
-                    body = (await resp.text())[:200]
-                    logger.error(
-                        f"_fetch_article: non-retryable HTTP {resp.status} "
-                        f"url={url[:120]} body={body}"
-                    )
-                    _log_fetch_trace(art_id, ticker, attempt, str(resp.status), ctx,
-                                     time.monotonic() - attempt_t0, force_info=True)
-                    return None
-                logger.warning(
-                    f"_fetch_article: HTTP {resp.status} attempt {attempt}/"
-                    f"{FETCH_MAX_RETRIES} url={url[:120]}"
+    ctx: dict = {}
+    attempt_t0 = time.monotonic()
+    try:
+        timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SEC)
+        async with session.get(url, headers=headers, timeout=timeout,
+                               trace_request_ctx=ctx) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                _log_fetch_trace(art_id, ticker, "200", ctx,
+                                 time.monotonic() - attempt_t0)
+                return text
+            if resp.status in (401, 403, 404):
+                body = (await resp.text())[:200]
+                logger.error(
+                    f"_fetch_article: HTTP {resp.status} "
+                    f"url={url[:120]} body={body}"
                 )
-                _log_fetch_trace(art_id, ticker, attempt, str(resp.status), ctx,
-                                 time.monotonic() - attempt_t0, force_info=True)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            last_exc = exc
-            logger.warning(
-                f"_fetch_article: transient error attempt {attempt}/"
-                f"{FETCH_MAX_RETRIES} url={url[:120]}: {exc}"
-            )
-            _log_fetch_trace(art_id, ticker, attempt, type(exc).__name__, ctx,
+            else:
+                logger.warning(
+                    f"_fetch_article: HTTP {resp.status} url={url[:120]}"
+                )
+            _log_fetch_trace(art_id, ticker, str(resp.status), ctx,
                              time.monotonic() - attempt_t0, force_info=True)
-
-        if attempt < FETCH_MAX_RETRIES:
-            await asyncio.sleep(delay)
-            delay *= 2.0
-
-    if last_exc is not None:
-        logger.error(f"_fetch_article: exhausted retries for url={url[:120]}: {last_exc}")
-    else:
-        logger.error(f"_fetch_article: exhausted retries for url={url[:120]}")
-    return None
+            return None
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            f"_fetch_article: transient error url={url[:120]}: {exc}"
+        )
+        _log_fetch_trace(art_id, ticker, type(exc).__name__, ctx,
+                         time.monotonic() - attempt_t0, force_info=True)
+        return None
 
 
 # ─── HTML scrape regexes for _normalize_article ───────────────────────────────
@@ -1463,8 +1567,8 @@ async def _handle_alert(
 
     # Per-stage timing so a top-of-hour burst is diagnosable: semwait = time spent
     # waiting for a free fetch slot (OUR local queue), curl = the RTPR round-trip
-    # (incl. any retries/backoff), normalize = local HTML scrape. The single TSV
-    # "CurlTime" number can't separate these; the [Timing] line below can.
+    # (single attempt; NW4.2 has no retries), normalize = local HTML scrape. The
+    # single TSV "CurlTime" number can't separate these; the [Timing] line below can.
     t0 = time.monotonic()
     async with sem:
         t1 = time.monotonic()                      # semaphore acquired
@@ -1479,7 +1583,32 @@ async def _handle_alert(
             f"[Timing] id={art_id} ticker={primary} semwait={t1 - t0:.3f}s "
             f"curl={t2 - t1:.3f}s (fetch-failed)"
         )
-        _emit_alert_release(prearmed, art_id)
+        # NW4.2: synthetic accepted callback with Headline='FAILED curl'. The
+        # orchestrator's excluded-strings path (Headline must be in its
+        # excluded_strings file) releases the warm client via BAD sentiment and
+        # writes an audit row to news_output_*.tsv. This replaces the bare
+        # _emit_alert_release path NW4.1 used here — release still happens, but
+        # downstream now also gets a TSV trace. Routed directly to the callback
+        # (not through _handle_article) so we don't auto-blacklist `primary`,
+        # store a fake article in _news_objects, or persist a fake JSON.
+        with _callback_lock:
+            cb = _news_callback
+        if cb is not None:
+            synthetic_id = f"id-{art_id}" if art_id else f"id-{int(time.time() * 1000)}"
+            synthetic = {
+                'Symbol':       primary,
+                'ID':           synthetic_id,
+                'ArrivalTime':  recv_ts or datetime.now(),
+                'Headline':     'FAILED curl',
+                'article_body': '',
+                'exchange':     '',
+                'prearmed':     [primary] if prearmed else [],
+                'art_id':       art_id,
+            }
+            fut = _callback_executor.submit(cb, synthetic)
+            fut.add_done_callback(
+                lambda f, _i=synthetic_id: _log_cb_exception(f, "accepted", "-", _i)
+            )
         return
 
     # Offload the synchronous regex scrape to the CPU pool so it never blocks the
@@ -1598,12 +1727,14 @@ async def _handle_article(data: dict, recv_ts=None, prearmed=None, art_id=None) 
             'prearmed':     [prearmed] if prearmed else [],
             'art_id':       art_id,
         }
-        try:
-            cb(payload)
-        except Exception as exc:
-            logger.error(
-                f"Exception in callback for id={news_id}: {exc}", exc_info=True
-            )
+        # Off-loop submit: the orchestrator's accepted callback may talk to IBKR
+        # and block. Submitting to _callback_executor (single worker) keeps the
+        # asyncio loop free for the next alert's curl while preserving order vs
+        # the matching _emit_alert_arm / _emit_alert_release for the same art_id.
+        fut = _callback_executor.submit(cb, payload)
+        fut.add_done_callback(
+            lambda f, _i=news_id: _log_cb_exception(f, "accepted", "-", _i)
+        )
 
     # Persist this accepted article to disk NOW, instead of waiting for the next
     # hourly _flush(). Scheduled AFTER the consumer callback so it never delays
@@ -1634,12 +1765,17 @@ async def _async_main(api_key: str) -> None:
                 async_shutdown.set()
 
     async def _periodic_flush():
+        # Run _flush on _flush_executor so the asyncio loop stays free for WS
+        # reads + curls during the (multi-second) flush. Awaiting the future
+        # preserves the existing "one flush at a time" semantics — the next
+        # iteration won't sleep+submit until the previous flush returns.
+        loop = asyncio.get_running_loop()
         try:
             while not async_shutdown.is_set():
                 await asyncio.sleep(FLUSH_INTERVAL)
                 if async_shutdown.is_set():
                     break
-                _flush(final=False)
+                await loop.run_in_executor(_flush_executor, _flush, False)
         except asyncio.CancelledError:
             pass
 

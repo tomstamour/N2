@@ -223,8 +223,8 @@ def _print_level_summary(rows, level, mode):
 
 
 def _write_csv(path, rows):
-    fields = ["mode", "level", "status", "elapsed", "dns", "queued", "connect",
-              "ttfb", "reused", "bytes", "url"]
+    fields = ["mode", "level", "inflight_at_start", "queue_wait", "ticker", "status",
+              "elapsed", "dns", "queued", "connect", "ttfb", "reused", "bytes", "url"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -323,6 +323,113 @@ async def probe(api_keys_path, collect_n, levels, modes, timeout_sec,
     return 0
 
 
+# ─── Fire-on-arrival mode (mimics NW4: curl the instant each alert arrives) ───
+# Distinguishes the two remaining explanations for the top-of-hour TTFB stall:
+#   • GLOBAL RTPR peak slowness  → TTFB high even at low concurrency
+#   • per-IP/key throttle on US  → TTFB rises with OUR concurrency (→ staggering helps)
+# It records inflight_at_start per fetch so TTFB can be bucketed by concurrency.
+def _report_arrival(rows):
+    print("\n[probe] ───── ARRIVAL: TTFB vs our concurrency ─────")
+    for lo, hi in [(1, 2), (3, 5), (6, 10), (11, 10**9)]:
+        sub = [r for r in rows if lo <= r.get("inflight_at_start", 0) <= hi]
+        if not sub:
+            continue
+        ttfbs = [r["ttfb"] for r in sub if r["ttfb"] is not None]
+        label = f"{lo}-{hi}" if hi < 10**9 else f"{lo}+"
+        print(f"[probe]  inflight {label}: n={len(sub)} ok={sum(1 for r in sub if r['status']==200)} "
+              f"ttfb med={_fmt(_med(ttfbs))}s p95={_fmt(_pct(ttfbs,95))}s "
+              f"max={_fmt(max(ttfbs) if ttfbs else None)}s")
+
+    lo_med = _med([r["ttfb"] for r in rows if r.get("inflight_at_start", 0) <= 2])
+    hi_med = _med([r["ttfb"] for r in rows if r.get("inflight_at_start", 0) >= 6])
+    print("\n[probe] ───── VERDICT ─────")
+    print(f"[probe] ttfb @ low concurrency (≤2): {_fmt(lo_med)}s  vs  high (≥6): {_fmt(hi_med)}s")
+    if lo_med is None or hi_med is None:
+        print("[probe] not enough concurrency spread to judge — retry at a heavier burst.")
+    elif lo_med >= 2.0:
+        print("[probe] TTFB high even at LOW concurrency → GLOBAL RTPR peak slowness, not our "
+              "concurrency. Staggering won't help; the 20s-timeout / fewer-retries change is the "
+              "mitigation. (Reconciles your friend's 'ms': they curl off-peak / lower volume.)")
+    elif hi_med >= max(2.0, 3 * lo_med):
+        print("[probe] TTFB RISES sharply with OUR concurrency → per-IP/key throttle on us. "
+              "Staggering (cap concurrent curls to ~2–3) should cut body latency. "
+              "Confirm with a second run: --arrival --max-concurrency 3.")
+    else:
+        print("[probe] no strong concurrency effect this run → likely a light burst; retry at a "
+              "heavier top-of-hour.")
+
+
+async def arrival_probe(api_keys_path, duration_s, max_conc, timeout_sec, out_csv) -> int:
+    api_key = _load_rtpr_credentials(api_keys_path)
+    print(f"[probe] ARRIVAL mode: fire-on-arrival for {duration_s:.0f}s, "
+          f"max_concurrency={max_conc or 'unlimited'} (NW4 must be STOPPED).")
+    # limit=0 → unlimited pool, so OUR connector never gates concurrency; we're probing
+    # RTPR/IP behavior, not our pool. The optional semaphore is the only concurrency cap.
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+    sem = asyncio.Semaphore(max_conc) if max_conc and max_conc > 0 else None
+    state = {"inflight": 0}
+    rows, tasks = [], set()
+
+    async with aiohttp.ClientSession(connector=connector,
+                                     trace_configs=[_make_trace_config()]) as session:
+        async def _fetch_one(url, ticker, arrival_mono):
+            if sem:
+                await sem.acquire()
+            sem_acq = time.monotonic()
+            state["inflight"] += 1
+            inflight_at_start = state["inflight"]
+            try:
+                r = await _timed_fetch(session, url, api_key, timeout_sec)
+            finally:
+                state["inflight"] -= 1
+                if sem:
+                    sem.release()
+            r["ticker"] = ticker
+            r["inflight_at_start"] = inflight_at_start
+            r["queue_wait"] = round(sem_acq - arrival_mono, 3)  # time blocked on our own cap
+            r["mode"] = "arrival"
+            rows.append(r)
+
+        async with websockets.connect(WS_URL.format(key=api_key), ping_interval=None) as ws:
+            print("[probe] WS connected — firing curls on arrival…")
+            end = time.monotonic() + duration_s
+            n = 0
+            while time.monotonic() < end:
+                remaining = end - time.monotonic()
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=min(5.0, remaining))
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                mtype = msg.get("type")
+                if mtype == "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                    continue
+                if mtype != "alert":
+                    continue
+                url = msg.get("article_url")
+                if not url:
+                    continue
+                n += 1
+                t = asyncio.create_task(_fetch_one(url, msg.get("ticker"), time.monotonic()))
+                tasks.add(t)
+                t.add_done_callback(tasks.discard)
+            print(f"[probe] window closed; {n} alerts fired, draining {len(tasks)} in-flight…")
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    if not rows:
+        print("[probe] no alerts in the window — run at a top-of-hour. exiting.")
+        return 1
+    _write_csv(out_csv, rows)
+    print(f"[probe] wrote {len(rows)} rows → {out_csv}")
+    _report_arrival(rows)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="RTPR permalink curl concurrency-sweep isolation probe.")
@@ -341,15 +448,29 @@ def main():
                          "10s so the probe sees the true single-attempt latency).")
     ap.add_argument("--collect-timeout", type=float, default=240.0,
                     help="Max seconds to wait while collecting alerts (default 240).")
+    ap.add_argument("--arrival", action="store_true",
+                    help="Fire-on-arrival mode: curl the instant each alert arrives "
+                         "(mimics NW4) and report TTFB vs our concurrency — tells GLOBAL "
+                         "RTPR slowness from a per-IP throttle.")
+    ap.add_argument("--duration", type=float, default=25.0,
+                    help="[--arrival] seconds to keep firing on arrival (default 25; "
+                         "start ~30s before the top of the hour).")
+    ap.add_argument("--max-concurrency", type=int, default=0,
+                    help="[--arrival] cap concurrent curls (0 = unlimited). Run once "
+                         "unlimited, then once at 3 to test whether staggering helps.")
     ap.add_argument("--out", default="/tmp/curlprobe.csv",
                     help="Per-request CSV output path (default /tmp/curlprobe.csv).")
     args = ap.parse_args()
 
-    levels = [int(x) for x in args.levels.split(",") if x.strip()]
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     try:
-        rc = asyncio.run(probe(args.api_keys, args.collect, levels, modes,
-                               args.timeout, args.collect_timeout, args.out))
+        if args.arrival:
+            rc = asyncio.run(arrival_probe(args.api_keys, args.duration,
+                                           args.max_concurrency, args.timeout, args.out))
+        else:
+            levels = [int(x) for x in args.levels.split(",") if x.strip()]
+            modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+            rc = asyncio.run(probe(args.api_keys, args.collect, levels, modes,
+                                   args.timeout, args.collect_timeout, args.out))
     except KeyboardInterrupt:
         print("\n[probe] interrupted")
         rc = 130
