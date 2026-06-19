@@ -85,7 +85,7 @@ CLERK_TIMEOUT_SEC      = 5       # per-message TCP send/recv timeout
 CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sentiment
 
 # Sentiment gate (STEP 1b): headline FinBERT `positive` is the sole criterion.
-SENTIMENT_POSITIVE_MIN = 0.2     # positive >= this → Sentiment "OK", else "BAD"
+SENTIMENT_POSITIVE_MIN = 0.8     # positive >= this → Sentiment "OK", else "BAD"
 
 # Baseline lookups from the daily universe TSV.
 TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "no baseline"

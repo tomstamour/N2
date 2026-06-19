@@ -517,7 +517,7 @@ class XWingController:
         self.terminating = False
 
         # ratchet state (stop holds when price falls, only moves UP) - per cycle
-        self.high_water_mid = None   # peak mid since the current position opened
+        self.high_water = None       # peak bid (realizable price) since position opened
         self._aux_floor = None       # highest aux ever computed this cycle
         self._lmt_floor = None       # highest lmt ever computed this cycle
 
@@ -565,6 +565,21 @@ class XWingController:
         with self.lock:
             if self.bid and self.ask and self.bid > 0 and self.ask > 0:
                 return (self.bid + self.ask) / 2.0
+            if self.last and self.last > 0:
+                return self.last
+            if self.close and self.close > 0:
+                return self.close
+            return None
+
+    def current_exit_ref(self):
+        """Realizable SELL reference = the bid (where a marketable SELL fills),
+        falling back to last, then close. Drives yield_pct and the protective stop
+        so a wide/phantom ask can't inflate either. The `mid` column still reports
+        the true (bid+ask)/2 for transparency. Note: deliberately does NOT fall back
+        to current_mid() (which would reintroduce the ask)."""
+        with self.lock:
+            if self.bid and self.bid > 0:
+                return self.bid
             if self.last and self.last > 0:
                 return self.last
             if self.close and self.close > 0:
@@ -700,17 +715,18 @@ class XWingController:
         self.stop_evt.set()
         self.wake.set()
 
-    def compute_protective_levels(self, mid):
+    def compute_protective_levels(self, px):
         """Single source of truth for the protective STP LMT levels.
 
-        Tracks a high-water mid and RATCHETS the result: aux/lmt only ever move
-        UP and HOLD when price falls, so the resting STP LMT behaves like a true
-        native stop-limit (it actually triggers when price drops to aux) instead
-        of floating down with the price. Returns (row_yield, trig%, lim%, aux, lmt)."""
+        `px` is the realizable price (the bid; see current_exit_ref). Tracks a
+        high-water bid and RATCHETS the result: aux/lmt only ever move UP and HOLD
+        when price falls, so the resting STP LMT behaves like a true native
+        stop-limit (it actually triggers when price drops to aux) instead of
+        floating down with the price. Returns (row_yield, trig%, lim%, aux, lmt)."""
         with self.lock:
-            ref = self.original_avg_fill or self.running_entry_avg or mid
-            self.high_water_mid = max(self.high_water_mid or mid, mid)
-            hw = self.high_water_mid
+            ref = self.original_avg_fill or self.running_entry_avg or px
+            self.high_water = max(self.high_water or px, px)
+            hw = self.high_water
             ypct = (hw - ref) / ref * 100.0 if ref else 0.0
             ythr, trig, lim = self.table.lookup(ypct)
             aux = round_to_tick(hw * (1 - trig / 100.0), self.min_tick)
@@ -869,33 +885,34 @@ def control_loop(ctl: XWingController, start_ts: float):
     while not ctl.stop_evt.is_set():
         ctl.wake.clear()
         mid = ctl.current_mid()
+        exit_ref = ctl.current_exit_ref()   # bid-based realizable price (yield + stop basis)
 
         with ctl.lock:
             bid, ask = ctl.bid, ctl.ask
             pos = int(round(ctl.position))
             ref = ctl.original_avg_fill or ctl.running_entry_avg
-            ypct = ((mid - ref) / ref * 100.0) if (mid and ref) else None
+            ypct = ((exit_ref - ref) / ref * 100.0) if (exit_ref and ref) else None
             event = ""
 
             # protective management while long
             row_thr = trig = lim = aux = lmt = None
-            if pos > 0 and mid is not None:
+            if pos > 0 and exit_ref is not None:
                 if ctl.exiting:
                     # leave the resting exit LMT untouched (spec step 5); show held levels
                     row_thr, trig, lim = ctl.table.lookup(ypct if ypct is not None else 0.0)
                     aux, lmt = ctl._aux_floor, ctl._lmt_floor
                 else:
-                    row_thr, trig, lim, aux, lmt = ctl.compute_protective_levels(mid)
-                    if mid <= aux:
+                    row_thr, trig, lim, aux, lmt = ctl.compute_protective_levels(exit_ref)
+                    if exit_ref <= aux:
                         # synthetic stop trigger: place the SELL limit at the held
                         # table limit (true stop-limit; rests if it gaps below - step 5)
-                        ctl.arm_or_replace_protective(mid, force_exit=True, exit_lmt=lmt,
+                        ctl.arm_or_replace_protective(exit_ref, force_exit=True, exit_lmt=lmt,
                                                       reason="synthetic-trigger")
                         ctl.exiting = True
                         ctl.phase = PHASE_EXITING
                         event = "stop_triggered"
                     else:
-                        ctl.arm_or_replace_protective(mid, aux=aux, lmt=lmt, reason="trail")
+                        ctl.arm_or_replace_protective(exit_ref, aux=aux, lmt=lmt, reason="trail")
                         ctl.phase = (PHASE_LONG_MONITOR if ctl.original_avg_fill
                                      else PHASE_ENTRY_PARTIAL)
 
