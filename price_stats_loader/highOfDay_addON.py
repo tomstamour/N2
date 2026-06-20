@@ -11,6 +11,12 @@ CLIENT_ID = 6
 REQUEST_TIMEOUT = 30
 PACING_SLEEP_SECONDS = 2
 
+# Resilience tuning
+FETCH_RETRIES = 2            # attempts per (symbol, date) before giving up
+RECONNECT_ATTEMPTS = 3       # reconnect tries when the connection drops
+RECONNECT_BACKOFF_SECONDS = 5
+CONSECUTIVE_FAILURE_ABORT = 10  # abort run after this many US fetches fail in a row
+
 # US market closes at 4 PM ET; ArrivalTime values are stored in UTC-4 (EDT)
 MARKET_CLOSE_ET_HOUR = 16
 
@@ -40,6 +46,33 @@ def get_target_date(arrival_time_str: str) -> date:
     return target
 
 
+def ensure_connected(ib: IB) -> bool:
+    """Ensure the IB connection is live, reconnecting if it has dropped.
+
+    Returns True if connected (or successfully reconnected), False otherwise.
+    """
+    if ib.isConnected():
+        return True
+
+    for attempt in range(1, RECONNECT_ATTEMPTS + 1):
+        logging.warning(f"Connection lost — reconnect attempt {attempt}/{RECONNECT_ATTEMPTS}...")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        try:
+            ib.connect(IB_HOST, IB_PORT, clientId=CLIENT_ID, timeout=20)
+        except Exception as e:
+            logging.warning(f"Reconnect attempt {attempt} failed: {e}")
+        if ib.isConnected():
+            logging.info("Reconnected.")
+            return True
+        ib.sleep(RECONNECT_BACKOFF_SECONDS)
+
+    logging.error(f"Could not reconnect after {RECONNECT_ATTEMPTS} attempts.")
+    return False
+
+
 def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
     """
     Fetch the daily high for target_dt and the close of the prior trading day.
@@ -62,24 +95,36 @@ def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
         + timedelta(days=1)
     ).strftime('%Y%m%d %H:%M:%S UTC')
 
-    try:
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime=end_dt_str,
-            durationStr='3 D',
-            barSizeSetting='1 day',
-            whatToShow='TRADES',
-            useRTH=False,
-            formatDate=1,
-            keepUpToDate=False,
-            timeout=REQUEST_TIMEOUT,
-        )
-    except Exception as e:
-        logging.warning(f"{symbol}: reqHistoricalData error — {e}")
-        return None, None
+    bars = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        if not ensure_connected(ib):
+            logging.warning(f"{symbol}: not connected, cannot fetch.")
+            return None, None
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime=end_dt_str,
+                durationStr='3 D',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=False,
+                formatDate=1,
+                keepUpToDate=False,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception as e:
+            logging.warning(f"{symbol}: reqHistoricalData error (attempt {attempt}/{FETCH_RETRIES}) — {e}")
+            bars = None
+
+        if bars:
+            break
+
+        if attempt < FETCH_RETRIES:
+            logging.warning(f"{symbol}: no bars for {target_dt} (attempt {attempt}/{FETCH_RETRIES}), retrying...")
+            ib.sleep(PACING_SLEEP_SECONDS)
 
     if not bars:
-        logging.warning(f"{symbol}: no bars returned for {target_dt}.")
+        logging.warning(f"{symbol}: no bars returned for {target_dt} after {FETCH_RETRIES} attempts.")
         return None, None
 
     target_bar = None
@@ -153,6 +198,7 @@ def main():
         logging.info("Connected.")
 
         cache: dict = {}
+        consecutive_failures = 0
 
         for idx, row in df.iterrows():
             symbol = str(row['Symbol']).strip()
@@ -177,6 +223,20 @@ def main():
                 logging.info(f"Fetching HOD for {symbol} on {target_dt}...")
                 high, prev_close = fetch_hod_and_prev_close(ib, symbol, target_dt)
                 cache[cache_key] = (high, prev_close)
+
+                # Track consecutive US-symbol fetch failures to detect an HMDS outage.
+                if high is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= CONSECUTIVE_FAILURE_ABORT:
+                        logging.error(
+                            f"{consecutive_failures} consecutive fetches failed — HMDS appears down. "
+                            f"Aborting to avoid silent data loss; restart IB Gateway and re-run. "
+                            f"Last attempted: {symbol} on {target_dt} (row {idx})."
+                        )
+                        break
+                else:
+                    consecutive_failures = 0
+
                 ib.sleep(PACING_SLEEP_SECONDS)
             else:
                 high, prev_close = cache[cache_key]

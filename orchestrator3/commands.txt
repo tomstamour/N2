@@ -1,5 +1,0 @@
-ls -lhtr $(find . -type f -exec grep -l "*pre_*" {} +)
-
-find . -type f -exec grep -l "RLYB*" {} + | xargs ls -lhtr
-
-rg --files | grep -i "*SSM*"
