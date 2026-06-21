@@ -62,14 +62,26 @@ logger = logging.getLogger("clerk")
 # Config
 # --------------------------------------------------------------------------- #
 HERE = Path(__file__).resolve().parent
+SCRIPTS_DIR = HERE.parent
+
+# Centralized per-user config (scripts/config/n2_config_file.txt): IBKR Gateway
+# host/port and the clerk's own listen host/port are sourced from here as the
+# argparse DEFAULTS below (explicit CLI flags still override).
+_cfg_spec = importlib.util.spec_from_file_location(
+    "n2_config", SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = importlib.util.module_from_spec(_cfg_spec)
+_cfg_spec.loader.exec_module(n2_config)
+_CFG = n2_config.load_config()
 
 CLIENT_ID_START = 1000          # pool uses 1000 .. 1000 + qty - 1
 CLIENT_ID_MAX = 1029            # inclusive ceiling (30 clients)
 MKT_REQ_ID = 99                 # per-client market-data reqId (one duo at a time)
 CD_REQ_ID = 98                  # per-client contractDetails reqId
 
-# clerk's own daily log (one file per day, rolled at midnight)
-CLERK_LOG_DIR = "clerk_logs"
+# clerk's own daily log (one file per day, rolled at midnight). Anchored to the
+# script dir (like CLERK_STATE_DIR below) so it lands beside the clerk regardless
+# of the launch CWD.
+CLERK_LOG_DIR = str(HERE / "clerk_logs")
 
 # durable queue of deferred (closed-market) duos waiting for the next market
 # open. Persisted so a clerk crash/restart while duos are deferred does not lose
@@ -83,9 +95,9 @@ RECONNECT_CONNECT_TIMEOUT = 10   # per-attempt wait for connected_evt
 RECONNECT_BACKOFF_S       = 10   # sleep between reconnect attempts
 MAX_RECONNECT_ATTEMPTS    = 18   # ~3 min of attempts per watchdog tick
 
-# trade-mole driven-mode artifacts
-MOLE_OUTPUT_DIR = "mole-outputs"
-MOLE_LOG_DIR = "mole-logs"
+# trade-mole driven-mode artifacts (anchored to the script dir, CWD-independent)
+MOLE_OUTPUT_DIR = str(HERE / "mole-outputs")
+MOLE_LOG_DIR = str(HERE / "mole-logs")
 MOLE_LIFETIME_STR = "02:30"     # watch window (mm:ss, per trade_mole convention)
 DEFAULT_ITI_BASELINE = 44444.00  # used when the orch-trigger has no ITI baseline
 DEFAULT_TRADE_SIZE_BASELINE = 44444.00  # used when the trigger has no trade-size baseline
@@ -1026,13 +1038,19 @@ def main():
     p.add_argument("--client-qty", type=int, default=20,
                    help=f"Number of warm clients to connect (ids start at "
                         f"{CLIENT_ID_START}; max id {CLIENT_ID_MAX}).")
-    p.add_argument("--host", default="127.0.0.1", help="IBKR Gateway/TWS host")
-    p.add_argument("--port", type=int, default=4001,
-                   help="IBKR port (4001 live GW / 4002 paper GW / 7497 paper TWS)")
-    p.add_argument("--listen-host", default="127.0.0.1",
-                   help="Host/interface for the orch-trigger TCP socket")
-    p.add_argument("--listen-port", type=int, default=8765,
-                   help="TCP port for orch-triggers (JSON per line)")
+    p.add_argument("--host", default=n2_config.get(_CFG, "IBKR_GATEWAY_HOST", "127.0.0.1"),
+                   help="IBKR Gateway/TWS host (default from n2_config_file.txt)")
+    p.add_argument("--port", type=int,
+                   default=n2_config.get_int(_CFG, "IBKR_GATEWAY_PORT", 4001),
+                   help="IBKR port (4001 live GW / 4002 paper GW / 7497 paper TWS; "
+                        "default from n2_config_file.txt)")
+    p.add_argument("--listen-host", default=n2_config.get(_CFG, "CLERK_HOST", "127.0.0.1"),
+                   help="Host/interface for the orch-trigger TCP socket "
+                        "(default from n2_config_file.txt)")
+    p.add_argument("--listen-port", type=int,
+                   default=n2_config.get_int(_CFG, "CLERK_PORT", 8765),
+                   help="TCP port for orch-triggers (JSON per line; "
+                        "default from n2_config_file.txt)")
     p.add_argument("--watchdog-interval", type=float, default=WATCHDOG_INTERVAL_S,
                    help="Seconds between reconnection-watchdog polls that "
                         "re-warm pool clients after a Gateway restart (0 disables).")

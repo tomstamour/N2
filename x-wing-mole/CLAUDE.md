@@ -24,7 +24,7 @@ See `xmole-commands.txt` for the principal run + trigger commands.
 - **`trade_mole_4.1.py`** → superseded by `trade-mole-2.0.py`
 
 ## Notes
-- Run with the venv python that has ibapi: `/home/tom/venv/bin/python`
+- Run with the venv python that has ibapi: `path/to/venv/bin/python`
   (system `python3` lacks ibapi; it only works for `py_compile` syntax checks).
 - Lifetimes parse as `mm:ss` (e.g. `00:15` = 15s, `01:00` = 60s).
 - Port 4001 is the LIVE Gateway; 4002 paper GW / 7497 paper TWS.

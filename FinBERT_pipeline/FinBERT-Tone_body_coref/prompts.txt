@@ -1,3 +1,3 @@
  I just coied past a whole directory with its content (scripts..). I want you to use the script @FinBERT_body_coref.py that uses the ProsusAI/FinBERT model but I want you to create a new version named FinBERT-tone_body_coref.py that will use the model
   yiyanghkust/finbert-tone (Directly usable on HuggingFace) instead of the ProsusAI model. Make sure you deveolp the FinBERT-tone_body_coref.py pipeline by using the path for this local directory. you will have to change the path that use to point to script in the former
-  directory (/home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT_pipeline/FinBERT_body_coref). Use the AskUserQuestion tool to better understand my needs.
+  directory (path/to/N2/scripts/FinBERT_pipeline/FinBERT_body_coref). Use the AskUserQuestion tool to better understand my needs.

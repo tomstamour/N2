@@ -70,23 +70,37 @@ except ImportError:
 logger = logging.getLogger("x-wing")
 
 # --------------------------------------------------------------------------- #
-# Hard-coded configuration (NOT received from the clerk).
+# Centralized per-user config (scripts/config/n2_config_file.txt). x-wing runs
+# both standalone and imported by clerk-1.1.py via spec_from_file_location, so
+# __file__ is always the real path and these resolve relative to the repo.
+# --------------------------------------------------------------------------- #
+import importlib.util as _ilu
+_HERE = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _HERE.parent
+_spec = _ilu.spec_from_file_location("n2_config", _SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(n2_config)
+_CFG = n2_config.load_config()
+
+# --------------------------------------------------------------------------- #
+# Configuration (NOT received from the clerk).
 # These are the x-wing-side defaults the clerk does NOT override. Only `symbol`
 # (ticker) and `last_close_price` (lastDailyClose) come from the orch-trigger.
-# Edit these in one place. Standalone --flags fall back to these same values.
+# Per-user values (ACCOUNT, host, port) come from the central config above; the
+# rest are edited here. Standalone --flags fall back to these same values.
 # --------------------------------------------------------------------------- #
 CAPITAL                       = 5.00            # dollar budget per trade
-ACCOUNT                       = "U18283054"     # IBKR account for every order
-INPUT_LIMITS_TABLE            = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/yield-triggerLimit-data/v4-smoothed-yield_vs-stopLimits.tsv"
-LOG_DIR                       = "/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/xwing-logs"          # xwing_<symbol>_<date>_<time>.log
-PRICE_ACTION_TABLE_DIR        = "xwing_tables"  # xwing-table_<symbol>_<date>_<time>.tsv
+ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
+INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v4-smoothed-yield_vs-stopLimits.tsv")
+LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
+PRICE_ACTION_TABLE_DIR        = str(_HERE / "xwing_tables")  # xwing-table_<symbol>_<date>_<time>.tsv
 LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal
 MAX_LIMIT_ENTRY_PERCENT_PRICE = 4.0             # entry = ask * (1 + pct/100)
 MAX_CAP_ENTRY_PERCENT         = 30.0            # cap = last_close * (1 + pct/100)
 # Connection defaults — used by STANDALONE mode only; in driven mode the clerk
-# owns the shared connection.
-DEFAULT_PORT                  = 4001
-DEFAULT_HOST                  = "127.0.0.1"
+# owns the shared connection. Host/port come from the central config.
+DEFAULT_PORT                  = n2_config.get_int(_CFG, "IBKR_GATEWAY_PORT", 4001)
+DEFAULT_HOST                  = n2_config.get(_CFG, "IBKR_GATEWAY_HOST", "127.0.0.1")
 DEFAULT_CLIENT_ID_BASE        = 10000
 
 # STANDALONE market-data request id (driven mode uses the clerk's reqId)

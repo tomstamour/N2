@@ -13,15 +13,28 @@ from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import glob
+from pathlib import Path
 
-sys.path.insert(0, '/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3')
-sys.path.insert(0, '/home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder')
-sys.path.insert(0, '/home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT_pipeline/FinBERT_body_noCoref')
+# ── Repo-relative anchor + centralized per-user config ────────────────────────
+# Every sibling script lives one level under scripts/, so this resolves the
+# repo's scripts/ dir from THIS file — no hard-coded /home/... paths, so a fresh
+# clone runs as-is. Per-user credentials/connection live in the single file
+# config/n2_config_file.txt (RTPR key, clerk host/port).
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+_cfg_spec = _ilu.spec_from_file_location("n2_config", SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = _ilu.module_from_spec(_cfg_spec)
+_cfg_spec.loader.exec_module(n2_config)
+_CFG = n2_config.load_config()
+N2_CONFIG_FILE = SCRIPTS_DIR / "config" / "n2_config_file.txt"
+
+sys.path.insert(0, str(SCRIPTS_DIR / 'newswatcher3'))
+sys.path.insert(0, str(SCRIPTS_DIR / 'universe_finder'))
+sys.path.insert(0, str(SCRIPTS_DIR / 'FinBERT_pipeline' / 'FinBERT_body_noCoref'))
 
 # ── FinBERT import (hyphen in filename prevents normal import) ────────────────
 _finbert_spec = _ilu.spec_from_file_location(
     "FinBERT_headliner",
-    "/home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT/FinBERT-headliner.py",
+    str(SCRIPTS_DIR / "FinBERT" / "FinBERT-headliner.py"),
 )
 _finbert_mod = _ilu.module_from_spec(_finbert_spec)
 _finbert_spec.loader.exec_module(_finbert_mod)
@@ -36,13 +49,13 @@ from finBERT_neutral_management_addON import aggregate as _nocoref_aggregate
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Daily TSV output ──────────────────────────────────────────────────────────
-OUTPUT_DIR = "/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/tables"
+OUTPUT_DIR = str(SCRIPTS_DIR / "orchestrator3" / "tables")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── NewsWatcher4.1 import (dot in filename prevents normal import) ────────────
 _nw_spec = _ilu.spec_from_file_location(
     "NewsWatcher4_1",
-    "/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3/NewsWatcher4.2.py",
+    str(SCRIPTS_DIR / "newswatcher3" / "NewsWatcher4.2.py"),
 )
 nw = _ilu.module_from_spec(_nw_spec)
 _nw_spec.loader.exec_module(nw)
@@ -56,15 +69,15 @@ _nw_spec.loader.exec_module(nw)
 #
 NW4_UNIVERSE_TSV          = None  # resolved at startup via _resolve_latest_universe_tsv()
 NW4_PRICED_TSV            = None  # resolved at startup via _resolve_latest_universe_tsv()
-NW4_BLACK_LIST            = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/black_list.csv'
-NW4_API_KEYS              = '/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3/RTPR_API-Key.txt'
-NW4_LOG_DIR               = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/logs'
-NW4_OUTPUT_DIR            = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/outputs'
-NW4_NEWS_DF_DIR           = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/outputs'
-NW4_BLOCKED_DIR           = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/outputs/blocked_PRs'
-NW4_ACCEPTED_DIR          = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/outputs/accepted_PRs'
-NW4_EXCLUDED_STRINGS_FILE = '/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3/excluded_strings.txt'
-ORCH_EXCLUDED_STRINGS_FILE  = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/excluded_strings-2.txt'
+NW4_BLACK_LIST            = str(SCRIPTS_DIR / 'orchestrator3' / 'black_list.csv')
+NW4_API_KEYS              = str(N2_CONFIG_FILE)   # RTPR key now lives in the central config
+NW4_LOG_DIR               = str(SCRIPTS_DIR / 'orchestrator3' / 'logs')
+NW4_OUTPUT_DIR            = str(SCRIPTS_DIR / 'orchestrator3' / 'outputs')
+NW4_NEWS_DF_DIR           = str(SCRIPTS_DIR / 'orchestrator3' / 'outputs')
+NW4_BLOCKED_DIR           = str(SCRIPTS_DIR / 'orchestrator3' / 'outputs' / 'blocked_PRs')
+NW4_ACCEPTED_DIR          = str(SCRIPTS_DIR / 'orchestrator3' / 'outputs' / 'accepted_PRs')
+NW4_EXCLUDED_STRINGS_FILE = str(SCRIPTS_DIR / 'newswatcher3' / 'excluded_strings.txt')
+ORCH_EXCLUDED_STRINGS_FILE  = str(SCRIPTS_DIR / 'orchestrator3' / 'excluded_strings-2.txt')
 NW4_BLACKLIST_EXPIRY_HOURS = 0
 NW4_REJECT_FLOAT_GT       = 50        # M shares; matches old universe filter
 NW4_REJECT_PRICE_GT       = 10.00
@@ -77,10 +90,10 @@ NW4_FLUSH_INTERVAL_SEC    = 3600
 #   STEP 1a (ARM)       on PR arrival → {ticker, lastDailyClose, itiBaseline, tradeSizeBaseline}
 #   STEP 1b (SENTIMENT) after FinBERT → {ticker, Sentiment: "OK"|"BAD"}
 # Start the clerk FIRST, e.g.:
-#   /home/tom/venv/bin/python clerk-1.1.py --client-qty 5 --port 4002 --listen-port 8765
+#   path/to/venv/bin/python clerk-1.1.py --client-qty 5 --port 4002 --listen-port 8765
 # (--port 4001 is the LIVE Gateway — real money. Use 4002 = paper GW for testing.)
-CLERK_HOST             = '127.0.0.1'
-CLERK_PORT             = 8765
+CLERK_HOST             = n2_config.get(_CFG, 'CLERK_HOST', '127.0.0.1')
+CLERK_PORT             = n2_config.get_int(_CFG, 'CLERK_PORT', 8765)
 CLERK_TIMEOUT_SEC      = 5       # per-message TCP send/recv timeout
 CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sentiment
 
@@ -90,7 +103,7 @@ SENTIMENT_POSITIVE_MIN = 0.8     # positive >= this → Sentiment "OK", else "BA
 # Baseline lookups from the daily universe TSV.
 TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "no baseline"
 DEFAULT_BASELINE_ITI = 44444.0   # fallback ITI (s) when symbol absent/NaN in universe
-UNIVERSE_DATA_DIR    = '/home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/data'
+UNIVERSE_DATA_DIR    = str(SCRIPTS_DIR / 'universe_finder' / 'data')
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── FinBERT body pipeline (noCoref) + neutral-management ──────────────────────

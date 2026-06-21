@@ -257,13 +257,13 @@ This ensures the script works offline and with common companies.
 ## Files
 
 **Main Script**:
-- `/home/tom/Documents/ibkr_scripts/N1/scripts/NerSecDictionary/NerSecDicCreator.py` (561 lines)
+- `path/to/N1/scripts/NerSecDictionary/NerSecDicCreator.py` (561 lines)
 
 **Input File**:
-- `/home/tom/Documents/ibkr_scripts/N1/scripts/NerSecDictionary/FEED_28-jan-2026_sentences.json`
+- `path/to/N1/scripts/NerSecDictionary/FEED_28-jan-2026_sentences.json`
 
 **Output File** (generated):
-- `/home/tom/Documents/ibkr_scripts/N1/scripts/NerSecDictionary/FEED_28-jan-2026_sentences_NER.json`
+- `path/to/N1/scripts/NerSecDictionary/FEED_28-jan-2026_sentences_NER.json`
 
 **Cache Directory** (auto-created):
 - `~/.cache/NerSecDictionary/`

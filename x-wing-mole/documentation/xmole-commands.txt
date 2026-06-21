@@ -3,7 +3,7 @@
 #######################################################################
 
 ### 1. CLERK — warm client pool + trigger listener (start this first)
-/home/tom/venv/bin/python clerk-1.1.py --client-qty 5 --port 4001 --listen-port 8765
+path/to/venv/bin/python clerk-1.1.py --client-qty 5 --port 4001 --listen-port 8765
 
 ### TRIGGER the clerk -> launches a trade-mole + x-wing duo on ONE shared client
 #   payload: ticker, lastDailyClose, itiBaseline, tradeSizeBaseline
@@ -14,12 +14,12 @@ echo '{"ticker":"STAK","lastDailyClose":0.14,"itiBaseline":534.52,"tradeSizeBase
 
 
 ### 2. TRADE-MOLE — standalone (its own IBKR connection)
-/home/tom/venv/bin/python trade-mole-2.1.py --symbol JWEL --clientID 1112 \
+path/to/venv/bin/python trade-mole-2.1.py --symbol JWEL --clientID 1112 \
   --lifeTime 01:00 --output mole-outputs --log-dir mole-logs --port 4001 \
   --baseline-iti 44444.00 --baseline-trade-size 150
 
 
 ### 3. X-WING — standalone (own connection; capital/account/limits/etc. hard-coded in script)
-/home/tom/venv/bin/python x-wing-2.0.py --symbol YYGH --last-close-price 0.15
+path/to/venv/bin/python x-wing-2.0.py --symbol YYGH --last-close-price 0.15
 #   then FIRE the entry (manual buy-signal):
 pkill -USR1 -f "x-wing-2.0.py --symbol JWEL"

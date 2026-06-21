@@ -27,7 +27,7 @@ Controls inside the board:
     q or Esc         quit
 
 Run with the project's venv (has ib_insync):
-    /home/tom/venv/bin/python daily-board.py
+    path/to/venv/bin/python daily-board.py
 """
 
 import argparse

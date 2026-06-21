@@ -14,7 +14,7 @@ Tooling to produce and inspect the `--input-limits-table` TSV consumed by `X-win
 ## Commands
 
 ```bash
-PY=/home/tom/venv/bin/python
+PY=path/to/venv/bin/python
 
 # Regenerate smoothed table from example source (default args)
 $PY generate_smoothed_yield_table.py
@@ -48,7 +48,7 @@ PCHIP (monotone cubic) is chosen because it follows the up-then-plateau shape of
 
 ## Dependencies
 
-`numpy`, `pandas`, `scipy` (generator) and `matplotlib` (plotter) — all installed in `/home/tom/venv`. Use that interpreter; the system `python3` lacks these packages.
+`numpy`, `pandas`, `scipy` (generator) and `matplotlib` (plotter) — all installed in `path/to/venv`. Use that interpreter; the system `python3` lacks these packages.
 
 ## Relationship to X-wing
 

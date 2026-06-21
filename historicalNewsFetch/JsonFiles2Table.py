@@ -19,10 +19,13 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
-FINBERT_SCRIPT = "/home/tom/Documents/ibkr_scripts/N1/scripts/FinBERT/FinBERT-headliner.py"
+# Repo-relative anchor: this file is scripts/historicalNewsFetch/, so .parent.parent
+# is scripts/ — resolve N2's own FinBERT headliner so a fresh clone runs as-is.
+FINBERT_SCRIPT = str(Path(__file__).resolve().parent.parent / "FinBERT" / "FinBERT-headliner.py")
 
 UTC_OFFSET = -4  # UTC-4
 

@@ -826,7 +826,7 @@ if __name__ == "__main__":
 # `nasdaq_symbols_data_priced_YYYY-MM-DD.tsv`). Run this one manually to produce
 # the parallel `nasdaq_symbols_data_priced_sized_YYYY-MM-DD.tsv`, e.g.:
 #
-#   /home/tom/venv/bin/python3 daily_universe_pipeline-2.py
+#   path/to/venv/bin/python3 daily_universe_pipeline-2.py
 #
 # Once validated, swap the cron line to point here (and decide whether the
 # `_sized` output should become the canonical one). `runs/cron.log` rotation and

@@ -13,8 +13,8 @@ Output uses the canonical headers `Yield (%)\tTrigger(%)\tLimit(%)`, so it is a 
 `--input-limits-table` for X-wing-1.0.py (LimitsTable loads it unchanged).
 
 Usage:
-  /home/tom/venv/bin/python generate_smoothed_yield_table.py
-  /home/tom/venv/bin/python generate_smoothed_yield_table.py \
+  path/to/venv/bin/python generate_smoothed_yield_table.py
+  path/to/venv/bin/python generate_smoothed_yield_table.py \
       --input example-yield_vs-stopLimits.tsv \
       --output smoothed-yield_vs-stopLimits.tsv --step 1.0 --decimals 2
 """

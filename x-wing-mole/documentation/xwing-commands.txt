@@ -2,7 +2,7 @@
 ./X-wing-1.0.py \
 --symbol JWEL \
 --capital 4.00 \
---account U18283054 \
+--account YOUR_IBKR_ACCOUNT \
 --input-limits-table example-yield_vs-stopLimits.tsv \
 --log-dir logs \
 --price-action-table xwing_tables \

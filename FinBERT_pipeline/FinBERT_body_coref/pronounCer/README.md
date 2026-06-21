@@ -56,7 +56,7 @@ If fastcoref is not installed, the system will automatically fall back to simple
 ### Terminal 1: Start the Service
 
 ```bash
-cd /home/tom/Documents/ibkr_scripts/N1/scripts/pronounCer
+cd path/to/N1/scripts/pronounCer
 python3 pronounCer_service.py
 ```
 
@@ -74,7 +74,7 @@ The service will keep running. You can leave this terminal open or run it in the
 ### Terminal 2: Run the Client (Simple Mode - Default)
 
 ```bash
-cd /home/tom/Documents/ibkr_scripts/N1/scripts/pronounCer
+cd path/to/N1/scripts/pronounCer
 python3 pronounCer.py --inputs FEED_28-jan-2026
 ```
 

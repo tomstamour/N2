@@ -113,7 +113,7 @@ The cron fires at 20:30 ET, so the available IBKR window is ~7.5 h. At 03:59 the
 
 ```
 TZ=America/New_York
-30 20 * * * /home/tom/venv/bin/python3 /home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/pipeline_daily.py >> /home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/runs/cron.log 2>&1
+30 20 * * * path/to/venv/bin/python3 path/to/N2/scripts/universe_finder/pipeline_daily.py >> path/to/N2/scripts/universe_finder/runs/cron.log 2>&1
 ```
 
 ---

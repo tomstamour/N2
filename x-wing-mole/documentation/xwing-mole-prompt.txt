@@ -16,7 +16,7 @@ This triggering of the Clerk will launch both the trade-mole and the x-wing scri
 
 The x-wing will not receive the following inputs from the clerk (they will be defined in the xwing script, make sure the variables are in the first lines of the script):
 --capital <>
---account U18283054
+--account YOUR_IBKR_ACCOUNT
 --input-limits-table example-yield_vs-stopLimits.tsv \
 --log-dir logs (make sure the logs have the format: wxing_date_time.log)
 --price-action-table xwing_tables (make sure the outputs have the format: wxing-table_date_time.tsv)

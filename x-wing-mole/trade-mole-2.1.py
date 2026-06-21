@@ -114,6 +114,19 @@ from ibapi.contract import Contract
 # Configuration
 # ============================================================================
 
+# Centralized per-user config (scripts/config/n2_config_file.txt). trade-mole
+# only opens its own IBKR connection in STANDALONE mode; the --host/--port
+# argparse defaults below are sourced from this file (CLI flags still override).
+# In DRIVEN mode (imported by clerk) the clerk owns the shared socket.
+import importlib.util as _ilu
+from pathlib import Path as _Path
+_SCRIPTS_DIR = _Path(__file__).resolve().parent.parent
+_cfg_spec = _ilu.spec_from_file_location(
+    "n2_config", _SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = _ilu.module_from_spec(_cfg_spec)
+_cfg_spec.loader.exec_module(n2_config)
+_CFG = n2_config.load_config()
+
 # User-requested rolling window sizes in seconds
 WINDOWS = [1, 2, 3, 4, 5, 10]
 
@@ -1340,10 +1353,13 @@ def main():
     parser.add_argument("--keep-recording-after-trigger", action="store_true",
                         help="Do NOT stop recording when the surge/buy-signal fires "
                              "(default: stop at the trigger row). Standalone only.")
-    parser.add_argument("--host", default="127.0.0.1", help="IBKR Gateway/TWS host")
-    parser.add_argument("--port", type=int, default=7497,
+    parser.add_argument("--host", default=n2_config.get(_CFG, "IBKR_GATEWAY_HOST", "127.0.0.1"),
+                        help="IBKR Gateway/TWS host (default from n2_config_file.txt)")
+    parser.add_argument("--port", type=int,
+                        default=n2_config.get_int(_CFG, "IBKR_GATEWAY_PORT", 4001),
                         help="IBKR port (7497=paper TWS, 7496=live TWS, "
-                             "4002=paper Gateway, 4001=live Gateway)")
+                             "4002=paper Gateway, 4001=live Gateway; "
+                             "default from n2_config_file.txt)")
     parser.add_argument("--loglevel", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--log-dir", default=None,

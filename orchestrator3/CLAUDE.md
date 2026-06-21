@@ -69,10 +69,10 @@ Also increase `max_workers` in `ThreadPoolExecutor` if adding more parallel task
 
 ## Dependencies
 
-- `NewsWatcher2` — `/home/tom/Documents/ibkr_scripts/N1/scripts/newswatcher2/`
-- `yfinance_stock_universe` — `/home/tom/Documents/ibkr_scripts/N1/scripts/universe_finder/`
-- `pre_trade_frequency_baseline` — `/home/tom/Documents/ibkr_scripts/N1/scripts/volume/trade_frequency_baseline/` (requires IBKR Gateway/TWS)
-- `trade_mole.py` — `/home/tom/Documents/ibkr_scripts/N1/scripts/volume/trade_surge_mole/` (CLI; spawned as detached subprocess on qualifying news)
+- `NewsWatcher2` — `path/to/N1/scripts/newswatcher2/`
+- `yfinance_stock_universe` — `path/to/N1/scripts/universe_finder/`
+- `pre_trade_frequency_baseline` — `path/to/N1/scripts/volume/trade_frequency_baseline/` (requires IBKR Gateway/TWS)
+- `trade_mole.py` — `path/to/N1/scripts/volume/trade_surge_mole/` (CLI; spawned as detached subprocess on qualifying news)
 
 ## Integration Context
 
@@ -122,10 +122,10 @@ All NW3-related paths and thresholds live in the `NW3_*` config block near the t
 
 ### Dependencies (Orchestrator3 only)
 
-- `NewsWatcher3` — `/home/tom/Documents/ibkr_scripts/N2/scripts/newswatcher3/`
-- `pre_trade_frequency_baseline` — `/home/tom/Documents/ibkr_scripts/N1/scripts/volume/trade_frequency_baseline/` (requires IBKR Gateway/TWS)
-- `trade_mole.py` — `/home/tom/Documents/ibkr_scripts/N1/scripts/volume/trade_surge_mole/`
-- Priced universe TSV — `/home/tom/Documents/ibkr_scripts/N1/scripts/universe_finder/data/nasdaq_symbols_data_priced.tsv`
+- `NewsWatcher3` — `path/to/N2/scripts/newswatcher3/`
+- `pre_trade_frequency_baseline` — `path/to/N1/scripts/volume/trade_frequency_baseline/` (requires IBKR Gateway/TWS)
+- `trade_mole.py` — `path/to/N1/scripts/volume/trade_surge_mole/`
+- Priced universe TSV — `path/to/N1/scripts/universe_finder/data/nasdaq_symbols_data_priced.tsv`
 
 The original `Orchestrator.py` (NW2 / Alpaca path) is the legacy implementation and remains in this directory for reference.
 
@@ -191,7 +191,7 @@ All in the `BODY_FINBERT_*` block at the top of `Orchestrator3.2.py`:
 
 ### Dependencies (additional vs 3.1)
 
-- `FinBERT_body_pipeline` — `/home/tom/Documents/ibkr_scripts/N2/scripts/FinBERT_pipeline/`
+- `FinBERT_body_pipeline` — `path/to/N2/scripts/FinBERT_pipeline/`
 - Sibling scripts pulled in by the body pipeline: `jsonCleaner`, `pronounCer`, `SentenceSplitter`, `NerSecDictionary`, `FinBERT/FinBERT-analysis.py` (uses ONNX INT8 model — run `python3 FinBERT-analysis.py --export` once if `finbert_onnx/` is not yet exported).
 - Python deps: `spacy` + `en_core_web_sm`, `fastcoref` (optional but required for `coref_mode='full'`), `transformers`, `optimum[onnxruntime]`.
 
@@ -199,7 +199,7 @@ All in the `BODY_FINBERT_*` block at the top of `Orchestrator3.2.py`:
 
 ## Orchestrator4.0 (clerk hand-off)
 
-`Orchestrator4.0.py` replaces the legacy trade-mole subprocess launcher with a TCP/JSON hand-off to `clerk-1.1.py` (the warm ibapi client pool in `/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/`). The FinBERT-headliner + noCoref body pipeline is identical to `Orchestrator3.5.py`. Beyond the trade trigger, this version moves the clerk **arm onto the raw WS alert** (pre-fetch) and adds a ticker pre-filter in NewsWatcher4 so `reqMktData` starts without waiting on the article-body curl (see *Arm-on-alert & NW4 pre-filter* below). Run with:
+`Orchestrator4.0.py` replaces the legacy trade-mole subprocess launcher with a TCP/JSON hand-off to `clerk-1.1.py` (the warm ibapi client pool in `path/to/N2/scripts/x-wing-mole/`). The FinBERT-headliner + noCoref body pipeline is identical to `Orchestrator3.5.py`. Beyond the trade trigger, this version moves the clerk **arm onto the raw WS alert** (pre-fetch) and adds a ticker pre-filter in NewsWatcher4 so `reqMktData` starts without waiting on the article-body curl (see *Arm-on-alert & NW4 pre-filter* below). Run with:
 
 ```bash
 python3 Orchestrator4.0.py        # the clerk must already be running (see below)
@@ -254,9 +254,9 @@ Drops `Trigger`; adds `LastDailyClose`, `itiBaseline`, `tradeSizeBaseline` (what
 
 ### Dependencies (vs 3.5)
 
-- `clerk-1.1.py` — `/home/tom/Documents/ibkr_scripts/N2/scripts/x-wing-mole/` (start it first; it loads `x-wing-2.0.py` + `trade-mole-2.1.py` and connects its own ibapi pool). Start example:
+- `clerk-1.1.py` — `path/to/N2/scripts/x-wing-mole/` (start it first; it loads `x-wing-2.0.py` + `trade-mole-2.1.py` and connects its own ibapi pool). Start example:
   ```bash
-  /home/tom/venv/bin/python clerk-1.1.py --client-qty 5 --port 4002 --listen-port 8765
+  path/to/venv/bin/python clerk-1.1.py --client-qty 5 --port 4002 --listen-port 8765
   ```
   `--port 4001` is the **LIVE** Gateway (real money); use `4002` (paper GW) for testing.
 - The orchestrator no longer spawns `trade_mole_*.py` or opens any ibapi connection of its own.

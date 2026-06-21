@@ -17,7 +17,7 @@ a diagnostic of the live incumbent rule `quote_updates_10s >= 11`.
 Read-only: writes one markdown report, modifies nothing else.
 
 Usage:
-    /home/tom/venv/bin/python analyze_surge_predictors.py
+    path/to/venv/bin/python analyze_surge_predictors.py
 """
 
 import csv

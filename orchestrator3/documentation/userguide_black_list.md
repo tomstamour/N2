@@ -18,7 +18,7 @@ The blacklist prevents the same stock from triggering multiple pipeline runs in 
 
 ## The Blacklist CSV
 
-**Location:** `/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/black_list.csv`
+**Location:** `path/to/N2/scripts/orchestrator3/black_list.csv`
 
 **Format:**
 ```

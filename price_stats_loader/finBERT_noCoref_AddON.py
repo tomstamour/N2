@@ -27,7 +27,7 @@ import pandas as pd
 
 # --- Locate sibling scripts on disk ----------------------------------------
 _THIS_FILE = Path(__file__).resolve()
-_REPO_SCRIPTS = _THIS_FILE.parent.parent  # /home/tom/Documents/ibkr_scripts/N2/scripts
+_REPO_SCRIPTS = _THIS_FILE.parent.parent  # <repo>/scripts
 _FINBERT_NOCOREF_DIR = _REPO_SCRIPTS / "FinBERT_pipeline" / "FinBERT_body_noCoref"
 _ORCHESTRATOR3_OUTPUTS = _REPO_SCRIPTS / "orchestrator3" / "outputs"
 

@@ -3,14 +3,14 @@
 
 ################ HisNews2.py is a script made to download all json files that have all the specificities of a PR in a specific date range.
 python3 ./HistNews2.py \
---symbols /home/tom/Documents/ibkr_scripts/N1/scripts/universe_finder/data/nasdaq_under10Mfloat.tsv \
+--symbols path/to/N1/scripts/universe_finder/data/nasdaq_under10Mfloat.tsv \
 --start-date 01-01-2026 \
 --end-date 28-02-2026 \
---excluded-strings /home/tom/Documents/ibkr_scripts/N1/scripts/orchestrator/excluded_strings.txt \
+--excluded-strings path/to/N1/scripts/orchestrator/excluded_strings.txt \
 --output ./outputs/floatUnderTenM-jan-fec-2026
 
 ##################### This script take all the json files in a directory and will produce a table that includes Arrival time of the news, Float, Sentiments scores, Headline..
 python3 JsonFiles2Tabled.py \
     --directory ./outputs/floatUnderTenM-jan-fec-2026/ \
     --output_name ./outputs/floatUnderTenM-jan-fec-2026/under10MFloat-jan-fev-2026_JsonFiles2Table.tsv \
-    --float_table /home/tom/Documents/ibkr_scripts/N1/scripts/universe_finder/data/nasdaq_symbols_data.tsv
+    --float_table path/to/N1/scripts/universe_finder/data/nasdaq_symbols_data.tsv

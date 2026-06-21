@@ -1,0 +1,47 @@
+# ============================================================================
+# N2 pipeline — Python dependencies, pinned to the versions this repo was
+# developed/tested against on Python 3.12.
+#
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Or run ./setup.sh, which also downloads the spaCy model and exports the
+# FinBERT ONNX model (see SETUP.md). NEVER commit the venv — it is machine/OS
+# specific; .venv/ is gitignored.
+# ============================================================================
+
+# ── Core trading runtime (Orchestrator4.0 → NewsWatcher4 → clerk/x-wing/trade-mole) ──
+ibapi==9.81.1.post1          # if PyPI can't resolve it, install from IBKR's TWS API (see SETUP.md)
+aiohttp==3.13.3
+websockets==15.0.1
+lxml==6.0.2
+requests==2.32.5
+numpy==1.26.4
+pandas==2.2.3
+
+# ── FinBERT sentiment (headline + noCoref body) ──
+transformers==4.55.4
+optimum==2.0.0
+optimum-onnx==0.0.3
+onnxruntime==1.23.2
+# torch is large; needed for the one-time ONNX export and the coref variant.
+# On a GPU-less machine install the CPU-only build (see SETUP.md).
+torch==2.10.0
+spacy==3.8.11
+# spaCy English model, version-pinned (equivalent to: python -m spacy download en_core_web_sm)
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# ── Optional / peripheral tools (universe_finder, daily-board, plotting, analysis, legacy fetchers) ──
+ib-insync==0.9.86            # daily-board, universe_finder add-ons
+yfinance==0.2.66             # universe_finder
+finvizfinance==1.3.0         # universe_finder (NASDAQ_symbols_data)
+alpaca-py==0.43.2            # legacy historicalNewsFetch only
+fastcoref==2.1.6             # only the FinBERT_body_coref variant (active body pipeline is noCoref)
+Flask==3.1.2                 # pronounCer_service microservice
+scikit-learn==1.9.0          # universe_finder ITI_imputer
+scipy==1.17.0                # yield-table generator, stats add-ons
+matplotlib==3.10.1           # plotting tools
+plotly==6.3.0                # trade-mole plot
+plotext==5.3.2               # terminal plots
+pytz==2025.2                 # tools/volume backtests
+adjustText                   # plot_sentiment_vs_dailyhigh; not in source venv → unpinned (latest)

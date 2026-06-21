@@ -7,8 +7,8 @@ curves against an evenly-spaced X axis (the row index: 0,1,2,...). Saves a PNG;
 pass --show to also open an interactive window.
 
 Usage:
-  /home/tom/venv/bin/python plot_yield_table.py
-  /home/tom/venv/bin/python plot_yield_table.py \
+  path/to/venv/bin/python plot_yield_table.py
+  path/to/venv/bin/python plot_yield_table.py \
       --input smoothed-yield_vs-stopLimits.tsv --output yield_table_plot.png --show
 """
 

@@ -11,8 +11,8 @@ Curves use distinct markers (solid / dotted / dashed) and dark colors only
 stripped.
 
 Usage:
-  /home/tom/venv/bin/python plot_yield_table_terminal.py
-  /home/tom/venv/bin/python plot_yield_table_terminal.py \\
+  path/to/venv/bin/python plot_yield_table_terminal.py
+  path/to/venv/bin/python plot_yield_table_terminal.py \\
       --input smoothed-yield_vs-stopLimits.tsv \\
       --output yield_table_plot.txt --no-show
 """

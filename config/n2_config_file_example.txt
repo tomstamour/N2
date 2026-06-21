@@ -1,0 +1,36 @@
+# ============================================================================
+# N2 user configuration — credentials & connection settings.
+#
+# A new user cloning the N2 repository edits ONLY this file. Every script in the
+# pipeline (NewsWatcher4, Orchestrator4.0, clerk, trade-mole, x-wing) reads its
+# per-user values from here; all other paths resolve relative to the repo.
+#
+# Format: a LABEL line ending in ':' followed by its value on the NEXT line.
+#         Blank lines and lines starting with '#' are ignored.
+#         A trailing ' #...' inline comment on a value line is stripped.
+# ============================================================================
+
+# RTPR.io API key (https://rtpr.io/wire). Used for the alerts WebSocket and the
+# per-article X-API-Key header.
+RTPR_API_KEY:
+my-rtpr-api-key
+
+# IBKR account ID set on every order placed by x-wing.
+IBKR_ACCOUNT:
+my-ibkr-account-number
+
+# IBKR Gateway / TWS connection used by clerk, trade-mole and x-wing.
+IBKR_GATEWAY_HOST:
+127.0.0.1
+
+# Port: 4001 = LIVE Gateway (REAL MONEY), 4002 = paper Gateway,
+#       7497 = paper TWS, 7496 = live TWS.
+IBKR_GATEWAY_PORT:
+4001
+
+# Clerk TCP/JSON listener — the channel Orchestrator4.0 uses to arm the clerk.
+CLERK_HOST:
+127.0.0.1
+
+CLERK_PORT:
+8765

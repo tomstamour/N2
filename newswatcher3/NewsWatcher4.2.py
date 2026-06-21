@@ -219,14 +219,25 @@ AUTH_FAILURE_BACKOFF_SEC = [60, 300, 1800, 3600]   # 1 min → 5 min → 30 min 
 
 RTPR_WS_URL_TEMPLATE = "wss://ws.rtpr.io/ws-alerts?apiKey={key}"
 
+# ─── Centralized per-user config (scripts/config/n2_config_file.txt) ──────────
+# NW4 reads its RTPR API key from the shared config via the n2_config parser;
+# repo-relative defaults below let a fresh clone run without source edits. The
+# orchestrator normally passes explicit paths, overriding these.
+import importlib.util as _ilu
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+_cfg_spec = _ilu.spec_from_file_location("n2_config", _SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = _ilu.module_from_spec(_cfg_spec)
+_cfg_spec.loader.exec_module(n2_config)
+_DEFAULT_CONFIG_FILE = _SCRIPTS_DIR / "config" / "n2_config_file.txt"
+
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def start(
-    universe_tsv: str = '/home/tom/Documents/ibkr_scripts/N2/scripts/universe_finder/data/nasdaq_symbols_data_priced.tsv',
-    black_list: str = '/home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator3/black_list.csv',
+    universe_tsv: str = str(_SCRIPTS_DIR / 'universe_finder' / 'data' / 'nasdaq_symbols_data_priced.tsv'),
+    black_list: str = str(_SCRIPTS_DIR / 'orchestrator3' / 'black_list.csv'),
     blacklist_expiry_hours: int = 24,
-    api_keys: str = './RTPR_API-Key.txt',
+    api_keys: str = str(_DEFAULT_CONFIG_FILE),
     log_dir: str = './logs',
     output_dir: str = './outputs',
     news_df_dir: str = './outputs',
@@ -701,33 +712,24 @@ def _setup_logging(log_dir: str) -> None:
 
 def _load_rtpr_credentials(file_path: str) -> str:
     """
-    Parse the RTPR API key from a file shaped like:
+    Parse the RTPR API key from `file_path` using the shared n2_config parser.
 
-        #RTPR.io API key informations
+    Accepts the central config's ``RTPR_API_KEY:`` label, falling back to the
+    legacy ``Key:`` label used by the standalone ``RTPR_API-Key.txt`` — so
+    either file works:
 
-        API Endpoint:
-        https://api.rtpr.io/articles
-
-        Key:
-        rtpr_XXXXXXXXXXXXXXX
+        RTPR_API_KEY:                 |   Key:
+        rtpr_XXXXXXXXXXXXXXX          |   rtpr_XXXXXXXXXXXXXXX
     """
     if not Path(file_path).exists():
         raise FileNotFoundError(f"API keys file not found: {file_path}")
 
-    api_key = None
-    try:
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
-        for i, line in enumerate(lines):
-            if line.strip().startswith('Key:'):
-                if i + 1 < len(lines):
-                    api_key = lines[i + 1].strip()
-                    break
-    except Exception as e:
-        raise ValueError(f"Error parsing API credentials file: {e}")
+    cfg = n2_config.load_config(file_path)
+    api_key = cfg.get('RTPR_API_KEY') or cfg.get('Key')
 
     if not api_key:
-        raise ValueError("Missing 'Key:' field in API credentials file")
+        raise ValueError(
+            f"Missing 'RTPR_API_KEY:' (or legacy 'Key:') field in {file_path}")
     return api_key
 
 

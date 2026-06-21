@@ -127,7 +127,7 @@ Total time: ~0.1 seconds
 ## File Structure
 
 ```
-/home/tom/Documents/ibkr_scripts/N1/scripts/pronounCer/
+path/to/N1/scripts/pronounCer/
 ├── pronounCer_service.py              [NEW] Service (6.6 KB)
 ├── pronounCer.py                      [NEW] Client (8.6 KB)
 ├── README.md                          [NEW] Documentation

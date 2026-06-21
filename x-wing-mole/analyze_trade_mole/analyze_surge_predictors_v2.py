@@ -29,7 +29,7 @@ Deliverable is a ranked markdown report only; nothing is wired into trade-mole.
 Read-only except for the one markdown report it writes.
 
 Usage:
-    /home/tom/venv/bin/python analyze_surge_predictors_v2.py
+    path/to/venv/bin/python analyze_surge_predictors_v2.py
 """
 
 import math

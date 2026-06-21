@@ -17,7 +17,7 @@ pip3 install --break-system-packages fastcoref
 
 ### Start Service (One Terminal)
 ```bash
-cd /home/tom/Documents/ibkr_scripts/N1/scripts/pronounCer
+cd path/to/N1/scripts/pronounCer
 python3 pronounCer_service.py
 ```
 
@@ -32,7 +32,7 @@ Starting Flask server on http://localhost:5050
 
 ### Process Files (Another Terminal)
 ```bash
-cd /home/tom/Documents/ibkr_scripts/N1/scripts/pronounCer
+cd path/to/N1/scripts/pronounCer
 
 # Simple mode (fast, pronouns only)
 python3 pronounCer.py --inputs FEED_28-jan-2026
