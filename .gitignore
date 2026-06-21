@@ -1,0 +1,50 @@
+# --- Ignore everything by default ---
+*
+
+# --- but still descend into subdirectories so the allow-rules below can match ---
+!*/
+
+# --- track source / config / doc files anywhere in the tree ---
+!*.py
+!*.sh
+!*.txt
+!*.md
+!.gitignore
+
+# --- ingnore config file with credentials
+config/n2_config_file.txt
+
+# --- re-ignore large generated-data folders (they hold big .txt/.csv/.json dumps) ---
+trade_mole_outputs/
+mole-outputs/
+outputs/
+ibkr_data/
+tables/
+# generated run logs — the *.txt ones can leak IBKR account IDs (e.g. preTrade_log.txt)
+logs/
+# regenerated FinBERT ONNX model (rebuild with setup.sh / FinBERT-*.py --export)
+finbert_onnx/
+
+# --- but DO track the .tsv outputs in price_stats_loader/outputs/ ---
+# (re-include the folder first, since a file can't be un-ignored while its parent dir is)
+!price_stats_loader/outputs/
+!price_stats_loader/outputs/*.tsv
+
+# --- and DO track the .tsv tables in orchestrator3/tables/ ---
+!orchestrator3/tables/
+!orchestrator3/tables/*.tsv
+
+# --- always-ignore noise ---
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+env/
+ENV/
+node_modules/
+.DS_Store
+*.log
+
+# --- keep this local-only helper file out of the repo ---
+/git-workflow.txt
