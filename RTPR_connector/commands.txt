@@ -1,0 +1,4 @@
+#1. Run the connector
+# Universe is auto-loaded (newest stocks_universe_YYYY-MM-DD.tsv) and re-scanned daily at 03:58 ET.
+
+python3 /home/tom/Documents/ibkr_scripts/N2/scripts/RTPR_connector/RTPR_connector.py

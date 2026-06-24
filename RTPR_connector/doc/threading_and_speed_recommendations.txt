@@ -1,0 +1,95 @@
+The core problem
+You have:
+A single WebSocket firehose (bursty: ~20 PRs/sec)
+Each message triggers:
+Filter (~700 symbols universe)
+HTTP fetch (curl/article)
+Processing
+Your latency bottlenecks are:
+Blocking I/O (curl/HTTP fetch)
+
+The Low-Latency Architecture
+Instead of reading, parsing, and filtering your 700 stock symbols on a single thread, split your application into a dedicated, ultra-fast Ingestion Thread (Producer) and a Worker Pool (Consumers) connected by a high-performance, in-memory queue.
+
+
+✅ Correct architecture (high-performance pattern)
+1. The Ingestion Thread (The Producer)
+This thread has exactly one job: read raw bytes off the WebSocket as fast as humanly possible and push them onto an in-memory queue.
+-Zero Processing: Do not decode JSON. Do not stringify bytes. Do not parse headers.
+-Zero Blockers: It must never perform disk I/O, database writes, or complex text filtering.
+-If this thread blocks for even a few milliseconds, the OS TCP receive buffer fills up, creating backpressure, causing network latency, or forcing the server to drop your connection.
+-Single-threaded WS → lock-free queue
+-Keep WS ingestion as fast and dumb as possible:
+async def on_message(msg):
+    if msg["symbol"] in universe:
+        queue.put_nowait(msg)
+No parsing beyond what's needed
+No HTTP calls here
+No heavy logic
+This should take microseconds
+👉 This ensures you never fall behind the stream
+
+2. The Backpressure Buffer (The Queue)
+The queue acts as a shock absorber between your network read and your processing threads.
+-Use a lock-free or highly optimized concurrent queue (e.g., Go channels, Java’s LMAX Disruptor or LinkedTransferQueue, C++’s moodycamel::ConcurrentQueue, or Python’s multiprocessing.Queue).
+
+
+3. The Worker Pool (parallelism here for PR article fetch, logging, connection, and so on) 
+Spin up a pool of worker threads (usually matching the number of physical CPU cores) to pull the raw data payloads off the queue. These threads handle the heavy lifting:
+Parsing the incoming message payload.
+Filtering for your 700 target stock symbols.
+Forwarding matching data to your down-stream execution or storage engine.
+Use asyncio + aiohttp:
+import asyncio
+import aiohttp
+
+queue = asyncio.Queue()
+
+async def worker(session):
+    while True:
+        msg = await queue.get()
+        url = msg["url"]
+
+        async with session.get(url) as resp:
+            article = await resp.text()
+
+        process(article)
+        queue.task_done()
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        workers = [asyncio.create_task(worker(session)) for _ in range(50)]
+        await asyncio.gather(*workers)
+👉 This is usually the best solution for your case.
+
+
+Optimizing the 700-Symbol Filter
+Because RTPR.io streams live press releases and news wires, matching text against a universe of 700 stocks can become a CPU bottleneck if done inefficiently.
+Do not loop through an array of 700 symbols for every incoming message. This creates an $O(M \times N)$ time complexity bottleneck that will quickly choke your worker threads during heavy market hours.
+Since RTPR.io explicitly passes a clean list of tickers in the JSON metadata (e.g., {"tickers": ["AAPL", "MSFT"]}), load your 700 target symbols into a Hash Set during application initialization. Checking a hash set is an $O(1)$ amortized operation.
+
+
+⚡ Critical optimizations (this matters more than threading)
+1. Batch bursts
+Instead of reacting instantly:
+batch = []
+while len(batch) < 20:
+    batch.append(await queue.get())
+Then fetch in parallel.
+
+2. Connection reuse (HUGE latency win)
+Never use raw curl per request.
+Use:
+aiohttp.ClientSession() (keeps TCP alive)
+or requests.Session()
+This alone can cut latency by 5–10x
+
+3. Limit concurrency (avoid self-DDOS)
+If you spawn too many workers:
+semaphore = asyncio.Semaphore(100)
+
+async with semaphore:
+    await fetch()
+
+4. Language-Specific Implementation Tips
+Python: Avoid standard threading due to the Global Interpreter Lock (GIL), which prevents true parallel CPU execution. Use asyncio for the single Ingestion Thread, and offload payloads via a multiprocessing.Queue to a pool of separate OS processes (ProcessPoolExecutor) for the actual parsing and filtering.

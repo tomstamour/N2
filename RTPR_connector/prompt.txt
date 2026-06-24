@@ -1,0 +1,38 @@
+I want you to create a script named "RTPR_connector.py" that will connect to the RTPR.io Web Socket (WS) and receive the Fire Hose stream of payloads provided by RTPR.io. I created a documentation files here @./doc/rtpr_WebSocket_documentation.txt with relevant information about the use of the RTPR WS. The script will have to perform multithreading on all relevant steps to avoid the "curl"/fetch latency of the PR. This is a huge concern, if the curl process is not properly multithreaded, the curl latency will increase drasticaly. We want to stay in the millisecond time length for all the processes. The latency issue happens when many PR arrive in "burst", i.e. several (up to 10-15) PRs arrives in the same ~1 second time window. The main challenge is to perform the fetch/curl process of several articles at the same time using proper threading so that every fetch process is running on a unique thread. I created a file here @doc/threading_and_speed_recommendations.txt with the threading architecture I want you to perform.
+
+For the WebSocket connectivity, I created a file here @doc/connection_management_recommendations.txt with the connection architecture I want you to perform.
+
+The script will take as input a universe file of the format @../N2/scripts/universe_finder/data/stocks_universe_2026-06-21.tsv
+From this universe file, only the "Symbol" column will be loaded and for only these symbols we will perform the curl of the whole PR/article. Load the symbols list once at start and keep it in the cache for fast reading/use of the symbols list. 
+
+This script will not write any file to the disk to avoid speed issues, work with the cache. Only the log file can be written to disk, wake sure it wont interfere with speed processing of ingestion and fetch of the PRs.
+
+The script RTPR_connector.py will produce a dataframe named "PR_dataframe" with one column per payload item from the RTPR WS fetch. The columns order will be as follow:
+
+Symbol|Tickers|ID|ArrivalDate|Created|ArrivalTime|CurlTime|Headline|Body|
+
+Where "ArrivalDate" and Created fields are derived from the item "article_published_at" from the payload. 
+The "ArrivalTime" is the time at which the innitial payload from the WS was received by the RTPR_WebSocket_connector.py script.
+The "CurlTime" is the time at which the RTPR_connector.py completed the fetch process of the PR/article.
+
+All time fields of the table will be converted to UTC-4 time zone with 3 digits for seconds (millisecond level). 
+Here is an example of the dataframe content:
+Symbol | Tickers            | ID         | ArrivalDate | Created      | ArrivalTime  | CurlTime     | Headline  | Body |
+MOGU   | "[""MOGU""]"       | nBw481tnja | 2026-06-22  | 06:34:00.256 | 06:34:01.011 | 06:34:01.260 | MOGU Announces Unaudited Financial Results for the Six Months Ended March 31, 2026 and Fiscal Year 2026 | Text example of ~200 words |
+
+If there are more then one tickers in the "Tickers" field of the payload, just create one row in the PR_dataframe, dont make it two rows.
+
+I created a file here : @doc/efficient_dataframe-ingestion.txt with the architecture I want you to perform for the PR_dataframe creation.
+
+The script RTPR_connector.py will flush the data from the memory every 24 hrs at 20:35UTC-4 and write the data to disk in the directory ./tables
+
+The logs will be written here: ./logs
+
+Here is my RTPR.io API key : @./RTPR_API-Key.txt
+
+Treat this as a completely isolated task.
+Do not rely on any previous conversation, stored memory, or external context.
+Only use the information explicitly provided in this prompt.
+I dont want you to get content or access to any other information outside of this directory to avoid recreate past mistakes.
+
+Use the AskUserQuestion tool to deeply and thouroughly understand my needs, then make a plan for the RTPR_connector.py script production.

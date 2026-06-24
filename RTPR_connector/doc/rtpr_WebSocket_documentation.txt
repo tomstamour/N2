@@ -1,0 +1,144 @@
+Here is the documentation for the WebSocket for RTPR.io at page: https://rtpr.io/docs
+
+RTPR:
+Alerts WebSocket Reference
+The alerts WebSocket is for programmatic use — your trading bot, your own dashboard, a notification bridge. It's available on the Pro plan; the API key and connection snippet for your account live in the Connect tab.
+
+Endpoint
+wss://ws.rtpr.io/ws-alerts?apiKey=YOUR_API_KEY
+Authentication
+Pass your API key as a query string parameter. The server closes the connection with code 4001 if the key is invalid, or 4004 if your subscription is no longer active. Treat any close as a cue to re-authenticate (refresh the key from the Connect tab) and reconnect with backoff.
+
+Payload
+When one of your rules matches an article, the gateway emits a single coalesced frame for that customer + article pair, even if several rules fired. Programmatic clients route on rule_name.
+
+{
+  "type": "alert",
+  "ticker": "AAPL",
+  "rules": [
+    { "rule_name": "Apple guidance" },
+    { "rule_name": "Big tech FOMC" }
+  ],
+  "article_published_at": "2026-04-29T18:30:00Z",
+  "article_url": "https://rtpr.io/a/lseg_n123?exp=1777497120&sig=ab12..."
+}
+The frame is intentionally minimal: it tells you which ticker, which rules, and where to read the article. Use article_url exactly as sent.
+
+Signed permalink URL (hot window)
+Alerts include a signed permalink in article_url with exp and sig query parameters. This token is short-lived (hot window, currently 2 minutes after publish) and speeds first-access fetching.
+
+Single URL contract: clients should always request the same article_url they received. During the hot window the signature can authorize access directly; after expiry the same URL continues to work when the request includes your API key (or an authenticated dashboard session).
+
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://rtpr.io/a/lseg_n123?exp=1777497120&sig=ab12..."
+
+# same URL after expiry -> falls back to key/session auth
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://rtpr.io/a/lseg_n123?exp=1777497120&sig=ab12..."
+Best practice for newer builders: keep your HTTP connection warm (HTTP keep-alive). In plain English: reuse one request session/client instead of opening a brand-new HTTPS connection for every article. During bursts, this is often one of the biggest reasons fetches stay fast.
+
+Heartbeat
+The server sends a JSON {"type":"ping"} every 30 seconds. Reply with {"type":"pong"}. If the server doesn't see your pong within 90 seconds it will close the connection.
+
+Minimal Python client
+# pip install websockets
+import asyncio, json, websockets
+
+URL = "wss://ws.rtpr.io/ws-alerts?apiKey=YOUR_API_KEY"
+
+async def run():
+    async with websockets.connect(URL) as ws:
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg.get("type") == "alert":
+                names = [r["rule_name"] for r in msg["rules"]]
+                print(f"{msg['ticker']} matched: {', '.join(names)}")
+                print(f"  -> {msg['article_url']}")
+            elif msg.get("type") == "ping":
+                await ws.send(json.dumps({"type": "pong"}))
+
+asyncio.run(run())
+Minimal Node.js client
+// npm install ws
+const WebSocket = require('ws');
+
+const ws = new WebSocket(
+  'wss://ws.rtpr.io/ws-alerts?apiKey=YOUR_API_KEY'
+);
+
+ws.on('message', (raw) => {
+  const msg = JSON.parse(raw);
+  if (msg.type === 'alert') {
+    const names = msg.rules.map((r) => r.rule_name).join(', ');
+    console.log(`${msg.ticker} matched: ${names}`);
+    console.log(`  -> ${msg.article_url}`);
+  } else if (msg.type === 'ping') {
+    ws.send(JSON.stringify({ type: 'pong' }));
+  }
+});
+
+ws.on('close', (code) => {
+  console.log('Closed', code, '— reconnect with backoff');
+});
+Backoff. If the connection drops, reconnect with exponential backoff starting at ~2 seconds, capped at one minute. If you see a string of failures (auth issues, gateway down), switch to a slow 5-minute poll until the next success — this keeps you off the rate limiter.
+
+
+
+
+
+
+
+
+
+
+######################## 
+# Here is another exemple for the WebSocket use on the RTPR.io page: https://rtpr.io/wire/developer
+
+
+RTPR:
+How it fits together
+1.
+Create a rule on the Rules page so RTPR knows which releases you care about.
+2.
+Connect to the alerts WebSocket with your API key (Python tab). Every time a rule fires you get one frame with the ticker, the rules that matched, and an article_url.
+3.
+Fetch the article_url exactly as sent in the alert to pull the full article data. It carries a short-lived signed token (the exp/sig params) that gets you the article fastest — see the Protocol reference tab for the curl example and how the signed token works.
+
+Python
+websockets
+
+Protocol reference
+
+REST feed API
+HTTP
+Click to switch
+Connects, prints alerts, auto-reconnects. Production-ready shape.
+import asyncio, json, websockets
+
+API_KEY = "rtpr_UQKaMpWKEzE4tFQKdDd3eav5PyrvUwkX"
+WS_URL = "wss://ws.rtpr.io/ws-alerts?apiKey={API_KEY}"
+
+async def main():
+    # auto-reconnect loop — restarts on any disconnect
+    async for ws in websockets.connect(WS_URL, ping_interval=None):
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+
+                # REQUIRED: respond to server heartbeats or you will be
+                # disconnected with code 4002 after ~90 seconds of silence.
+                if msg.get("type") == "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                    continue
+
+                if msg.get("type") != "alert":
+                    continue  # skip connected/subscribed acks etc.
+
+                ticker = msg["ticker"]
+                rules  = ", ".join(r["rule_name"] for r in msg["rules"])
+                print(f"{ticker}: {rules} -> {msg['article_url']}")
+
+        except websockets.ConnectionClosed:
+            continue  # reconnect
+
+asyncio.run(main())

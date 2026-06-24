@@ -1,0 +1,115 @@
+Efficient In-Memory DataFrame Ingestion (Thread-Safe)
+Core Principle
+👉 Only ONE component writes to the DataFrame
+All workers produce results, but a single writer aggregates them.
+Architecture
+[ Workers (N) ]
+    ↓
+(result queue)
+    ↓
+[ DataFrame Writer (1) ]
+    ↓
+[ In-memory DataFrame ]
+1. Workers Push Results (No DataFrame Access)
+Workers return structured dicts:
+result = {
+    "timestamp": msg["ts"],
+    "symbol": msg["symbol"],
+    "headline": msg["headline"],
+    "url": msg["url"],
+    "body": article_text
+}
+
+result_queue.put_nowait(result)
+👉 Workers NEVER touch the DataFrame.
+2. Single Writer Task (Critical)
+This is the only place where the DataFrame is modified:
+import pandas as pd
+import asyncio
+
+df = pd.DataFrame()
+buffer = []
+
+async def dataframe_writer():
+    global df
+
+    while True:
+        item = await result_queue.get()
+        buffer.append(item)
+
+        # Batch writes (important)
+        if len(buffer) >= 100:
+            df = pd.concat([df, pd.DataFrame(buffer)], ignore_index=True)
+            buffer.clear()
+
+        result_queue.task_done()
+3. Why Batching Matters
+Bad (slow):
+df = df.append(row)
+Good (fast):
+pd.concat([...])
+👉 You reduce:
+memory reallocations
+GIL pressure
+object fragmentation
+4. Should You Store the Article Body (~2000 words)?
+Short answer: yes, but be intentional
+Trade-offs:
+✅ Pros
+Full data available for NLP / backtesting
+No need to re-fetch
+Simpler pipeline
+❌ Cons
+Memory usage grows fast
+Rough Memory Estimate
+Assume:
+2000 words ≈ 10–15 KB text
+10,000 PRs/day → ~100–150 MB
+👉 Totally fine in RAM for modern systems.
+Even:
+50k PRs/day → ~500–750 MB (still manageable)
+Optimization Option (Recommended)
+Split structure:
+{
+    "symbol": ...,
+    "headline": ...,
+    "url": ...,
+    "body": article_text,   # optional or compressed
+}
+OR:
+Store summary + metadata in DataFrame
+Store full text in:
+dict cache (id -> text)
+or compressed (zlib)
+5. Even Better: Store Body Compressed
+import zlib
+
+compressed = zlib.compress(article_text.encode())
+👉 Cuts memory by ~70–80%
+6. Daily Reset Strategy
+Instead of mutating the same DataFrame:
+if now - start_time > 24h:
+    df = pd.DataFrame()
+Better:
+Swap reference atomically:
+old_df = df
+df = pd.DataFrame()
+👉 avoids blocking
+7. Advanced (If You Scale Further)
+If volume increases:
+Use PyArrow Table instead of pandas (faster append)
+Or Polars (better concurrency model)
+8. Key Anti-Patterns to Avoid
+❌ Multiple threads writing to DataFrame
+❌ df.append() in loop
+❌ Locking DataFrame with mutex (kills performance)
+❌ Writing per message (no batching)
+Final Design
+WebSocket → Queue → Workers → Result Queue → DataFrame Writer → In-memory DF
+Key Insight
+👉 Treat your DataFrame like a database with a single writer
+Everything else:
+parallel
+fast
+stateless
+This is what keeps latency low AND throughput high.

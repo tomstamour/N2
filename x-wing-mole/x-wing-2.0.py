@@ -89,7 +89,7 @@ _CFG = n2_config.load_config()
 # Per-user values (ACCOUNT, host, port) come from the central config above; the
 # rest are edited here. Standalone --flags fall back to these same values.
 # --------------------------------------------------------------------------- #
-CAPITAL                       = 5.00            # dollar budget per trade
+CAPITAL                       = 1.00            # dollar budget per trade
 ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
 INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v4-smoothed-yield_vs-stopLimits.tsv")
 LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
