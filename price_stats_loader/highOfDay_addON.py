@@ -1,5 +1,6 @@
 from ib_insync import IB, Stock
 import pandas as pd
+import pandas_market_calendars as mcal
 import argparse
 import logging
 import os
@@ -25,7 +26,25 @@ US_EXCHANGES = {
     'NASDAQ', 'NYSE', 'NYSE AMERICAN', 'NYSE ARCA', 'NYSE MKT', 'AMEX', 'CBOE',
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def setup_logging(log_path: str | None = None) -> None:
+    """Configure logging to stderr and, optionally, to a file.
+
+    When log_path is given, log records are also appended to that file. Parent
+    directories are created if needed.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_path:
+        log_dir = os.path.dirname(os.path.abspath(log_path))
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True,
+    )
 
 
 def is_us_exchange(exchange_val) -> bool:
@@ -33,17 +52,42 @@ def is_us_exchange(exchange_val) -> bool:
     return str(exchange_val).strip().upper() in {e.upper() for e in US_EXCHANGES}
 
 
-def get_target_date(arrival_time_str: str) -> date:
-    """Return the next trading session date after the given UTC arrival time."""
-    dt = datetime.fromisoformat(arrival_time_str).replace(tzinfo=timezone.utc)
-    if dt.hour < MARKET_CLOSE_ET_HOUR:
-        target = dt.date()
-    else:
-        target = (dt + timedelta(days=1)).date()
-    # Advance past weekends
-    while target.weekday() >= 5:
-        target += timedelta(days=1)
-    return target
+# US equity trading calendar (NYSE/Nasdaq). Used to skip weekends AND holidays
+# (e.g. Memorial Day) so target dates always land on a real trading session.
+_XNYS = mcal.get_calendar('XNYS')
+
+
+def is_trading_day(d: date) -> bool:
+    """Return True if d is a US equity trading session (not weekend/holiday)."""
+    return len(_XNYS.valid_days(start_date=d, end_date=d)) > 0
+
+
+def next_trading_day(d: date) -> date:
+    """Return the first US trading session strictly after d."""
+    sched = _XNYS.valid_days(start_date=d + timedelta(days=1),
+                             end_date=d + timedelta(days=10))
+    return sched[0].date()
+
+
+def get_target_date(arrival_time_str: str, arrival_date_str: str = "") -> date:
+    """Return the trading session date to fetch for the given UTC arrival time.
+
+    Before market close on a trading day -> that same day. Otherwise (after
+    close, or arrival landing on a weekend/holiday) -> the next trading session.
+
+    ArrivalTime may be a full ISO datetime ('2026-06-12 11:00:04.751') or, in
+    newer inputs, time-only ('12:00:13.918'). In the time-only case the date is
+    taken from arrival_date_str (the row's ArrivalDate column).
+    """
+    s = arrival_time_str.strip()
+    # Time-only values (no leading 'YYYY-' date part): prepend ArrivalDate.
+    if not s[:5].count('-') and arrival_date_str:
+        s = f"{arrival_date_str.strip()} {s}"
+    dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    arrival_date = dt.date()
+    if dt.hour < MARKET_CLOSE_ET_HOUR and is_trading_day(arrival_date):
+        return arrival_date
+    return next_trading_day(arrival_date)
 
 
 def ensure_connected(ib: IB) -> bool:
@@ -76,18 +120,24 @@ def ensure_connected(ib: IB) -> bool:
 def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
     """
     Fetch the daily high for target_dt and the close of the prior trading day.
-    Returns (daily_high, prev_close) or (None, None) on failure.
+
+    Returns (daily_high, prev_close, status) where status is one of:
+      'ok'      - data fetched successfully
+      'failure' - genuine empty/errored response (HMDS/connectivity signal);
+                  counts toward the consecutive-failure abort
+      'skip'    - contract not found or target date is not a trading session;
+                  a per-symbol/data condition that must NOT trip the abort
     """
     contract = Stock(symbol, 'SMART', 'USD')
     try:
         qualified = ib.qualifyContracts(contract)
         if not qualified:
             logging.warning(f"{symbol}: could not qualify contract, skipping.")
-            return None, None
+            return None, None, 'skip'
         contract = qualified[0]
     except Exception as e:
         logging.warning(f"{symbol}: qualification error — {e}")
-        return None, None
+        return None, None, 'skip'
 
     # End at midnight UTC of the day after target_dt so the target bar is included
     end_dt_str = (
@@ -99,7 +149,7 @@ def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
     for attempt in range(1, FETCH_RETRIES + 1):
         if not ensure_connected(ib):
             logging.warning(f"{symbol}: not connected, cannot fetch.")
-            return None, None
+            return None, None, 'failure'
         try:
             bars = ib.reqHistoricalData(
                 contract,
@@ -125,7 +175,7 @@ def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
 
     if not bars:
         logging.warning(f"{symbol}: no bars returned for {target_dt} after {FETCH_RETRIES} attempts.")
-        return None, None
+        return None, None, 'failure'
 
     target_bar = None
     prev_bar = None
@@ -137,13 +187,15 @@ def fetch_hod_and_prev_close(ib: IB, symbol: str, target_dt: date):
             break
 
     if target_bar is None:
+        # Bars came back but the target day isn't among them: a non-trading
+        # session (holiday/half-day gap), not an HMDS outage — skip, don't abort.
         logging.warning(f"{symbol}: no bar found for target date {target_dt} (bars cover {[b.date for b in bars]}).")
-        return None, None
+        return None, None, 'skip'
 
     daily_high = round(target_bar.high, 2)
     prev_close = round(prev_bar.close, 2) if prev_bar is not None else None
 
-    return daily_high, prev_close
+    return daily_high, prev_close, 'ok'
 
 
 def main():
@@ -172,7 +224,18 @@ def main():
         default=None,
         help='Directory where the enriched TSV will be written. Defaults to the input file\'s directory.',
     )
+    parser.add_argument(
+        '--log', '-l',
+        metavar='FILE',
+        dest='log_file',
+        default=None,
+        help='Path to a log file. Log output is written here (appended) in addition to the console.',
+    )
     args = parser.parse_args()
+
+    setup_logging(args.log_file)
+    if args.log_file:
+        logging.info(f"Logging to {os.path.abspath(args.log_file)}")
 
     df = pd.read_csv(args.input_file, sep='\t')
     df['DailyHigh($)'] = None
@@ -203,6 +266,7 @@ def main():
         for idx, row in df.iterrows():
             symbol = str(row['Symbol']).strip()
             arrival_str = str(row['ArrivalTime']).strip()
+            arrival_date_str = str(row.get('ArrivalDate', '')).strip()
             exchange = str(row.get('Exchange', '')).strip()
 
             if exchange and not is_us_exchange(exchange):
@@ -213,7 +277,7 @@ def main():
                 logging.info(f"{symbol}: Exchange value missing, attempting SMART/USD.")
 
             try:
-                target_dt = get_target_date(arrival_str)
+                target_dt = get_target_date(arrival_str, arrival_date_str)
             except Exception as e:
                 logging.warning(f"Row {idx} ({symbol}): could not parse ArrivalTime '{arrival_str}' — {e}")
                 continue
@@ -221,11 +285,13 @@ def main():
             cache_key = (symbol, target_dt)
             if cache_key not in cache:
                 logging.info(f"Fetching HOD for {symbol} on {target_dt}...")
-                high, prev_close = fetch_hod_and_prev_close(ib, symbol, target_dt)
+                high, prev_close, status = fetch_hod_and_prev_close(ib, symbol, target_dt)
                 cache[cache_key] = (high, prev_close)
 
-                # Track consecutive US-symbol fetch failures to detect an HMDS outage.
-                if high is None:
+                # Track consecutive genuine fetch failures to detect an HMDS outage.
+                # 'skip' (unqualifiable contract / non-trading target date) is a
+                # per-symbol data condition and must not trip the abort.
+                if status == 'failure':
                     consecutive_failures += 1
                     if consecutive_failures >= CONSECUTIVE_FAILURE_ABORT:
                         logging.error(
@@ -234,7 +300,7 @@ def main():
                             f"Last attempted: {symbol} on {target_dt} (row {idx})."
                         )
                         break
-                else:
+                elif status == 'ok':
                     consecutive_failures = 0
 
                 ib.sleep(PACING_SLEEP_SECONDS)

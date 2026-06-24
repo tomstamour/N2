@@ -1,0 +1,117 @@
+================================================================================
+Inputs Orchestrator4.0.py receives from NewsWatcher4.2.py
+================================================================================
+
+Orchestrator4.0.py imports NewsWatcher4.2.py (../newswatcher3/) as a module,
+registers three callbacks BEFORE nw.start() (Orchestrator4.0.py:974-976), then
+receives all news data by those callbacks being invoked from NW4's background /
+asyncio threads. There is also one PULL channel where the orchestrator reaches
+back into NW4's object store.
+
+All data flows over 3 PUSH callbacks + 1 PULL call. Nothing is returned from
+nw.start(); the firehose drives everything through the registered callbacks.
+
+
+--------------------------------------------------------------------------------
+CHANNEL 1 - Accepted-article callback  (the main payload)
+--------------------------------------------------------------------------------
+Registered : nw.register_callback(on_news_accepted)        Orchestrator4.0.py:974
+Invoked by : NW4.2 single-worker _callback_executor        NewsWatcher4.2.py:1736
+Consumer   : on_news_accepted(news_dict)                   Orchestrator4.0.py:840
+
+Payload - normal accepted article (_handle_article, NewsWatcher4.2.py:1722):
+
+    {
+      'Symbol':       symbol_str,        # str, comma-joined FULL ticker list, "ABC,DEF"
+      'ID':           news_id,           # str, RTPR article id
+      'ArrivalTime':  arrival,           # datetime - stamped at WS RECEIPT (recv_ts),
+                                         #            NOT curl completion
+      'Headline':     title,             # str, article title
+      'article_body': data['article_body'] or '',   # str, scraped body text
+      'exchange':     article_exchange,  # str, uppercased exchange code
+      'prearmed':     [prearmed] or [],  # list[str], tickers already armed pre-fetch
+      'art_id':       art_id,            # str, URL-slug id - key the clerk arm was
+                                         #      stashed under
+    }
+
+Payload - synthetic "FAILED curl" (fetch failure, _handle_alert, NewsWatcher4.2.py:1600):
+    Same keys, but:
+      Symbol       = single primary ticker (NOT comma-joined)
+      Headline     = 'FAILED curl'  (sentinel; orchestrator's excluded-strings path
+                                      uses it to release the warm clerk client)
+      article_body = ''  ,  exchange = ''
+
+What the orchestrator reads out of news_dict:
+    Symbol       -> split into per-ticker list (fan-out)
+    ID           -> row id / _lookup_author / _lookup_created key
+    ArrivalTime  -> ArrivalDate + ArrivalTime TSV columns
+    Headline     -> FinBERT headline + excluded-string check
+    article_body -> noCoref body pipeline (_run_body_pipeline)
+    exchange     -> Exchange TSV column
+    prearmed     -> which tickers already have an in-flight arm future (reuse, not re-arm)
+    art_id       -> key to pop the stashed arm future from _arm_results
+
+    NOTE: CurlTime is NOT from NW4. The orchestrator sets it itself with
+          datetime.now() at the top of on_news_accepted (Orchestrator4.0.py:858).
+
+
+--------------------------------------------------------------------------------
+CHANNEL 2 - Alert callback  (pre-fetch arm, latency fix)
+--------------------------------------------------------------------------------
+Registered : nw.register_alert_callback(_on_alert)         Orchestrator4.0.py:975
+Invoked by : NW4.2 _emit_alert_arm, the instant the alert's primary ticker passes
+             the cheap pre-filter, BEFORE the body curl       NewsWatcher4.2.py:1568
+Consumer   : _on_alert(ticker, art_id, recv_ts=None)       Orchestrator4.0.py:453
+
+Inputs (positional):
+    ticker  : str       - the alert's single primary ticker
+    art_id  : str       - URL-slug article id
+    recv_ts : datetime  - when the WS frame arrived
+
+Effect: submits _arm_clerk(ticker) and stashes the future under (art_id, ticker).
+
+
+--------------------------------------------------------------------------------
+CHANNEL 3 - Alert-release callback
+--------------------------------------------------------------------------------
+Registered : nw.register_alert_release_callback(_on_alert_release)
+                                                           Orchestrator4.0.py:976
+Invoked by : NW4.2 _emit_alert_release, when a pre-armed article is dropped before
+             acceptance (dedup hit, full-filter block, or normalize failure)
+Consumer   : _on_alert_release(ticker, art_id)            Orchestrator4.0.py:475
+
+Inputs (positional):
+    ticker : str
+    art_id : str
+
+Effect: releases the warm clerk client (BAD sentiment) via _release_armed.
+
+
+--------------------------------------------------------------------------------
+CHANNEL 4 - Pull: nw.get_news_object(f"id-{news_id}")
+--------------------------------------------------------------------------------
+Not a callback - the orchestrator reaches back into NW4's in-memory _news_objects
+store to read fields that are NOT in the callback payload:
+
+    _lookup_author(news_id)   -> obj['author']    Orchestrator4.0.py:590
+    _lookup_created(news_id)  -> obj['created']   Orchestrator4.0.py:599
+
+Returns None if the object was already pruned by NW4's periodic flush; both
+lookups degrade gracefully (empty cell).
+
+
+--------------------------------------------------------------------------------
+REVERSE DIRECTION (for completeness - config Orchestrator sends INTO NW4)
+--------------------------------------------------------------------------------
+nw.start(...) at Orchestrator4.0.py:978 passes universe/blacklist/api-keys/dirs/
+float+price thresholds/flush interval. This is OUTPUT from the orchestrator, not
+input it receives, so it is out of scope for the question but noted for context.
+
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+  - One rich dict per accepted article (8 keys)        -> on_news_accepted
+  - Two lightweight alert tuples (arm / release)        -> _on_alert / _on_alert_release
+  - One on-demand pull for author + created             -> nw.get_news_object
+  - Config flows the OTHER way via nw.start(...)

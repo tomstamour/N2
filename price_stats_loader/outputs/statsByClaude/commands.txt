@@ -1,0 +1,9 @@
+python3 correlate_dailyhigh.py --input ../PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv --columns positive negative neutral sentiment_score nocoref_neutral_filter nocoref_confidence_weighted nocoref_net_score nocoref_top_k nocoref_positional Headline-RBscore --output ./PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored_correlations.tsv
+
+##### Will output a matrix of "True positive"/"False positive" for different thresold of the sentiment score metrics.  
+python3 false_positive_count.py \
+--input ../PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv \
+--columns-name positive sentiment_score nocoref_neutral_filter nocoref_confidence_weighted nocoref_net_score nocoref_top_k nocoref_positional Headline-RBscore \
+--true-positive-threshold 30
+
+
