@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import socket
-import asyncio
+import time
 import importlib.util as _ilu
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
@@ -44,13 +44,13 @@ from FinBERT_body_noCoref import FinBERTBodyPipeline
 from finBERT_neutral_management_addON import aggregate as _nocoref_aggregate
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── RTPR_connector3 import (the news source) ──────────────────────────────────
-# Orchestrator5.0 drives RTPR_connector3's asyncio loop IN-PROCESS and taps each
-# firehose article via the connector's latency-neutral set_row_hook (default None
-# so a standalone connector run is unaffected). The firehose pushes the FULL
-# article inline — no curl phase — so 4.2's alert/pre-arm/release split collapses
-# into a single reception hook. Executing the module only defines its
-# functions/Config/helpers — main() is __main__-guarded.
+# ── RTPR_connector3 import (shared helpers ONLY — the connector is NOT run) ───
+# RTPR_connector3 runs as its OWN standalone process and publishes every
+# accepted firehose article on a local TCP feed; _run_feed_client below is the
+# subscriber. This import never starts anything (main() is __main__-guarded) —
+# it only borrows the connector's helpers so both processes agree byte-for-byte
+# on clock and formatting: FIXED_TZ, now_fixed, format_millis_time/date,
+# clean_inline_text, DailyFixedTZFileHandler/FixedTZFormatter.
 _c3_spec = _ilu.spec_from_file_location(
     "RTPR_connector3",
     str(SCRIPTS_DIR / "RTPR_connector3" / "RTPR_connector3.py"),
@@ -99,16 +99,22 @@ TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "n
 DEFAULT_BASELINE_ITI = 44444.0   # fallback ITI (s) when symbol absent/NaN in universe
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── RTPR_connector3 (news source) knobs ───────────────────────────────────────
-# The connector config is built via its own parse_args (see main()) so all its
-# CLI defaults apply unchanged (writer batch 200 / idle flush 0.5s, 20:35 daily
-# flush, 03:50 universe reload + WS re-subscribe, firehose URL, universe-list
-# subscribe, dedup on); only the CWD-relative paths are overridden here. The
-# connector's own logs/tables keep living in RTPR_connector3/ — do NOT also run
-# the standalone connector, or two firehose connections write the same files.
-C3_API_KEY_FILE = str(SCRIPTS_DIR / 'RTPR_connector3' / 'RTPR_API-Key.txt')
-C3_LOG_DIR      = str(SCRIPTS_DIR / 'RTPR_connector3' / 'logs')
-C3_TABLE_DIR    = str(SCRIPTS_DIR / 'RTPR_connector3' / 'tables')
+# ── RTPR_connector3 feed (the news source) ────────────────────────────────────
+# The STANDALONE connector publishes every accepted firehose article as one
+# JSON line on its loopback TCP feed —
+#   {"type":"article","arrival_ms":…,"data":{raw payload},"row":{connector row}}
+# plus a 5s heartbeat. Start it separately (either order works — we retry until
+# the feed is up):
+#   cd RTPR_connector3 && /home/tom/venv/bin/python RTPR_connector3.py --flush-on-shutdown
+# Articles published while this process is down are dropped by design (no
+# replay on reconnect) — the connector's own PR_dataframe table still records
+# them. Run only ONE Orchestrator5 instance (a second would double-arm the
+# clerk); extra read-only watchers like `nc 127.0.0.1 8900` are fine.
+FEED_HOST                = n2_config.get(_CFG, 'FEED_HOST', '127.0.0.1')
+FEED_PORT                = n2_config.get_int(_CFG, 'FEED_PORT', 8900)
+FEED_CONNECT_TIMEOUT_SEC = 5     # per-attempt TCP connect timeout
+FEED_RETRY_SEC           = 3     # reconnect cadence while the connector is down
+FEED_SILENCE_TIMEOUT_SEC = 20    # connector heartbeats every 5s → 20s silence = dead peer
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Worker pools (parallelism knobs) ──────────────────────────────────────────
@@ -624,10 +630,11 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
     is_ok = evaluate_sentiment(finbert_val)
 
     # 2) Build the headline portion of the row. Created/Arrival*/OrchTime/Author/
-    #    Exchange are pass-throughs from the firehose reception (all stamped on the
-    #    connector's fixed UTC-4 clock). The Body CELL is flattened to one line here
-    #    so the TSV stays one-row-per-line; the body pipeline consumed the pristine
-    #    multiline text via news_dict['article_body'].
+    #    Exchange are pass-throughs from the reception (all stamped on the
+    #    connector's fixed UTC-4 clock). The Body CELL stores the RAW payload as
+    #    RTPR sent it (HTML tags/entities kept, if any) with only whitespace runs
+    #    collapsed so the TSV stays one-row-per-line; the body pipeline consumed
+    #    the CLEANED multiline text via news_dict['article_body'].
     completed_dict = {
         'Symbol':             symbol,
         'Tickers':            json.dumps(tickers),
@@ -637,7 +644,7 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         'ArrivalTime':        news_dict.get('ArrivalTime', ''),
         'OrchTime':           news_dict.get('OrchTime', ''),
         'Headline':           news_dict['Headline'],
-        'Body':               c3.clean_inline_text(news_dict.get('article_body') or ''),
+        'Body':               c3.clean_inline_text(news_dict.get('body_raw') or ''),
         'Author':             news_dict.get('Author', ''),
         'Float':              _lookup_float(symbol),
         'MktCap':             _lookup_mktcap(symbol),
@@ -746,29 +753,32 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
     print(f"{'='*60}\n")
 
 
-# ─── Firehose reception tap — invoked by RTPR_connector3's row hook ───────────
+# ─── Article reception — fed by the standalone connector's TCP feed ───────────
 
 def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
-    """RTPR_connector3 row hook. Fires on the WS loop thread the instant an
-    in-universe firehose article arrives — the full article comes inline, so 4.2's
-    alert/pre-arm/release split collapses into this single reception event: dedup,
-    the two kept NW4 input filters (ticker count ≤ 2, NW4-level excluded strings →
-    drop), then arm every in-universe ticker and fan out per ticker.
+    """Article reception handler, called by _run_feed_client for every article
+    line the standalone connector publishes (`data` = raw firehose payload,
+    `row` = connector-built row, arrival_dt = when the connector received the
+    firehose frame). The full article arrives inline, so 4.2's
+    alert/pre-arm/release split stays collapsed into this single reception
+    event: dedup, the two kept NW4 input filters (ticker count ≤ 2, NW4-level
+    excluded strings → drop), then arm every in-universe ticker and fan out.
 
-    Runs on the connector loop thread → stays lean: only dict/string filters and
-    non-blocking executor submits; all heavy work goes to the thread pools. `row`
-    and `data` are shared with the connector (row is later batched into its own
-    PR_dataframe) and must never be mutated here."""
+    Runs on the feed-reader (main) thread → stays lean: only dict/string
+    filters and non-blocking executor submits; all heavy work goes to the
+    thread pools. `data` and `row` are this process's own JSON copies."""
     global _seen_day
-    # OrchTime = the moment this article lands in the orchestrator — stamped first,
-    # on the connector's fixed UTC-4 clock like every other time column.
+    # OrchTime = the moment this article lands in the orchestrator (includes the
+    # local TCP hop) — stamped first, on the connector's fixed UTC-4 clock like
+    # every other time column.
     orch_time = c3.format_millis_time(c3.now_fixed())
 
     art_id = (row.get('ID') or '').strip()
 
-    # Dedup. The connector's own dedup sits in its dataframe_writer AFTER this hook,
-    # and a WS reconnect can replay recent articles — so dedup here, keyed per
-    # arrival day (arrival_dt is UTC-4-aware). Loop-thread-only → no lock.
+    # Dedup. The feed broadcasts BEFORE the connector's own dedup, and a firehose
+    # reconnect on the connector side can replay recent articles — so dedup here,
+    # keyed per arrival day (arrival_dt is UTC-4-aware). Single reader thread →
+    # no lock.
     day = arrival_dt.date()
     if day != _seen_day:
         _seen_ids.clear()
@@ -819,7 +829,8 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
         'Symbol':       ','.join(tickers),
         'ID':           art_id,
         'Headline':     headline,
-        'article_body': row.get('Body') or '',   # pristine (newlines intact) for the body pipeline
+        'article_body': row.get('Body') or '',   # CLEANED (tags stripped, newlines intact) for the body pipeline
+        'body_raw':     str(data.get('article_body') or data.get('body') or ''),  # exactly as RTPR sent it → TSV Body cell
         'Author':       str(data.get('author') or ''),
         'Created':      row.get('Created') or '',
         # Date of ARRIVAL (4.2 semantic) — the connector row's ArrivalDate is the
@@ -869,6 +880,109 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
         )
 
 
+# ─── Feed client (subscribes to the standalone RTPR_connector3) ───────────────
+
+def _handle_feed_line(raw: bytes) -> None:
+    """Dispatch one JSON line from the feed. Never raises — a malformed line or
+    a handler bug must not kill the reception loop."""
+    try:
+        msg = json.loads(raw.decode('utf-8'))
+    except Exception as exc:
+        logger.warning(f"[Feed] bad JSON line ({exc}) — {len(raw)} bytes skipped")
+        return
+
+    mtype = msg.get('type')
+    if mtype == 'article':
+        data = msg.get('data')
+        row  = msg.get('row')
+        if not isinstance(data, dict) or not isinstance(row, dict):
+            logger.warning(f"[Feed] malformed article message — keys={sorted(msg)}")
+            return
+        # ArrivalTime semantics preserved across the hop: arrival_ms is the
+        # connector's firehose-frame stamp, not our read time.
+        arrival_ms = msg.get('arrival_ms')
+        arrival_dt = (datetime.fromtimestamp(arrival_ms / 1000.0, tz=c3.FIXED_TZ)
+                      if isinstance(arrival_ms, (int, float)) else c3.now_fixed())
+        try:
+            _on_row_built(data, row, arrival_dt)
+        except Exception:
+            logger.exception(f"[Feed] _on_row_built failed for id={row.get('ID') or '-'}")
+    elif mtype == 'hello':
+        logger.info(f"[Feed] server hello: service={msg.get('service')} "
+                    f"proto={msg.get('proto')} server_time={msg.get('server_time')}")
+        if msg.get('proto') != 1:
+            logger.warning(f"[Feed] unexpected feed protocol {msg.get('proto')!r} (expected 1)")
+    elif mtype != 'heartbeat':
+        logger.info(f"[Feed] ignoring message type={mtype!r}")
+
+
+def _log_feed_retry(attempts: int, exc=None) -> None:
+    """Throttled connect-retry logging: WARNING once, then ~1 line/min."""
+    if attempts == 1:
+        detail = f" ({exc})" if exc else ""
+        logger.warning(f"[Feed] connector feed unreachable at {FEED_HOST}:{FEED_PORT}{detail} "
+                       f"— retrying every {FEED_RETRY_SEC}s (is RTPR_connector3.py running?)")
+    elif attempts % 20 == 0:
+        logger.info(f"[Feed] still waiting for the connector feed (attempt {attempts})")
+
+
+def _run_feed_client() -> None:
+    """Blocking JSON-lines feed client — runs on the main thread until Ctrl+C.
+
+    Connects to the standalone connector's feed and hands every article message
+    to _on_row_built. Reconnects forever on any failure (connector down or
+    restarting); articles published while disconnected are DROPPED by design —
+    the connector's own PR_dataframe table still records them, and no replay
+    happens on reconnect. The connector heartbeats every 5s, so
+    FEED_SILENCE_TIMEOUT_SEC without a single byte means a dead/hung peer."""
+    attempts = 0
+    lost_at = None  # time.monotonic() of the last connection loss (for gap logging)
+    while True:
+        connected = False
+        try:
+            with socket.create_connection((FEED_HOST, FEED_PORT),
+                                          timeout=FEED_CONNECT_TIMEOUT_SEC) as sock:
+                sock.settimeout(FEED_SILENCE_TIMEOUT_SEC)
+                connected = True
+                attempts = 0
+                gap = f" gap={time.monotonic() - lost_at:.1f}s" if lost_at is not None else ""
+                logger.info(f"[Feed] FEED_CONNECTED {FEED_HOST}:{FEED_PORT}{gap}"
+                            + (" — PRs from the gap were dropped (see connector's table)"
+                               if lost_at is not None else ""))
+                buf = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        logger.warning("[Feed] FEED_DISCONNECTED reason=eof "
+                                       "(connector closed the feed)")
+                        break
+                    buf += chunk
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl < 0:
+                            break
+                        line, buf = buf[:nl], buf[nl + 1:]
+                        if line:
+                            _handle_feed_line(line)
+            lost_at = time.monotonic()
+        except socket.timeout as exc:
+            if connected:
+                logger.warning(f"[Feed] FEED_SILENCE >{FEED_SILENCE_TIMEOUT_SEC}s "
+                               f"without data/heartbeat — reconnecting")
+                lost_at = time.monotonic()
+            else:
+                attempts += 1
+                _log_feed_retry(attempts, exc)
+        except OSError as exc:
+            if connected:
+                logger.warning(f"[Feed] FEED_DISCONNECTED reason={exc}")
+                lost_at = time.monotonic()
+            else:
+                attempts += 1
+                _log_feed_retry(attempts, exc)
+        time.sleep(FEED_RETRY_SEC)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -906,30 +1020,8 @@ def main():
     _nw_excluded_strings = _load_excluded_strings(NW4_EXCLUDED_STRINGS_FILE)
     _excluded_strings    = _load_excluded_strings(ORCH_EXCLUDED_STRINGS_FILE)
 
-    # ── Build the RTPR_connector3 config via its own CLI parser ───────────────
-    # Reuses the connector's defaults + validation; only the CWD-relative paths
-    # are overridden. --flush-on-shutdown preserves the graceful final-flush.
-    config = c3.parse_args([
-        "--api-key-file", C3_API_KEY_FILE,
-        "--universe-dir", UNIVERSE_DATA_DIR,
-        "--log-dir",      C3_LOG_DIR,
-        "--table-dir",    C3_TABLE_DIR,
-        "--flush-on-shutdown",
-    ])
-
-    # uvloop: drop-in faster event loop on Linux; degrade gracefully if unavailable.
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        logger.info("uvloop enabled")
-    except Exception as exc:
-        logger.info(f"uvloop unavailable ({exc}) — using default asyncio loop")
-
-    # Register the reception hook BEFORE the loop runs (no missed-article race).
-    c3.set_row_hook(_on_row_built)
-
-    # Daily universe reload thread (swaps _iti_df + _inscope_set; the connector
-    # reloads its own WS subscribe list at 03:50).
+    # Daily universe reload thread (swaps _iti_df + _inscope_set; the standalone
+    # connector reloads its own WS subscribe list at 03:50 on its side).
     _stop_event = threading.Event()
     _last_iti_reload_date = datetime.now(tz=ZoneInfo('America/New_York')).date()
     _iti_thread = threading.Thread(
@@ -938,14 +1030,16 @@ def main():
     )
     _iti_thread.start()
 
-    logger.info("Starting RTPR_connector3 loop. Waiting for news... (Ctrl+C to stop)")
+    logger.info(
+        f"Subscribing to the RTPR_connector3 feed at {FEED_HOST}:{FEED_PORT} — "
+        f"start the connector as its own process (any order). "
+        f"Waiting for news... (Ctrl+C to stop)"
+    )
 
-    # run_connector installs its own SIGINT/SIGTERM handlers, sets up the
-    # connector's queue-fed logging internally (do NOT call c3.setup_logging here —
-    # it would leak a second QueueListener), and on signal drains the writer +
-    # final-flushes, then returns.
     try:
-        asyncio.run(c3.run_connector(config))
+        _run_feed_client()
+    except KeyboardInterrupt:
+        logger.info("Ctrl+C — shutting down (the standalone connector is unaffected)")
     finally:
         logger.info("Shutting down executors...")
         _stop_event.set()

@@ -71,11 +71,22 @@ OUTPUT_FORMATS = {
     "csv": (".csv", ","),
 }
 
-# In-process row hook (default None -> standalone behavior unchanged).
-# An embedding orchestrator (e.g. Orchestrator5.0) registers a callable via
-# set_row_hook(fn); websocket_listener then calls fn(data, row, arrival_dt) on
-# the WS loop thread right after the row is enqueued. The callable MUST be
-# non-blocking and MUST NOT mutate `data` or `row`.
+# Local TCP feed (JSON lines on loopback): every accepted article is fanned out
+# to connected consumers (Orchestrator5.0, `nc 127.0.0.1 8900` debug watchers).
+# Bounded per-client queues keep a slow consumer from ever blocking the WS loop.
+FEED_HOST = "127.0.0.1"
+FEED_PROTO = 1
+FEED_HEARTBEAT_SECONDS = 5.0
+FEED_CLIENT_QUEUE_MAX = 2000
+
+# In-process row hook (default None -> no extra work on the hot path).
+# websocket_listener calls _row_hook(data, row, arrival_dt) on the WS loop
+# thread right after the row is enqueued — BEFORE the writer's dedup, so WS
+# reconnect replays flow through and consumers must dedup by article ID.
+# run_connector registers FeedServer.broadcast here when --feed-port is
+# enabled (the standard topology: this standalone connector feeding
+# Orchestrator5.0 over local TCP); tests may register their own callable.
+# The callable MUST be non-blocking and MUST NOT mutate `data` or `row`.
 _row_hook = None
 
 
@@ -106,6 +117,7 @@ class Config:
     table_suffix: str
     table_delimiter: str
     ws_url_template: str
+    feed_port: int
     self_test: bool
 
 
@@ -261,6 +273,15 @@ def parse_args(argv: list[str]) -> Config:
         default="wss://ws.rtpr.io?apiKey={api_key}",
     )
     parser.add_argument(
+        "--feed-port",
+        type=int,
+        default=8900,
+        help=(
+            "Publish each accepted article as a JSON line on the local TCP feed "
+            f"{FEED_HOST}:<port> for orchestrator consumers (0 disables the feed)."
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run the offline row-builder self-test and exit.",
@@ -281,6 +302,8 @@ def parse_args(argv: list[str]) -> Config:
         parser.error("--universe-reload-minute must be between 0 and 59")
     if not 0 <= args.universe_reload_second <= 59:
         parser.error("--universe-reload-second must be between 0 and 59")
+    if args.feed_port != 0 and not 1024 <= args.feed_port <= 65535:
+        parser.error("--feed-port must be 0 (disabled) or between 1024 and 65535")
 
     suffix, delimiter = OUTPUT_FORMATS[args.output_format]
 
@@ -313,6 +336,7 @@ def parse_args(argv: list[str]) -> Config:
         table_suffix=suffix,
         table_delimiter=delimiter,
         ws_url_template=args.ws_url_template,
+        feed_port=args.feed_port,
         self_test=args.self_test,
     )
 
@@ -923,6 +947,154 @@ async def websocket_listener(
         await asyncio.sleep(delay)
 
 
+class FeedServer:
+    """Loopback TCP fan-out of accepted articles as JSON lines.
+
+    run_connector registers broadcast() as the row hook, so it runs on the WS
+    loop thread right after each row is enqueued and must never block: each
+    client gets a bounded queue drained by its own writer coroutine, and a
+    client whose queue overflows is dropped instead of ever stalling the hot
+    path. Consumers (Orchestrator5.0, `nc` watchers) receive per line:
+
+        {"type":"hello","service":"RTPR_connector3-feed","proto":1,...}   on connect
+        {"type":"article","arrival_ms":...,"data":{...},"row":{...}}     per article
+        {"type":"heartbeat","server_ms":...}                             every 5s
+
+    `data` is the raw firehose payload, `row` the connector's built row;
+    arrival_ms is the epoch-ms arrival stamp. Articles are broadcast pre-dedup
+    (WS reconnects can replay) — consumers dedup by data/row ID themselves.
+    """
+
+    def __init__(self, port: int, logger: logging.Logger) -> None:
+        self.port = port
+        self.logger = logger
+        self.server: Any = None
+        self.heartbeat_task: asyncio.Task | None = None
+        # queue -> (peer label, handler task); handler tasks unregister themselves.
+        self._clients: dict[asyncio.Queue, tuple[str, asyncio.Task]] = {}
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(
+            self._handle_client, FEED_HOST, self.port
+        )
+        self.heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name="feed_heartbeat"
+        )
+        self.logger.info("FEED_LISTENING host=%s port=%d", FEED_HOST, self.port)
+
+    async def stop(self) -> None:
+        if self.heartbeat_task is not None:
+            self.heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.heartbeat_task
+        if self.server is not None:
+            self.server.close()  # stop accepting; existing handlers cancelled below
+        tasks = [task for _, task in list(self._clients.values())]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self.server is not None:
+            # Only AFTER the handlers are done: on Python 3.12+ wait_closed()
+            # also waits for all client handlers, so awaiting it first would
+            # deadlock against the cancellations above.
+            with contextlib.suppress(Exception):
+                await self.server.wait_closed()
+        self.logger.info("FEED_STOPPED")
+
+    def broadcast(self, data: dict, row: dict, arrival_dt: datetime) -> None:
+        """Row hook (WS loop thread): serialize once, enqueue to every client."""
+        if not self._clients:
+            return
+        line = (
+            json.dumps(
+                {
+                    "type": "article",
+                    "arrival_ms": round(arrival_dt.timestamp() * 1000),
+                    "data": data,
+                    "row": row,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        self._send_to_all(line, kind="article")
+
+    def _send_to_all(self, payload: bytes, kind: str) -> None:
+        for q, (peer, task) in list(self._clients.items()):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Reader stopped consuming; drop it rather than buffer unboundedly.
+                self._clients.pop(q, None)
+                task.cancel()
+                self.logger.warning(
+                    "FEED_CLIENT_OVERFLOW peer=%s dropped queue_max=%d kind=%s",
+                    peer,
+                    FEED_CLIENT_QUEUE_MAX,
+                    kind,
+                )
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(FEED_HEARTBEAT_SECONDS)
+            if not self._clients:
+                continue
+            line = (
+                json.dumps(
+                    {
+                        "type": "heartbeat",
+                        "server_ms": round(now_fixed().timestamp() * 1000),
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._send_to_all(line, kind="heartbeat")
+
+    async def _handle_client(self, reader: Any, writer: Any) -> None:
+        peername = writer.get_extra_info("peername")
+        peer = f"{peername[0]}:{peername[1]}" if isinstance(peername, tuple) else str(peername)
+        q: asyncio.Queue = asyncio.Queue(maxsize=FEED_CLIENT_QUEUE_MAX)
+        self._clients[q] = (peer, asyncio.current_task())
+        self.logger.info(
+            "FEED_CLIENT_CONNECTED peer=%s clients=%d", peer, len(self._clients)
+        )
+        hello = (
+            json.dumps(
+                {
+                    "type": "hello",
+                    "service": "RTPR_connector3-feed",
+                    "proto": FEED_PROTO,
+                    "server_time": format_log_datetime(now_fixed()),
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            writer.write(hello)
+            await writer.drain()
+            while True:
+                payload = await q.get()
+                writer.write(payload)
+                await writer.drain()
+        except asyncio.CancelledError:
+            pass  # dropped on overflow, or server shutdown
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass  # client went away; detected on the next write
+        finally:
+            self._clients.pop(q, None)
+            # abort(), not close(): close() flushes transport-buffered data first,
+            # which never completes against a stalled reader and would hang stop().
+            with contextlib.suppress(Exception):
+                writer.transport.abort()
+            self.logger.info(
+                "FEED_CLIENT_DISCONNECTED peer=%s clients=%d", peer, len(self._clients)
+            )
+
+
 async def run_connector(config: Config) -> None:
     api_key = load_api_key(config.api_key_file)
     logger, log_listener = setup_logging(config.log_dir, config.console_log)
@@ -952,7 +1124,7 @@ async def run_connector(config: Config) -> None:
 
         logger.info(
             "STARTUP universe_file=%s universe_symbols=%d subscribe_all=%d dedup=%d "
-            "flush=%02d:%02d reload=%02d:%02d:%02d output=%s",
+            "flush=%02d:%02d reload=%02d:%02d:%02d output=%s feed_port=%d",
             universe_cache.path,
             len(universe_cache.symbols),
             int(config.subscribe_all),
@@ -963,7 +1135,16 @@ async def run_connector(config: Config) -> None:
             config.universe_reload_minute,
             config.universe_reload_second,
             config.table_suffix,
+            config.feed_port,
         )
+
+        # Local TCP feed for orchestrator consumers — started before the WS task
+        # so no accepted article can ever precede the hook registration.
+        feed_server: FeedServer | None = None
+        if config.feed_port > 0:
+            feed_server = FeedServer(config.feed_port, logger)
+            await feed_server.start()
+            set_row_hook(feed_server.broadcast)
 
         writer_task = asyncio.create_task(
             dataframe_writer(result_queue, config, logger), name="dataframe_writer"
@@ -984,6 +1165,10 @@ async def run_connector(config: Config) -> None:
         reloader_task.cancel()
         ws_task.cancel()
         await asyncio.gather(reloader_task, ws_task, return_exceptions=True)
+
+        if feed_server is not None:
+            set_row_hook(None)
+            await feed_server.stop()
 
         await result_queue.put(None)
         await writer_task
