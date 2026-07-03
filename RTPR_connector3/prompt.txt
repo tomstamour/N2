@@ -1,0 +1,31 @@
+I want you to create a script named "RTPR_connector3.py" that will connect to the RTPR.io Web Socket (WS) and receive the Fire Hose stream of payloads provided by RTPR.io. I created a documentation files here @./doc/rtpr_WebSocket_documentation.txt with relevant information about the use of the RTPR WS. The file ./doc/rtpr_WebSocket_documentation.txt host a Discord conversation I personaly had today with the RTPR owner and administrator (rtpr_official). In that conversation the rtpr_official gives me a secret access to the firehose stream of RTPR. The RTPR_connector3.py script as to avoid all pitfalls that would decrease the ingestion of the PR articles pushed by the firehose to my local computer. We want to stay in the millisecond time length for all the processes of the PR ingestion to cache encoding in the dataframe. The latency issue  can happen when many PR arrive in "burst", i.e. several (up to 10-15) PRs arrives in the same ~1 second time window.
+
+The script will take as input a universe file of the format @../N2/scripts/universe_finder/data/stocks_universe_2026-06-21.tsv
+From this universe file, only the "Symbol" column will be loaded and for only these symbols we will subscribe to the PR/article ingestion. Load the symbols list once at start and keep it in the cache for fast reading/use of the symbols list. Reload at start  and every day at 03:50:00 UTC-4 the latest file with the named format "stocks_universe_yyyy-mm-dd.tsv" of the directory ../N2/scripts/universe_finder/data/ 
+
+This script will not write any file to the disk to avoid speed issues, work with the cache. Only the log file can be written to disk, wake sure it wont interfere with speed processing of ingestion of the PRs.
+
+The script RTPR_connectori3.py will produce a data frame named "PR_dataframe" with one column per payload item from the RTPR WS firehose (only universe PRs). The columns order will be as follow:
+
+Symbol|Tickers|ID|ArrivalDate|Created|ArrivalTime|Headline|Body|
+
+Where "ArrivalDate" and Created fields are derived from the item "article_published_at" from the payload. 
+The "ArrivalTime" is the time at which the innitial payload from the WS was received by the RTPR_WebSocket_connector.py script.
+
+All time fields of the table will be converted to UTC-4 time zone with 3 digits for seconds (millisecond level). 
+Here is an example of the dataframe content:
+Symbol | Tickers            | ID         | ArrivalDate | Created      | ArrivalTime  | Headline  | Body |
+MOGU   | "[""MOGU""]"       | nBw481tnja | 2026-06-22  | 06:34:00.256 | 06:34:01.011 | MOGU Announces Unaudited Financial Results for the Six Months Ended March 31, 2026 and Fiscal Year 2026 | Text example here of x words |
+
+If there are more then one tickers in the "Tickers" field of the payload, just create one row in the PR_dataframe, dont make it two rows.
+
+I want you to stay efficient in from the firehose PR ingestion to the PR_dataframe creation so there wont be latency in the dataframe creation.
+
+The script RTPR_connector3.py will flush the data from the memory every 24 hrs at 20:35UTC-4 and write the data to disk in the directory ./tables
+
+The logs will be written here: ./logs
+
+Here is my RTPR.io API key : @./RTPR_API-Key.txt
+
+
+Use the AskUserQuestion tool to deeply and thouroughly understand my needs, then make a plan for the RTPR_connector3.py script production.

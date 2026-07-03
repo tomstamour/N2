@@ -1,0 +1,40 @@
+tom — 6:10 PM
+I am doing my own filtering, and the only filter is that the symbol must be in my universe. So my universe is already filtered..
+I filter only on float and market cap, maybe I should set that rule in RTPR and have less incoming alerts..?
+My RTPR alert right now is all the nasdaq and nyse
+
+
+rtpr_official — 6:12 PM
+ok, you seem cool so i'll let you in on a secret..
+its not publisized and I only had very early users on it before I even had the alerts socket but I also have a firehose socket that just sends everything including article data
+so you don't have to curl at all
+connect with: wss://ws.rtpr.io?apiKey=YOUR_API_KEY
+
+
+tom — 6:14 PM
+oh ok that is very interesting
+
+
+rtpr_official — 6:14 PM
+Connect with ?apiKey=....
+Server sends {"type":"connected"}.
+
+You must send a subscribe frame — the firehose is not automatic:
+Everything: {"action":"subscribe","tickers":[""]}
+Or specific tickers: {"action":"subscribe","tickers":["AAPL","TSLA"]}
+
+Server sends {"type":"subscribed","tickers":[""]}.
+
+Server pushes {"type":"article","data":{ "id", "ticker", "tickers", "title", "article_body", "author", "created", ... }} for each release.
+
+
+Every 30s the server sends {"type":"ping"} — you must reply {"type":"pong"} or you're dropped after ~90s (close code 4002).
+
+you can subscribe to all tickers and you will get every article directly sent to you
+
+
+tom — 6:16 PM
+wow that very kind, thank you
+
+rtpr_official — 6:16 PM
+please keep it quiet as i need to keep the numbers on the firehose down

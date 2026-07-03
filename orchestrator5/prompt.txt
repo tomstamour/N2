@@ -1,0 +1,18 @@
+I want you to create a new version of the @../orchestrator3/Orchestrator4.2.py script that will be named ./Orchestrator5.0.py. The 5.0 script will not connect to the ../RTPR_connector/RTPR_connector.py anymore to obtain the PR inforamtion/data required by the Ochestrator, it will now connect to the @../RTPR_connector3/RTPR_connector3.py script. The difference from the RTPR_connector/RTPR_connector.py versus the ../RTPR_connector3/RTPR_connector3.py script is that the first one had to fetch/curl the PR data using the url received from the RTPR alert payload, while, the latest ../RTPR_connector3/RTPR_connector3.py receives the PR data via direct firehose WS from RTPR.
+
+Here are all tHe fields I now want in the produced tables like in the file ../orchestrator3/tables/news_output_2026-06-29.tsv :
+Fields:
+Symbol | Tickers      | ID         | ArrivalDate | Created      | ArrivalTime  | OrchTime     | Headline           | Body| Author         | Float   | MktCap  | Exchange | LastDailyClose | itiBaseline | tradeSizeBaseline | FinBERTCompletedAt | And all other original ../orchestrator3/Orchestrator4.2.py following columns ... |
+
+The ArrivalTime column host the time at which the ../RTPR_connector3/RTPR_connector3.py recevied the article/PR from the firehose
+The OrchTime column is the time at which the ./Orchestrator5.0.py script aggregated the data in its dataframe/or dictionnary (the data comming from the ../RTPR_connector3/RTPR_connector3.py)
+For the column FinBERTCompletedAt, remove the date, just keep the time stamp.
+The Body column will host the body of the PR/article text.
+
+The tables have to be outputed here ./tables
+
+Make sur the ./Orchestrator5.0.py script will detect the reception of a PR/article data by the ../RTPR_connector3/RTPR_connector3.py as fast as possible and aggragate it to its Orchestartor data as fast as possible.
+
+Make sure the FinBERT analysis are properly ran in parallel to avoid latency during PR burst were many PR have to be analysed at the same time.
+
+Use the AskUserQuestion tool to deeply understand my needs and to challenge me regarding the coding details I missed.
