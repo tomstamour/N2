@@ -33,6 +33,10 @@ Notes:
 
 Run with the venv interpreter:
   /home/tom/venv/bin/python ShortInterrest_AddON.py -i stocks_universe_2026-07-02_head20.tsv
+
+Importable use (daily_universe_pipeline-2.py Step 8): `enrich_dataframe(df)`
+appends the same columns to an in-memory DataFrame and returns it; all log
+lines go to the named logger "short_interest" so the caller can route them.
 """
 
 import argparse
@@ -77,6 +81,10 @@ BORROW_HISTORY_DAYS = 20      # iBorrowDesk lookback for the utilization proxy
 BORROW_DELTA_DAYS = 5
 
 EASTERN = ZoneInfo("America/New_York")
+
+# Named logger so an importing pipeline can attach its own handlers; the CLI
+# path (setup_logging) configures the root logger and messages propagate up.
+log = logging.getLogger("short_interest")
 
 # ------------------------------------------------------- scoring constants
 # Consensus thresholds from the three deep-search docs (see doc/ and the plan
@@ -200,12 +208,12 @@ def http_get_text(url: str) -> str | None:
             # nasdaqtrader.com serves an HTML "Page Not Available" page with
             # HTTP 200 for missing dates (holidays); don't treat it as data.
             if resp.text.lstrip().startswith('<'):
-                logging.info(f"GET {url} -> HTML page instead of data; skipping.")
+                log.info(f"GET {url} -> HTML page instead of data; skipping.")
                 return None
             return resp.text
-        logging.info(f"GET {url} -> HTTP {resp.status_code}")
+        log.info(f"GET {url} -> HTTP {resp.status_code}")
     except requests.RequestException as e:
-        logging.warning(f"GET {url} failed: {e}")
+        log.warning(f"GET {url} failed: {e}")
     return None
 
 
@@ -277,7 +285,7 @@ def fetch_finra_short_interest(symbols: list[str], cache_dir: str) -> dict[str, 
                     headers={**HTTP_HEADERS, 'Accept': 'application/json',
                              'Content-Type': 'application/json'})
             except requests.RequestException as e:
-                logging.warning(f"FINRA SI ({dataset}) request failed: {e}")
+                log.warning(f"FINRA SI ({dataset}) request failed: {e}")
                 continue
             if resp.status_code == 204:
                 records = []
@@ -285,16 +293,16 @@ def fetch_finra_short_interest(symbols: list[str], cache_dir: str) -> dict[str, 
                 try:
                     records = resp.json()
                 except ValueError:
-                    logging.warning(f"FINRA SI ({dataset}): response was not JSON.")
+                    log.warning(f"FINRA SI ({dataset}): response was not JSON.")
                     continue
             elif resp.status_code in (401, 403):
-                logging.warning(
+                log.warning(
                     f"FINRA SI ({dataset}): HTTP {resp.status_code} — anonymous "
                     "access refused. Register a free API key at "
                     "developer.finra.org, or rely on the yfinance fallback.")
                 continue
             else:
-                logging.info(f"FINRA SI ({dataset}): HTTP {resp.status_code} "
+                log.info(f"FINRA SI ({dataset}): HTTP {resp.status_code} "
                              f"— {resp.text[:200]}")
                 continue
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -302,7 +310,7 @@ def fetch_finra_short_interest(symbols: list[str], cache_dir: str) -> dict[str, 
                 json.dump(records, fh)
 
         parsed = _parse_finra_records(records, 'finra')
-        logging.info(f"FINRA SI ({dataset}): {len(records)} records, "
+        log.info(f"FINRA SI ({dataset}): {len(records)} records, "
                      f"{len(parsed)} symbols matched.")
         out.update(parsed)
         remaining = [s for s in remaining if s not in out]
@@ -315,7 +323,7 @@ def fetch_yfinance_short_interest(symbols: list[str]) -> dict[str, dict]:
     try:
         import yfinance as yf
     except ImportError:
-        logging.warning("yfinance not installed — cannot fall back for short interest.")
+        log.warning("yfinance not installed — cannot fall back for short interest.")
         return {}
 
     out: dict[str, dict] = {}
@@ -323,7 +331,7 @@ def fetch_yfinance_short_interest(symbols: list[str]) -> dict[str, dict]:
         try:
             info = yf.Ticker(sym).info or {}
         except Exception as e:
-            logging.info(f"{sym}: yfinance info failed — {e}")
+            log.info(f"{sym}: yfinance info failed — {e}")
             continue
         shares_short = to_float(info.get('sharesShort'))
         if shares_short is None:
@@ -370,7 +378,7 @@ def fetch_short_volume_history(cache_dir: str) -> dict[str, list[tuple[str, floa
                 (d.isoformat(), round(short_v / total_v * 100.0, 2)))
     for series in per_symbol.values():
         series.sort()
-    logging.info(f"Short-volume files loaded: {found} day(s), "
+    log.info(f"Short-volume files loaded: {found} day(s), "
                  f"{len(per_symbol)} symbols.")
     return per_symbol
 
@@ -388,7 +396,7 @@ def fetch_ibkr_borrow_file(cache_dir: str) -> dict[str, dict]:
                 ftp.retrbinary(f"RETR {IBKR_FTP_FILE}", chunks.append)
             return b''.join(chunks).decode('utf-8', errors='replace')
         except Exception as e:
-            logging.warning(
+            log.warning(
                 f"IBKR shortstock FTP failed ({e}) — outbound FTP/port 21 may be "
                 "blocked on this network; current fee/available will come from "
                 "iBorrowDesk instead.")
@@ -421,7 +429,7 @@ def fetch_ibkr_borrow_file(cache_dir: str) -> dict[str, dict]:
             'rebate': to_float(col('REBATERATE')),
             'available': to_float(col('AVAILABLE')),
         }
-    logging.info(f"IBKR borrow file: {len(out)} symbols.")
+    log.info(f"IBKR borrow file: {len(out)} symbols.")
     return out
 
 
@@ -439,7 +447,7 @@ def fetch_iborrowdesk(symbol: str, cache_dir: str) -> dict | None:
     try:
         data = json.loads(text)
     except ValueError:
-        logging.info(f"{symbol}: iBorrowDesk returned non-JSON.")
+        log.info(f"{symbol}: iBorrowDesk returned non-JSON.")
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as fh:
@@ -497,7 +505,7 @@ def fetch_regsho_membership(cache_dir: str) -> list[tuple[str, set[str]]]:
         if text is None:
             continue
         if not text.lstrip().startswith('Symbol|'):
-            logging.info(f"Reg SHO {ymd}: unexpected file format — skipping day.")
+            log.info(f"Reg SHO {ymd}: unexpected file format — skipping day.")
             continue
         symbols: set[str] = set()
         for line in text.splitlines():
@@ -506,7 +514,7 @@ def fetch_regsho_membership(cache_dir: str) -> list[tuple[str, set[str]]]:
                 continue
             symbols.add(parts[0].strip().upper())
         lists.append((d.isoformat(), symbols))
-    logging.info(f"Reg SHO threshold lists loaded: {len(lists)} day(s).")
+    log.info(f"Reg SHO threshold lists loaded: {len(lists)} day(s).")
     return lists
 
 
@@ -644,6 +652,74 @@ def compute_symbol_metrics(symbol: str, float_shares: float | None,
     return m
 
 
+# ------------------------------------------------------------- enrichment
+def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
+                     skip_borrow_history: bool = False) -> pd.DataFrame:
+    """Append the SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/Squeeze columns to `df`.
+
+    `df` must have a 'Symbol' column; 'Float_M' (millions of shares) and
+    'LastDailyClosePrice' are used when present — values may be strings
+    (everything goes through to_float), so a dtype=str frame works. Rows with
+    a missing/blank Symbol are dropped. Returns the enriched copy.
+
+    This is the library entry point used by daily_universe_pipeline-2.py;
+    the CLI in main() is a thin wrapper around it.
+    """
+    if 'Symbol' not in df.columns:
+        raise ValueError("DataFrame has no 'Symbol' column.")
+    cache_dir = cache_dir or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    df = df[df['Symbol'].notna()].copy()
+    df = df[df['Symbol'].astype(str).str.strip() != ''].copy()
+    symbols = sorted({str(s).strip().upper() for s in df['Symbol']})
+    log.info(f"{len(symbols)} unique symbols to enrich")
+
+    # market-wide fetches (one download each, cached per day)
+    si_map = fetch_finra_short_interest(symbols, cache_dir)
+    missing_si = [s for s in symbols if s not in si_map]
+    if missing_si:
+        log.info(f"FINRA SI missing for {len(missing_si)} symbols — trying yfinance.")
+        si_map.update(fetch_yfinance_short_interest(missing_si))
+    svr_map = fetch_short_volume_history(cache_dir)
+    ftp_map = fetch_ibkr_borrow_file(cache_dir)
+    regsho_lists = fetch_regsho_membership(cache_dir)
+
+    # per-symbol assembly (iBorrowDesk is the only per-symbol network call)
+    metrics: dict[str, dict] = {}
+    for n, sym in enumerate(symbols, 1):
+        row = df[df['Symbol'].astype(str).str.strip().str.upper() == sym].iloc[0]
+        float_m = to_float(row.get('Float_M'))
+        float_shares = float_m * 1e6 if float_m else None
+        last_close = to_float(row.get('LastDailyClosePrice'))
+
+        if skip_borrow_history:
+            hist = borrow_history_metrics(None)
+        else:
+            log.info(f"[{n}/{len(symbols)}] {sym}: fetching borrow history...")
+            hist = borrow_history_metrics(fetch_iborrowdesk(sym, cache_dir))
+
+        metrics[sym] = compute_symbol_metrics(
+            symbol=sym,
+            float_shares=float_shares,
+            last_close=last_close,
+            si=si_map.get(sym),
+            svr_series=svr_map.get(sym),
+            ftp_borrow=ftp_map.get(sym),
+            borrow_hist=hist,
+            regsho=regsho_flag_and_streak(sym, regsho_lists),
+        )
+
+    for col in OUTPUT_COLUMNS:
+        df[col] = [metrics[str(s).strip().upper()][col] for s in df['Symbol']]
+
+    covered = sum(1 for m in metrics.values() if m['SI_DataCoverage'] != 'none')
+    scored = sum(1 for m in metrics.values() if (m['SqueezeScore'] or 0) > 0)
+    log.info(f"Symbols: {len(symbols)} | with any data: {covered} | score > 0: {scored}")
+    return df
+
+
 # -------------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(
@@ -669,65 +745,20 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.log_file)
-    cache_dir = args.cache_dir or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'cache')
-    os.makedirs(cache_dir, exist_ok=True)
 
     df = pd.read_csv(args.input_file, sep='\t')
     if 'Symbol' not in df.columns:
-        logging.error("Input file has no 'Symbol' column.")
+        log.error("Input file has no 'Symbol' column.")
         return
-    df = df[df['Symbol'].notna()].copy()
-    symbols = sorted({str(s).strip().upper() for s in df['Symbol'] if str(s).strip()})
-    logging.info(f"{len(symbols)} unique symbols from {args.input_file}")
-
-    # market-wide fetches (one download each, cached per day)
-    si_map = fetch_finra_short_interest(symbols, cache_dir)
-    missing_si = [s for s in symbols if s not in si_map]
-    if missing_si:
-        logging.info(f"FINRA SI missing for {len(missing_si)} symbols — trying yfinance.")
-        si_map.update(fetch_yfinance_short_interest(missing_si))
-    svr_map = fetch_short_volume_history(cache_dir)
-    ftp_map = fetch_ibkr_borrow_file(cache_dir)
-    regsho_lists = fetch_regsho_membership(cache_dir)
-
-    # per-symbol assembly (iBorrowDesk is the only per-symbol network call)
-    metrics: dict[str, dict] = {}
-    for n, sym in enumerate(symbols, 1):
-        row = df[df['Symbol'].astype(str).str.strip().str.upper() == sym].iloc[0]
-        float_m = to_float(row.get('Float_M'))
-        float_shares = float_m * 1e6 if float_m else None
-        last_close = to_float(row.get('LastDailyClosePrice'))
-
-        if args.skip_borrow_history:
-            hist = borrow_history_metrics(None)
-        else:
-            logging.info(f"[{n}/{len(symbols)}] {sym}: fetching borrow history...")
-            hist = borrow_history_metrics(fetch_iborrowdesk(sym, cache_dir))
-
-        metrics[sym] = compute_symbol_metrics(
-            symbol=sym,
-            float_shares=float_shares,
-            last_close=last_close,
-            si=si_map.get(sym),
-            svr_series=svr_map.get(sym),
-            ftp_borrow=ftp_map.get(sym),
-            borrow_hist=hist,
-            regsho=regsho_flag_and_streak(sym, regsho_lists),
-        )
-
-    for col in OUTPUT_COLUMNS:
-        df[col] = [metrics[str(s).strip().upper()][col] for s in df['Symbol']]
+    log.info(f"Input: {args.input_file}")
+    df = enrich_dataframe(df, cache_dir=args.cache_dir,
+                          skip_borrow_history=args.skip_borrow_history)
 
     input_stem = os.path.splitext(os.path.basename(args.input_file))[0]
     out_dir = args.output_dir or os.path.dirname(os.path.abspath(args.input_file))
     out_path = os.path.join(out_dir, f"{input_stem}_SI.tsv")
     df.to_csv(out_path, sep='\t', index=False)
-
-    covered = sum(1 for m in metrics.values() if m['SI_DataCoverage'] != 'none')
-    scored = sum(1 for m in metrics.values() if (m['SqueezeScore'] or 0) > 0)
-    logging.info(f"Saved {out_path}")
-    logging.info(f"Symbols: {len(symbols)} | with any data: {covered} | score > 0: {scored}")
+    log.info(f"Saved {out_path}")
 
 
 if __name__ == '__main__':

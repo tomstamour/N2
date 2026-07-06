@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Cap glibc malloc arenas to keep the scanner's virtual-memory footprint low.
+# Each thread can otherwise reserve a 64 MB arena; the scanner re-execs itself
+# to set this when unset, but exporting it here applies it from the first pass.
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=131072
+
 # Creation of a directory with date as a name. This directory will host all file relevant to the daily GUS setup.
 ./scripts_functions/timer.sh --time 05:46:10 \
   --execute mkdir ./runs/$(date +%d-%b-%Y)
@@ -23,7 +29,13 @@
   --min-price 0
   #--historical-mode
 
-# Printing the GTT at 09:30
+# Live table view: DO NOT run VisiData inline here. The scanner above runs in the
+# foreground (--no-new-window) as a continuous loop, so it never returns, and
+# `vd` is a blocking interactive TUI. Instead, open a SEPARATE terminal and run:
+#     ./view_table.sh ./runs/$(date +%d-%b-%Y)/GusTradeTable.txt        # reload on change
+#     ./view_table.sh ./runs/$(date +%d-%b-%Y)/GusTradeTable.txt 30     # reload every 30s
+
+# Printing the GTT at 09:30./scripts_functions/gainers_scanner_scripts/Gainers_Scanner_Script.py
 nohup ./scripts_functions/timer.sh --time 09:29:59 \
   --execute cp ./runs/$(date +%d-%b-%Y)/GusTradeTable.txt \
   ./runs/$(date +%d-%b-%Y)/GTT_930_Print_$(date +%d-%b-%Y).txt &

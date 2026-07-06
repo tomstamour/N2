@@ -23,15 +23,17 @@ def test_argument_parsing():
 
     # Test 2: Test argument parser with sample args
     try:
-        # Simulate command-line arguments
+        # Simulate command-line arguments. A checkpoint (--time0 or --date-A) is
+        # required, so we supply --time0 here.
         test_args = [
             'Gainers_Scanner_Script.py',
-            '--output', 'test_output.csv',
+            '--time0', '2026-07-02/09:45',
             '--gap-percentage', '50',
             '--client-id', '300',
             '--host', '127.0.0.1',
             '--port', '4001',
-            '--log-dir', './test_logs',
+            '--output-dir', './test_output',
+            '--log', './test_logs/scanner.log',
             '--max-stocks', '25',
             '--min-price', '10.0',
             '--refresh-interval', '5',
@@ -48,24 +50,28 @@ def test_argument_parsing():
         sys.argv = original_argv
 
         print("✓ Arguments parsed successfully")
-        print(f"  - Output: {args.output}")
+        print(f"  - Checkpoint mode: {args.checkpoint_mode}")
+        print(f"  - time0: {args.time0}")
         print(f"  - Gap percentage: {args.gap_percentage}")
         print(f"  - Client ID: {args.client_id}")
         print(f"  - Host: {args.host}")
         print(f"  - Port: {args.port}")
-        print(f"  - Log dir: {args.log_dir}")
+        print(f"  - Output dir: {args.output_dir}")
+        print(f"  - Log: {args.log}")
         print(f"  - Max stocks: {args.max_stocks}")
         print(f"  - Min price: {args.min_price}")
         print(f"  - Refresh interval: {args.refresh_interval}")
         print(f"  - No new window: {args.no_new_window}")
 
         # Verify values
-        assert args.output == 'test_output.csv', "Output path mismatch"
+        assert args.checkpoint_mode == 'time0', "Checkpoint mode mismatch"
+        assert args.time0 == '2026-07-02/09:45', "time0 mismatch"
         assert args.gap_percentage == 50, "Gap percentage mismatch"
         assert args.client_id == 300, "Client ID mismatch"
         assert args.host == '127.0.0.1', "Host mismatch"
         assert args.port == 4001, "Port mismatch"
-        assert args.log_dir == './test_logs', "Log dir mismatch"
+        assert args.output_dir == './test_output', "Output dir mismatch"
+        assert args.log == './test_logs/scanner.log', "Log path mismatch"
         assert args.max_stocks == 25, "Max stocks mismatch"
         assert args.min_price == 10.0, "Min price mismatch"
         assert args.refresh_interval == 5, "Refresh interval mismatch"
@@ -79,11 +85,11 @@ def test_argument_parsing():
         traceback.print_exc()
         return False
 
-    # Test 3: Test with minimal required args
+    # Test 3: Test with minimal required args (checkpoint + gap + client-id)
     try:
         test_args_minimal = [
             'Gainers_Scanner_Script.py',
-            '--output', 'minimal.csv',
+            '--date-A', '2026-07-02',
             '--gap-percentage', '25',
             '--client-id', '301'
         ]
@@ -96,22 +102,29 @@ def test_argument_parsing():
         sys.argv = original_argv
 
         print("✓ Minimal arguments parsed successfully")
-        print(f"  - Using defaults: host={args.host}, port={args.port}, refresh={args.refresh_interval}")
+        print(f"  - Using defaults: host={args.host}, port={args.port}, "
+              f"output_dir={args.output_dir}, refresh={args.refresh_interval}")
 
+        assert args.checkpoint_mode == 'date-A', "Default checkpoint mode incorrect"
         assert args.host == '127.0.0.1', "Default host incorrect"
         assert args.port == 4001, "Default port incorrect"
-        assert args.refresh_interval == 3, "Default refresh interval incorrect"
+        assert args.output_dir == '.', "Default output dir incorrect"
+        assert args.log is None, "Default log should be None"
+        assert args.refresh_interval == 30, "Default refresh interval incorrect"
 
     except Exception as e:
         print(f"✗ Minimal argument parsing failed: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
     print("\n" + "="*60)
     print("All tests passed! ✓")
     print("="*60)
-    print("\nThe refactored Gainers Scanner Script is ready to use.")
+    print("\nThe Gainers Scanner Script argument parser is working.")
     print("\nExample command:")
-    print("  python Gainers_Scanner_Script.py --output gainers.csv --gap-percentage 50 --client-id 300")
+    print("  python Gainers_Scanner_Script.py --time0 2026-07-02/09:45 "
+          "--gap-percentage 50 --client-id 300")
     print("\nFor full documentation, see: GAINERS_SCANNER_README.md")
 
     return True

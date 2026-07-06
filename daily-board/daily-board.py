@@ -11,7 +11,7 @@ SSH, no browser needed). Two columns are added immediately after Symbol:
     PostPRhigh(%)  — the run-up from the arrival price to that high:
                      (High - ArrivalPrice) / ArrivalPrice * 100.
 
-Data sourcing (chosen to respect IBKR pacing while refreshing every 5s):
+Data sourcing (chosen to respect IBKR pacing while refreshing every 30s):
   * ONE historical backfill per symbol at startup  → high & price since ArrivalTime.
   * Then a live streaming market-data subscription per symbol keeps a running max.
   * No tick-by-tick data is used (reqMktData top-of-book/last is an approximation).
@@ -64,11 +64,11 @@ IB_PORT = 4001
 CLIENT_ID = 20000
 CONNECT_TIMEOUT = 20
 
-REFRESH_SECONDS = 5            # how often the PostPR values + timestamp recompute
+REFRESH_SECONDS = 30           # how often the PostPR values + timestamp recompute
 WRITE_SECONDS = 60            # how often the table is written to disk (overwrite)
 USE_RTH = False               # False = include pre/post-market in the high
 BACKFILL_PACING_SECONDS = 0.15  # pause between startup historical requests
-HIST_TIMEOUT = 20
+HIST_TIMEOUT = 8              # failed backfills degrade to live-data-only, so fail fast
 
 # TSV export goes to a per-day file in OUTPUT_DIR, named after the input's date
 # (e.g. outputs/daily-board_2026-06-15.tsv). It is overwritten every WRITE_SECONDS.
@@ -223,6 +223,9 @@ class DataManager:
         self.ib.reqMarketDataType(1)  # live data
 
         total = len(self.symbols)
+        worst = total * (HIST_TIMEOUT + BACKFILL_PACING_SECONDS)
+        print(f"[daily-board] backfilling {total} symbols "
+              f"(worst case ~{worst:.0f}s if the data farm is slow)...", flush=True)
         for i, sym in enumerate(self.symbols, 1):
             print(f"[daily-board] ({i}/{total}) {sym}: qualifying...", flush=True)
             contract = self._qualify(sym)
@@ -249,47 +252,60 @@ class DataManager:
         return None
 
     def _backfill_symbol(self, symbol, contract):
-        """For every row of this symbol, fetch the high & arrival price since arrival."""
-        now_utc = datetime.now(timezone.utc)
-        # Group the row indices that use this symbol.
-        idxs = [i for i, r in enumerate(self.rows)
-                if str(r.get('Symbol', '')).strip().upper() == symbol]
+        """ONE historical request per symbol; derive every row's high & arrival price.
 
-        for i in idxs:
-            arrival_raw = str(self.rows[i].get('ArrivalTime', '')).strip()
-            arrival_date = str(self.rows[i].get('ArrivalDate', '')).strip()
+        The request spans from the symbol's EARLIEST arrival to now; each row then
+        reads its own values off the shared bar list (bars at/after its arrival).
+        """
+        now_utc = datetime.now(timezone.utc)
+        # Row index -> arrival datetime (UTC), for the rows that use this symbol.
+        arrivals = {}
+        for i, r in enumerate(self.rows):
+            if str(r.get('Symbol', '')).strip().upper() != symbol:
+                continue
+            arrival_raw = str(r.get('ArrivalTime', '')).strip()
+            arrival_date = str(r.get('ArrivalDate', '')).strip()
             try:
-                arrival_utc = parse_arrival_utc(arrival_raw, arrival_date)
+                arrivals[i] = parse_arrival_utc(arrival_raw, arrival_date)
             except Exception as exc:  # noqa: BLE001
                 log.warning("%s row %d: bad ArrivalTime '%s' — %s",
                             symbol, i, arrival_raw, exc)
+
+        # Arrivals in the future rely on live data only.
+        past = {i: a for i, a in arrivals.items() if a < now_utc}
+        if not past:
+            return
+
+        secs = int((now_utc - min(past.values())).total_seconds())
+        duration, bar_size = self._duration_and_bar(secs)
+        try:
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime='',          # now
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow='TRADES',
+                useRTH=USE_RTH,
+                formatDate=2,
+                keepUpToDate=False,
+                timeout=HIST_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: reqHistoricalData error — %s", symbol, exc)
+            bars = None
+
+        if not bars:
+            print(f"[daily-board] {symbol}: backfill failed — using live data only.",
+                  flush=True)
+            return
+
+        for i, arrival_utc in past.items():
+            later = [b for b in bars if b.date >= arrival_utc]
+            if not later:
                 continue
-
-            secs = int((now_utc - arrival_utc).total_seconds())
-            if secs <= 0:
-                continue  # arrival in the future — rely on live data only
-
-            duration, bar_size = self._duration_and_bar(secs)
-            try:
-                bars = self.ib.reqHistoricalData(
-                    contract,
-                    endDateTime='',          # now
-                    durationStr=duration,
-                    barSizeSetting=bar_size,
-                    whatToShow='TRADES',
-                    useRTH=USE_RTH,
-                    formatDate=2,
-                    keepUpToDate=False,
-                    timeout=HIST_TIMEOUT,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s row %d: reqHistoricalData error — %s", symbol, i, exc)
-                bars = None
-
-            if bars:
-                self.backfill_high[i] = round(max(b.high for b in bars), 4)
-                # First (oldest) bar's open ~ price at ArrivalTime.
-                self.arrival_price[i] = round(bars[0].open, 4)
+            self.backfill_high[i] = round(max(b.high for b in later), 4)
+            # First (oldest) bar's open ~ price at ArrivalTime.
+            self.arrival_price[i] = round(later[0].open, 4)
 
     @staticmethod
     def _duration_and_bar(secs):
@@ -323,10 +339,13 @@ class DataManager:
     # -- snapshot ----------------------------------------------------------
 
     def build_snapshot(self):
-        """Recompute PostPR values and return a render-ready snapshot dict."""
-        out_rows = []
-        for i, src in enumerate(self.rows):
-            sym = str(src.get('Symbol', '')).strip().upper()
+        """Recompute PostPR values and return a render-ready snapshot dict.
+
+        Writes the two computed columns into the source row dicts in place (no
+        per-refresh copy of the whole table — keeps the memory footprint flat).
+        """
+        for i, row in enumerate(self.rows):
+            sym = str(row.get('Symbol', '')).strip().upper()
             live = self.live_max.get(sym)
 
             highs = [h for h in (self.backfill_high[i], live) if h is not None]
@@ -341,16 +360,14 @@ class DataManager:
             if high is not None and arrival not in (None, 0):
                 pct = (high - arrival) / arrival * 100.0
 
-            row = dict(src)
             row['PostPRhigh($)'] = high
             row['PostPRhigh(%)'] = pct
-            out_rows.append(row)
 
         self.last_update_str = datetime.now(ET).strftime('%H:%M:%S')
-        self.widths = self._compute_widths(out_rows)
+        self.widths = self._compute_widths(self.rows)
         return {
             'cols': self.display_cols,
-            'rows': out_rows,
+            'rows': self.rows,
             'widths': self.widths,
             'file': self.file_label,
             'updated': self.last_update_str,
@@ -714,7 +731,8 @@ def main():
     parser.add_argument('--port', type=int, default=IB_PORT)
     parser.add_argument('--client', type=int, default=CLIENT_ID)
     parser.add_argument('--refresh', type=float, default=REFRESH_SECONDS,
-                        help="seconds between value recomputes (default 5)")
+                        help=f"seconds between value recomputes "
+                             f"(default {REFRESH_SECONDS})")
     parser.add_argument('--max-symbols', type=int, default=0,
                         help="cap number of symbols subscribed (0 = no cap)")
     parser.add_argument('--out', default=None,
@@ -733,6 +751,9 @@ def main():
     logging.basicConfig(
         filename=LOG_PATH, level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s')
+    # ib_insync INFO is very chatty (every position/tick/farm message) — keep the
+    # log to warnings so the file and string churn stay small.
+    logging.getLogger('ib_insync').setLevel(logging.WARNING)
 
     path = args.input or find_latest_file(args.dir)
     if not path or not os.path.exists(path):

@@ -7,13 +7,17 @@ This script performs continuous scans to find stocks with X% price increases
 from the previous day's close to the current price.
 
 Outputs: CSV file with symbols, prices, gain percentages, and borrow info.
-Live terminal display with auto-refresh.
+Prints per-cycle status lines and rewrites the GusTradeTable on disk each scan
+cycle. For a live view, open the table in a separate process (e.g. VisiData with
+`--reload-every=N`) rather than rendering it in-process.
+
+Note: pandas and yfinance are imported lazily inside the functions that use them
+to keep startup memory low.
 """
 
 import time
 import datetime
 import logging
-import pandas as pd
 import threading
 import os
 import sys
@@ -28,13 +32,9 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# Rich library for terminal display
+# Rich library for terminal display (only Console is used)
 try:
     from rich.console import Console
-    from rich.table import Table
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
 except ImportError:
     print("Error: rich module not found. Please install it with: pip install rich")
     exit(1)
@@ -49,12 +49,11 @@ except ImportError:
     print("Error: ibapi module not found. Please install it with: pip install ibapi")
     exit(1)
 
-# yfinance import for sector/industry and fundamental data
-try:
-    import yfinance as yf
-except ImportError:
-    print("Error: yfinance module not found. Please install it with: pip install yfinance")
-    exit(1)
+# NOTE: pandas (`import pandas as pd`) and yfinance (`import yfinance as yf`) are
+# imported lazily inside the functions that use them (fetch_pr_base_price,
+# get_yfinance_data, previous_day_volume_calculator) to keep startup memory low.
+# They pull in heavy transitive deps (numpy/requests/lxml/curl_cffi) that we do
+# not want to load on every run.
 
 # =====================
 # Command-Line Argument Parsing
@@ -144,8 +143,10 @@ Note: --time0 format is YYYY-MM-DD/HH:MM in US/Eastern timezone
                         help='Minimum stock price filter (default: 0.50)')
     parser.add_argument('--refresh-interval',
                         type=int,
-                        default=3,
-                        help='Seconds between scans (default: 3)')
+                        default=30,
+                        help='Seconds between scans and disk rewrites of the '
+                             'GusTradeTable (default: 30). Pair with VisiData '
+                             '`--reload-every` for a live external view.')
     parser.add_argument('--no-new-window',
                         action='store_true',
                         help='Display in current terminal instead of new window')
@@ -935,6 +936,10 @@ RTPR_FETCH_TIMEOUT = 8.0         # per-request HTTP timeout (seconds)
 RTPR_FETCH_WORKERS = 10          # concurrent fetches for newly-seen symbols
 _rtpr_api_key = None             # set in main() from --config; None disables the feature
 
+# Concurrency for the per-batch stock-processing pools. Kept modest to limit
+# thread stacks and glibc malloc arenas (lower virtual-memory footprint).
+SCAN_MAX_WORKERS = 8
+
 
 def load_rtpr_api_key(config_path):
     """Read the RTPR API key from the N2 config file.
@@ -1011,6 +1016,8 @@ def fetch_pr_base_price(ticker, published_at):
     containing `published_at`, or None if the data is unavailable. This is the
     denominator of the PRyield return.
     """
+    import yfinance as yf
+    import pandas as pd
     try:
         hist = yf.Ticker(str(ticker).strip()).history(
             period='7d', interval='1m', prepost=True
@@ -1219,9 +1226,13 @@ def write_complete_gtt(tracked_stocks, gtt_path):
     # Sort by live_percentage (highest first)
     sorted_stocks = sorted(stock_list, key=lambda x: x.get('live_percentage', 0), reverse=True)
 
-    # Write complete file (overwrite mode)
+    # Write complete file atomically: write to a temp file in the same
+    # directory, then os.replace() onto the real path. os.replace is atomic on
+    # the same filesystem, so an external reader (e.g. VisiData with
+    # --reload-every) never observes a half-written/truncated table.
+    tmp_path = f"{gtt_path}.tmp"
     try:
-        with open(gtt_path, 'w') as f:
+        with open(tmp_path, 'w') as f:
             # Write header
             f.write('\t'.join(header) + '\n')
 
@@ -1342,10 +1353,16 @@ def write_complete_gtt(tracked_stocks, gtt_path):
                 ]
                 f.write('\t'.join(row) + '\n')
 
+        os.replace(tmp_path, gtt_path)
         logger.info(f"Wrote complete GTT with {len(sorted_stocks)} stocks to {gtt_path}")
 
     except Exception as e:
         logger.error(f"Error writing complete GTT file: {e}")
+        # Clean up the partial temp file so it can't be mistaken for output.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def evaluate_trade_decision(stock_data, args):
@@ -2644,6 +2661,8 @@ class GainersScanner:
 
         logger.info(f"{symbol}: Fetching fresh data from yfinance...")
 
+        import yfinance as yf
+
         # Initialize results
         results = {
             'float_shares': None,
@@ -2752,6 +2771,8 @@ class GainersScanner:
                 logger.debug(f"{symbol}: PDV cache expired (age: {age:.0f}s > TTL: {ttl}s)")
 
         logger.info(f"{symbol}: Calculating PDV (Previous Day Volume) ratio...")
+
+        import yfinance as yf
 
         # Initialize result
         result = {
@@ -3252,7 +3273,7 @@ class GainersScanner:
             logger.info(f"Processing scanner batch {batch_num}/{total_batches} ({len(batch)} stocks)...")
 
             # Process batch in parallel using ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            with ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS) as executor:
                 # Submit all stocks in batch for parallel processing
                 # Determine is_first_scan per stock: True if not in peak_cache
                 future_to_stock = {}
@@ -3394,7 +3415,7 @@ class GainersScanner:
                 logger.info(f"Processing tracked-only batch {batch_num}/{total_batches} ({len(batch_symbols)} stocks)...")
 
                 # Process in parallel
-                with ThreadPoolExecutor(max_workers=20) as executor:
+                with ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS) as executor:
                     futures = {}
                     for symbol in batch_symbols:
                         # Get contract from cached contracts or create new one
@@ -3844,6 +3865,21 @@ def launch_in_new_terminal(args):
 # =====================
 def main():
     """Main function."""
+    # --- Low virtual-memory guard -------------------------------------------
+    # glibc reads MALLOC_ARENA_MAX from the environment at process startup, so
+    # setting os.environ here would be too late for the current process. A
+    # one-time re-exec (before any worker threads are created) makes it stick,
+    # capping the number of 64 MB malloc arenas that a multi-threaded Python
+    # process would otherwise reserve — the main driver of high VSZ here.
+    # With pandas/yfinance now imported lazily, this throwaway first pass is
+    # cheap. The guard is skipped once the var is present (second pass, or when
+    # a launcher already exported it).
+    if os.environ.get("MALLOC_ARENA_MAX") is None:
+        os.environ["MALLOC_ARENA_MAX"] = "2"
+        os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    # ------------------------------------------------------------------------
+
     global logger, _rtpr_api_key
 
     # Parse arguments

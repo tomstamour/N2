@@ -126,7 +126,7 @@ baseline (shares/trade) for RTH and ETH from the *same* TRADES bars (via
 output gets two extra columns. Writes to a DISTINCT stem so it never collides
 with the production output: `data/nasdaq_symbols_data_priced_sized_YYYY-MM-DD.tsv`.
 
-## Steps 4–7 and the 14-column output
+## Steps 4–8 and the 38-column output
 
 - **Step 4** — ITI imputation: runs `ITI_imputer.py` in place on the 8-column
   canonical schema (the trade-size columns are NOT present yet, so the imputer's
@@ -140,8 +140,23 @@ with the production output: `data/nasdaq_symbols_data_priced_sized_YYYY-MM-DD.ts
   `--no-size-impute` (independent of `--no-impute`). A Step 7 failure leaves the
   12-column Step 6 file intact and re-runnable (the call is wrapped in try/except
   exactly like Steps 4 and 6).
+- **Step 8** — short-interest enrichment: `../ShortInterrest/ShortInterrest_AddON.py`
+  is loaded by path and its `enrich_dataframe(df, skip_borrow_history=...)`
+  appends 24 columns in place (same read-back-as-strings pattern as Step 6) →
+  the final **38-column** file: `SI_*` ×8, `SVR_*` ×4, `CTB_*` ×3, `Borrow_*` ×4,
+  `RegSHO_*` ×2, `SqueezeFlags`, `SqueezeScore`, `SI_DataCoverage`. Free web
+  sources only (FINRA SI + daily short volume, IBKR shortstock FTP, iBorrowDesk,
+  Nasdaq Reg SHO threshold list) — no IBKR API connection; downloads cached
+  per-day under `../ShortInterrest/cache/`. Skipped by `--no-short-interest`;
+  `--skip-borrow-history` drops the per-symbol iBorrowDesk calls (~0.8 s each —
+  those feed `CTB_FeeDelta5d` / `Borrow_AvailDelta5dPct` / `Borrow_UtilProxy`).
+  Best-effort: a failure leaves the 14-column file intact; recovery is running
+  the addon standalone (`-i data/stocks_universe_YYYY-MM-DD.tsv`, which writes a
+  `_SI.tsv` sibling — its CLI is a thin wrapper around the same `enrich_dataframe`).
+  The addon logs to the named logger `short_interest`, routed into the per-day
+  `pipeline_daily.log` and console by `_setup_logging`.
 
-Final 14-column schema:
+First-14-column schema (before the Step 8 SI columns):
 `Symbol, Exchange, Float_M, MarketCap_M, Float_Source, LastDailyClosePrice,
 RTH_avgITI_sec, ETH_avgITI_sec, ITI_impute_flag, ITI_impute_method,
 RTH_tradeSize, ETH_TradeSize, TradeSize_impute_flag, TradeSize_impute_method`.

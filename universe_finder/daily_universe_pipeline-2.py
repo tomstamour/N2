@@ -45,13 +45,25 @@ End-to-end pipeline:
      file. --max-float-skipped (blank) rows stay blank. ITI_imputer.py is left
      untouched; trade_size_imputer imports its HGB helpers. Atomic write; a
      failure here leaves the 12-column Step 6 file intact and re-runnable.
+  8. Run ../ShortInterrest/ShortInterrest_AddON.enrich_dataframe on the file
+     in place (unless --no-short-interest): appends 24 short-interest /
+     short-squeeze columns (SI_*, SVR_*, CTB_*, Borrow_*, RegSHO_*,
+     SqueezeFlags, SqueezeScore, SI_DataCoverage) from free web sources —
+     FINRA short interest + daily short volume, IBKR shortstock FTP,
+     iBorrowDesk, Nasdaq Reg SHO threshold list. No IBKR API connection.
+     → final 38-column file. Best-effort: a failure leaves the 14-column
+     file intact; re-run the addon standalone to recover.
+     --skip-borrow-history drops the per-symbol iBorrowDesk calls.
 
-  Output columns (12 after ITI_imputer's 2 sidecars; 14 after trade_size_imputer's 2):
+  Output columns (12 after ITI_imputer's 2 sidecars; 14 after trade_size_imputer's 2;
+  38 after ShortInterrest_AddON's 24):
     Symbol | Exchange | Float_M | MarketCap_M | Float_Source
            | LastDailyClosePrice | RTH_avgITI_sec | ETH_avgITI_sec
            [ | ITI_impute_flag | ITI_impute_method ]
            | RTH_tradeSize | ETH_TradeSize
            [ | TradeSize_impute_flag | TradeSize_impute_method ]
+           [ | SI_* ×8 | SVR_* ×4 | CTB_* ×3 | Borrow_* ×4 | RegSHO_* ×2
+             | SqueezeFlags | SqueezeScore | SI_DataCoverage ]
   Step 1 fields (Float_M, MarketCap_M) are NaN when no source had the value.
   Step 2/3 fields are filled with the sentinel 44444 on miss.
 
@@ -111,6 +123,12 @@ _FILTER_MAX_PRICE   = 4.00    # LastDailyClosePrice must be < $4.00
 # (trade_frequency_and_size.addOn.py), so it can't be imported by name — load
 # it by path. Done lazily inside main() to keep import errors local to a run.
 _TRADE_SIZE_ADDON = _SCRIPT_DIR / "trade_frequency_and_size.addOn.py"
+
+# Short-interest enrichment (Step 8) lives in a sibling directory outside this
+# package, so it too is loaded by path. Its `enrich_dataframe(df, ...)` appends
+# the SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/Squeeze columns (24) to the final file.
+_SHORT_INTEREST_ADDON = (
+    _SCRIPT_DIR.parent / "ShortInterrest" / "ShortInterrest_AddON.py")
 
 # Aggregate stdout/stderr log written by the cron line ( `>> cron.log 2>&1` ).
 # Cron's shell is the sole writer, so we cannot use Python's
@@ -175,6 +193,14 @@ def _setup_logging() -> None:
         ib_log.setLevel(logging.WARNING)
         ib_log.addHandler(fh)
 
+        # ShortInterrest_AddON (Step 8) logs to the named logger
+        # "short_interest". Route it into both the per-day file and the
+        # console so the nightly log has the full SI fetch trace.
+        si_log = logging.getLogger("short_interest")
+        si_log.setLevel(logging.INFO)
+        si_log.addHandler(fh)
+        si_log.addHandler(ch)
+
 
 def _batches(seq, n):
     """Yield (start_index, slice) chunks of `seq` of length `n`."""
@@ -192,6 +218,24 @@ def _load_trade_size_addon():
         "trade_frequency_and_size_addOn", _TRADE_SIZE_ADDON)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load trade-size addon at {_TRADE_SIZE_ADDON}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_short_interest_addon():
+    """Load ../ShortInterrest/ShortInterrest_AddON.py by path.
+
+    It sits outside this directory (not importable by name); callers use
+    `.enrich_dataframe`. Loaded lazily inside Step 8 so a missing file or a
+    missing dependency (requests) only costs that step, not the whole run.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ShortInterrest_AddON", _SHORT_INTEREST_ADDON)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Cannot load short-interest addon at {_SHORT_INTEREST_ADDON}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -356,6 +400,19 @@ def main() -> None:
                              "44444-sentinel RTH_tradeSize/ETH_TradeSize rows and "
                              "append 2 provenance sidecars. Independent of "
                              "--no-impute.")
+    parser.add_argument("--no-short-interest", action="store_true",
+                        help="Skip the short-interest enrichment step (Step 8). "
+                             "By default, after the imputers finish, "
+                             "ShortInterrest_AddON.enrich_dataframe appends the "
+                             "24 SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/Squeeze "
+                             "columns in place (free web sources; no IBKR "
+                             "connection). Best-effort: a failure leaves the "
+                             "14-column file intact.")
+    parser.add_argument("--skip-borrow-history", action="store_true",
+                        help="Step 8: skip the per-symbol iBorrowDesk calls "
+                             "(~0.8 s each). Faster, but CTB_FeeDelta5d / "
+                             "Borrow_AvailDelta5dPct / Borrow_UtilProxy stay "
+                             "blank and SqueezeScore loses those components.")
     args = parser.parse_args()
 
     # Legacy --concurrency seeds whichever per-step knob the user didn't set.
@@ -813,6 +870,42 @@ def main() -> None:
             log.exception(f"trade_size_imputer failed: {exc!r} — the file on "
                           f"disk (12-col, raw 44444 sizes) is unaffected; "
                           f"imputation can be re-run manually.")
+
+    # ── Step 8 — append short-interest / squeeze metrics in place ───────────
+    # ../ShortInterrest/ShortInterrest_AddON.enrich_dataframe appends the 24
+    # SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/SqueezeFlags/SqueezeScore/
+    # SI_DataCoverage columns (free web sources only — FINRA, IBKR shortstock
+    # FTP, iBorrowDesk, Nasdaq Reg SHO; no IBKR API connection) → the final
+    # 38-column file. Same read-back-as-strings pattern as Step 6 so the
+    # imputers' formatting of the existing columns is preserved byte-for-byte.
+    # Best-effort like Steps 4/6/7: the sources are flaky external services,
+    # so any failure logs and leaves the 14-column file valid on disk. The
+    # step is also re-runnable standalone:
+    #   /home/tom/venv/bin/python ../ShortInterrest/ShortInterrest_AddON.py \
+    #       -i data/stocks_universe_YYYY-MM-DD.tsv   (writes a _SI.tsv sibling)
+    # Raw downloads are cached per-day under ../ShortInterrest/cache, so a
+    # same-day re-run only repeats the per-symbol iBorrowDesk misses.
+    if args.no_short_interest:
+        log.info("--no-short-interest: skipping short-interest step.")
+    else:
+        log.info(f"Step 8 — appending short-interest / squeeze metrics via "
+                 f"ShortInterrest_AddON ({output_path.name}) …")
+        try:
+            _si = _load_short_interest_addon()
+            disk = pd.read_csv(output_path, sep="\t", dtype=str,
+                               keep_default_na=False)
+            n_cols_before = len(disk.columns)
+            disk = _si.enrich_dataframe(
+                disk, skip_borrow_history=args.skip_borrow_history)
+            disk.to_csv(output_path, sep="\t", index=False)
+            covered = int((disk["SI_DataCoverage"] != "none").sum())
+            log.info(f"Step 8 — appended {len(disk.columns) - n_cols_before} "
+                     f"SI columns (coverage: {covered}/{len(disk)} rows with "
+                     f"any data) → {output_path.name}")
+        except Exception as exc:
+            log.exception(f"Step 8 (short-interest) failed: {exc!r} — the "
+                          f"14-column file on disk is unaffected; re-run "
+                          f"ShortInterrest_AddON.py manually against it.")
 
 
 if __name__ == "__main__":
