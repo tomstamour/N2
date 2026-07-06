@@ -1,0 +1,9 @@
+# clerk-trigger-conditions.txt — per-window trigger conditions, loaded ONCE at
+# clerk startup (edit + restart clerk to change). Times are ET, HH:MM 24h;
+# window end is EXCLUSIVE (06:59 = DEFAULT resumes at exactly 06:59:00).
+# Keys:
+#   lifeTime=mm:ss       mole watch window (surge must fire within this)
+#   finbert_gate=on|off  whether the Sentiment/FinBERT gate is required
+#                        before x-wing places the order
+DEFAULT              lifeTime=02:30  finbert_gate=on
+WINDOW 04:00-06:59   lifeTime=00:10  finbert_gate=off

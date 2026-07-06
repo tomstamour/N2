@@ -3,6 +3,9 @@
 #######################################################################
 
 ### 1. CLERK — warm client pool + trigger listener (start this first)
+#   Loads clerk-trigger-conditions.txt (same dir) ONCE at startup: per-ET-window
+#   mole lifeTime + finbert_gate on/off. Override path with --trigger-conditions.
+#   Edit the file + restart the clerk to change windows.
 path/to/venv/bin/python clerk-1.1.py --client-qty 5 --port 4001 --listen-port 8765
 
 ### TRIGGER the clerk -> launches a trade-mole + x-wing duo on ONE shared client

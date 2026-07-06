@@ -5,11 +5,16 @@ on trigger, hands a buy-signal to an order manager (`x-wing`); a `clerk` runs bo
 together in one process on a single shared ibapi connection.
 
 ## Active scripts
-- **`clerk-1.0.py`** — warm pool of pre-connected ibapi clients (ids 1000–1029).
+- **`clerk-1.1.py`** — warm pool of pre-connected ibapi clients (ids 1000–1029).
   Listens on a TCP/JSON socket for orch-triggers `{ticker, lastDailyClose,
   itiBaseline}`, then runs a trade-mole + x-wing **duo** in-process on one shared
   client. Recycles the client (cancel mkt data + reset) without dropping the socket.
-- **`trade-mole-2.0.py`** — trade-frequency surge detector. Standalone, or **driven**
+  Reads `clerk-trigger-conditions.txt` once at startup: per-ET-window `lifeTime`
+  (mole watch, resolved at collection start) and `finbert_gate` on/off (sentiment
+  gate, resolved at the surge instant; off = surge alone places the order and
+  sentiment messages are ignored). Windows are end-exclusive; missing/malformed
+  file → built-ins (02:30, gate on).
+- **`trade-mole-2.1.py`** — trade-frequency surge detector. Standalone, or **driven**
   by the clerk (ticks injected). Preserves all ITI_baseline calcs/columns; the
   temporary trigger rule is isolated in `IBKRSurgeApp.should_fire()`. Stops
   recording at the buy-signal and calls `buy_signal_callback(last_ask)`.
@@ -21,7 +26,7 @@ See `xmole-commands.txt` for the principal run + trigger commands.
 
 ## Legacy (to be DELETED soon — refactor is done, do not edit or extend)
 - **`X-wing-1.0.py`** → superseded by `x-wing-2.0.py`
-- **`trade_mole_4.1.py`** → superseded by `trade-mole-2.0.py`
+- **`trade_mole_4.1.py`** → superseded by `trade-mole-2.1.py`
 
 ## Notes
 - Run with the venv python that has ibapi: `path/to/venv/bin/python`

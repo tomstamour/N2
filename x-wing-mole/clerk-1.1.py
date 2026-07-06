@@ -45,7 +45,8 @@ import tempfile
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, time as dtime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -98,7 +99,11 @@ MAX_RECONNECT_ATTEMPTS    = 18   # ~3 min of attempts per watchdog tick
 # trade-mole driven-mode artifacts (anchored to the script dir, CWD-independent)
 MOLE_OUTPUT_DIR = str(HERE / "mole-outputs")
 MOLE_LOG_DIR = str(HERE / "mole-logs")
-MOLE_LIFETIME_STR = "02:30"     # watch window (mm:ss, per trade_mole convention)
+MOLE_LIFETIME_STR = "02:30"     # built-in watch window (mm:ss) when no
+                                # trigger-conditions file/DEFAULT applies
+# per-ET-window trigger conditions (mole lifeTime + finbert_gate), loaded ONCE
+# at startup. Missing/malformed file -> built-ins (MOLE_LIFETIME_STR, gate on).
+TRIGGER_CONDITIONS_FILE = str(HERE / "clerk-trigger-conditions.txt")
 DEFAULT_ITI_BASELINE = 44444.00  # used when the orch-trigger has no ITI baseline
 DEFAULT_TRADE_SIZE_BASELINE = 44444.00  # used when the trigger has no trade-size baseline
                                         # (the 44444 sentinel disables the M9 columns)
@@ -121,6 +126,159 @@ def _load_module(mod_name: str, filename: str):
 
 xwing = _load_module("xwing2", "x-wing-2.0.py")
 trademole = _load_module("trademole2", "trade-mole-2.1.py")
+
+
+# --------------------------------------------------------------------------- #
+# Per-ET-window trigger conditions (clerk-trigger-conditions.txt)
+#
+# File format (loaded ONCE at startup; '#' comments allowed; times ET HH:MM;
+# window end is EXCLUSIVE — 06:59 means DEFAULT resumes at exactly 06:59:00):
+#
+#     DEFAULT              lifeTime=02:30  finbert_gate=on
+#     WINDOW 04:00-06:59   lifeTime=00:10  finbert_gate=off
+#
+# lifeTime     mole watch window (mm:ss), resolved when collection starts.
+# finbert_gate on|off — whether the Sentiment/FinBERT gate must confirm before
+#              x-wing places the order, resolved at the surge instant.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Window:
+    start: dtime                    # inclusive
+    end: dtime                      # EXCLUSIVE
+    lifetime_s: "int | None"        # None = inherit from DEFAULT
+    finbert_gate: "bool | None"     # None = inherit from DEFAULT
+    label: str                      # "HH:MM-HH:MM" for logs
+
+
+@dataclass(frozen=True)
+class Resolved:
+    lifetime_s: int
+    finbert_gate: bool
+    window: str                     # matched window label, or "DEFAULT"
+
+
+@dataclass(frozen=True)
+class TriggerConditions:
+    default_lifetime_s: int
+    default_finbert_gate: bool
+    windows: tuple = ()
+    source: str = "builtin"
+
+    @classmethod
+    def builtin(cls):
+        return cls(trademole.parse_lifetime(MOLE_LIFETIME_STR), True)
+
+    def at(self, dt_et: datetime) -> Resolved:
+        """Resolve the regime in force at the given ET instant."""
+        t = dt_et.time()
+        for w in self.windows:
+            if w.start <= t < w.end:
+                life = w.lifetime_s if w.lifetime_s is not None \
+                    else self.default_lifetime_s
+                gate = w.finbert_gate if w.finbert_gate is not None \
+                    else self.default_finbert_gate
+                return Resolved(life, gate, w.label)
+        return Resolved(self.default_lifetime_s, self.default_finbert_gate,
+                        "DEFAULT")
+
+
+def _parse_condition_keys(tokens, lineno):
+    """Parse 'lifeTime=mm:ss' / 'finbert_gate=on|off' tokens; returns
+    (lifetime_s_or_None, gate_or_None). Raises ValueError on anything else."""
+    life, gate = None, None
+    for tok in tokens:
+        key, sep, val = tok.partition("=")
+        if not sep:
+            raise ValueError(f"line {lineno}: expected key=value, got {tok!r}")
+        if key == "lifeTime":
+            if life is not None:
+                raise ValueError(f"line {lineno}: duplicate lifeTime")
+            life = trademole.parse_lifetime(val)    # mm:ss -> seconds
+        elif key == "finbert_gate":
+            if gate is not None:
+                raise ValueError(f"line {lineno}: duplicate finbert_gate")
+            v = val.lower()
+            if v not in ("on", "off"):
+                raise ValueError(
+                    f"line {lineno}: finbert_gate must be on|off, got {val!r}")
+            gate = (v == "on")
+        else:
+            raise ValueError(f"line {lineno}: unknown key {key!r}")
+    return life, gate
+
+
+def load_trigger_conditions(path) -> TriggerConditions:
+    """Parse the trigger-conditions file. Missing file -> WARN + built-ins;
+    any malformed content -> ERROR + built-ins (never a partial config)."""
+    builtin = TriggerConditions.builtin()
+    if not os.path.exists(path):
+        logger.warning("trigger-conditions file %s not found — using built-ins "
+                       "(lifeTime %s, finbert_gate on)", path, MOLE_LIFETIME_STR)
+        return builtin
+    try:
+        have_default = False
+        default_life, default_gate = None, None
+        windows = []
+        with open(path, encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                tokens = line.split()
+                kind = tokens[0]
+                if kind == "DEFAULT":
+                    if have_default:
+                        raise ValueError(f"line {lineno}: duplicate DEFAULT line")
+                    have_default = True
+                    default_life, default_gate = \
+                        _parse_condition_keys(tokens[1:], lineno)
+                elif kind == "WINDOW":
+                    if len(tokens) < 2 or "-" not in tokens[1]:
+                        raise ValueError(
+                            f"line {lineno}: WINDOW needs a HH:MM-HH:MM span")
+                    span = tokens[1]
+                    s_str, _, e_str = span.partition("-")
+                    start = xwing.parse_hhmm(s_str)
+                    end = xwing.parse_hhmm(e_str)
+                    if start >= end:
+                        raise ValueError(
+                            f"line {lineno}: window start must be before end "
+                            f"(midnight-crossing not supported), got {span!r}")
+                    life, gate = _parse_condition_keys(tokens[2:], lineno)
+                    windows.append(Window(start, end, life, gate, span))
+                else:
+                    raise ValueError(
+                        f"line {lineno}: expected DEFAULT or WINDOW, got {kind!r}")
+        for i, a in enumerate(windows):
+            for b in windows[i + 1:]:
+                if a.start < b.end and b.start < a.end:
+                    raise ValueError(f"windows {a.label} and {b.label} overlap")
+    except Exception as e:
+        logger.error("trigger-conditions file %s is malformed (%s) — using "
+                     "built-ins (lifeTime %s, finbert_gate on)",
+                     path, e, MOLE_LIFETIME_STR)
+        return builtin
+
+    if not have_default:
+        logger.warning("trigger-conditions %s has no DEFAULT line — built-ins "
+                       "(lifeTime %s, finbert_gate on) fill the default regime",
+                       path, MOLE_LIFETIME_STR)
+    cond = TriggerConditions(
+        default_life if default_life is not None else builtin.default_lifetime_s,
+        default_gate if default_gate is not None else builtin.default_finbert_gate,
+        tuple(windows), "file")
+    # Echo the effective config so the regime in force is always in the log.
+    logger.info("trigger-conditions (%s): DEFAULT lifeTime=%ds finbert_gate=%s",
+                path, cond.default_lifetime_s,
+                "on" if cond.default_finbert_gate else "off")
+    for w in cond.windows:
+        life = w.lifetime_s if w.lifetime_s is not None else cond.default_lifetime_s
+        gate = w.finbert_gate if w.finbert_gate is not None \
+            else cond.default_finbert_gate
+        logger.info("trigger-conditions: WINDOW %s ET (end exclusive) "
+                    "lifeTime=%ds finbert_gate=%s",
+                    w.label, life, "on" if gate else "off")
+    return cond
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +424,7 @@ class DuoSession:
         self._defer_timer = None     # closed-market: idle-until-04:00 ET timer
         self._defer_target = None    # target datetime (ET) we are deferring to
         self._sentiment_ok = threading.Event()
+        self._sentiment_bypassed = False  # buy-signal fired with finbert_gate off
         self._handlers = []          # logging handlers to detach on finish
         self.output_path = trademole.driven_output_path(MOLE_OUTPUT_DIR, self.symbol)
 
@@ -405,7 +564,12 @@ class DuoSession:
         self.client.reqMktData(MKT_REQ_ID, cd.contract,
                                trademole.GENERIC_TICKS, False, False, [])
 
-        watch = trademole.parse_lifetime(MOLE_LIFETIME_STR)
+        # Watch lifetime is resolved against the ET clock NOW (collection start,
+        # which for deferred overnight duos is 04:00 ET, not trigger arrival).
+        # The finbert_gate shown here is informational only — it is re-evaluated
+        # at the surge instant in on_buy_signal.
+        res = self.clerk.conditions.at(datetime.now(tz=trademole.ET))
+        watch = res.lifetime_s
         self._watch_timer = threading.Timer(watch, self._on_watch_timeout)
         self._watch_timer.daemon = True
         self._watch_timer.start()
@@ -413,27 +577,40 @@ class DuoSession:
         # crash-replay. Drop its durable record (no-op for the open-market path,
         # which never created one).
         self.clerk.store.remove(self.symbol)
-        logger.info("[%s] duo armed on client %d (watch %ds, iti_baseline=%.2f, "
+        logger.info("[%s] duo armed on client %d (watch %ds [window %s, "
+                    "finbert_gate=%s at start], iti_baseline=%.2f, "
                     "trade_size_baseline=%.2f, lastClose=%s)", self.symbol,
-                    self.client.client_id, watch, self.iti_baseline,
+                    self.client.client_id, watch, res.window,
+                    "on" if res.finbert_gate else "off", self.iti_baseline,
                     self.trade_size_baseline, self.last_close)
         return True
 
     # ------------------------------------------------------------------ #
     def on_buy_signal(self, last_ask):
         """Called by trade-mole on the ibapi thread when the surge fires.
-        Cancels the watch window and spawns a sentinel thread that waits for
-        the Sentiment gate before handing off to x-wing."""
+        Cancels the watch window, evaluates finbert_gate at THIS instant, and
+        spawns a sentinel thread that either waits for the Sentiment gate or
+        (gate off) hands off to x-wing immediately."""
+        res = self.clerk.conditions.at(datetime.now(tz=trademole.ET))
         with self._lock:
             if self._buy_fired or self._finished:
                 return
             self._buy_fired = True
+            if not res.finbert_gate:
+                # Set BEFORE the launch thread starts so a racing sentiment
+                # message can never observe fired-but-unflagged.
+                self._sentiment_bypassed = True
             if self._watch_timer is not None:
                 self._watch_timer.cancel()
-        logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — awaiting sentiment gate",
-                    self.symbol, last_ask, self.client.client_id)
+        if res.finbert_gate:
+            logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — awaiting sentiment gate",
+                        self.symbol, last_ask, self.client.client_id)
+        else:
+            logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — finbert_gate "
+                        "OFF (window %s): bypassing sentiment gate",
+                        self.symbol, last_ask, self.client.client_id, res.window)
         t = threading.Thread(target=self._await_sentiment_and_launch,
-                             args=(last_ask,),
+                             args=(last_ask, res.finbert_gate),
                              name=f"sentiment-gate-{self.symbol}", daemon=True)
         t.start()
 
@@ -453,23 +630,30 @@ class DuoSession:
             logger.error("[%s] writing trade-mole output failed: %s",
                          self.symbol, e, exc_info=True)
 
-    def _await_sentiment_and_launch(self, last_ask):
+    def _await_sentiment_and_launch(self, last_ask, gate_on):
         """Sentinel thread: waits for the Sentiment gate then launches x-wing,
-        or aborts the trade on timeout."""
+        or aborts the trade on timeout. With gate_on=False (finbert_gate off at
+        the surge instant) the wait is skipped and x-wing launches immediately."""
         # The mole has stopped recording at the trigger; persist its table now
         # (off the ibapi thread) so the dataset survives regardless of whether
         # the sentiment gate passes or x-wing ever fills.
         self._write_mole_once()
-        confirmed = self._sentiment_ok.wait(timeout=SENTIMENT_TIMEOUT_S)
-        if self._finished:
-            return
-        if not confirmed:
-            logger.warning("[%s] sentiment gate timed out (%.1fs) — aborting trade",
-                           self.symbol, SENTIMENT_TIMEOUT_S)
-            self.finish("sentiment_timeout")
-            return
-        logger.info("[%s] sentiment gate confirmed — launching x-wing (last_ask=%s)",
-                    self.symbol, last_ask)
+        if gate_on:
+            confirmed = self._sentiment_ok.wait(timeout=SENTIMENT_TIMEOUT_S)
+            if self._finished:
+                return
+            if not confirmed:
+                logger.warning("[%s] sentiment gate timed out (%.1fs) — aborting trade",
+                               self.symbol, SENTIMENT_TIMEOUT_S)
+                self.finish("sentiment_timeout")
+                return
+            logger.info("[%s] sentiment gate confirmed — launching x-wing (last_ask=%s)",
+                        self.symbol, last_ask)
+        else:
+            if self._finished:
+                return
+            logger.info("[%s] launching x-wing without sentiment gate (last_ask=%s)",
+                        self.symbol, last_ask)
         self.xwing.on_buy_signal(last_ask)
         t = threading.Thread(target=xwing.run_trade,
                              args=(self.xwing, time.time()),
@@ -673,13 +857,14 @@ class ClientPool:
 # --------------------------------------------------------------------------- #
 class Clerk:
     def __init__(self, host, port, client_qty, listen_host, listen_port,
-                 watchdog_interval=WATCHDOG_INTERVAL_S):
+                 watchdog_interval=WATCHDOG_INTERVAL_S, conditions=None):
         self.host = host
         self.port = port
         self.client_qty = client_qty
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.watchdog_interval = watchdog_interval
+        self.conditions = conditions or TriggerConditions.builtin()
         self.pool = ClientPool()
         self._stop = threading.Event()
         self._server_sock = None
@@ -896,9 +1081,10 @@ class Clerk:
             if rec.get("sentiment") == "ok":
                 session.set_sentiment_ok()
             else:
-                logger.warning("[%s] replayed with sentiment still pending; the "
-                               "sentiment gate will time out if it surges "
-                               "(orchestrator does not re-send sentiment)", symbol)
+                logger.warning("[%s] replayed with sentiment still pending; if it "
+                               "surges while finbert_gate is on, the sentiment "
+                               "gate will time out (orchestrator does not re-send "
+                               "sentiment)", symbol)
 
             target = None
             tgt_str = rec.get("defer_target_et")
@@ -971,15 +1157,30 @@ class Clerk:
                 sentiment = payload.get("Sentiment")
                 with self._sessions_lock:
                     session = self._sessions.get(ticker)
-                if session and sentiment == "OK":
+                if session and session._sentiment_bypassed:
+                    # The duo already fired with finbert_gate off: sentiment has
+                    # no authority over it — BAD must NOT kill the trade.
+                    logger.info("[%s] Sentiment %s ignored: session fired with "
+                                "finbert_gate off", ticker, sentiment)
+                    reply = {"status": "sentiment_ignored_bypass", "symbol": ticker}
+                elif session and sentiment == "OK":
                     session.set_sentiment_ok()
                     reply = {"status": "sentiment_ack", "symbol": ticker}
                 elif session and sentiment == "BAD":
-                    # Bad sentiment: tear the duo down now and return the warm
-                    # client to the pool instead of holding it for the full
-                    # watch window. finish() is idempotent and safe here.
-                    session.finish("sentiment_bad")
-                    reply = {"status": "sentiment_bad_released", "symbol": ticker}
+                    res = self.conditions.at(datetime.now(tz=trademole.ET))
+                    if not res.finbert_gate:
+                        # Gate-off window: the surge is the only trigger
+                        # authority, so a pre-surge BAD is discarded too.
+                        logger.info("[%s] Sentiment BAD ignored: finbert_gate off "
+                                    "in current window (%s)", ticker, res.window)
+                        reply = {"status": "sentiment_ignored_gate_off",
+                                 "symbol": ticker}
+                    else:
+                        # Bad sentiment: tear the duo down now and return the warm
+                        # client to the pool instead of holding it for the full
+                        # watch window. finish() is idempotent and safe here.
+                        session.finish("sentiment_bad")
+                        reply = {"status": "sentiment_bad_released", "symbol": ticker}
                 else:
                     reply = {"status": "sentiment_ignored", "symbol": ticker}
             else:
@@ -1051,6 +1252,10 @@ def main():
                    default=n2_config.get_int(_CFG, "CLERK_PORT", 8765),
                    help="TCP port for orch-triggers (JSON per line; "
                         "default from n2_config_file.txt)")
+    p.add_argument("--trigger-conditions", default=TRIGGER_CONDITIONS_FILE,
+                   help="Per-ET-window trigger-conditions file (lifeTime + "
+                        "finbert_gate), loaded once at startup. Missing or "
+                        "malformed -> built-ins (02:30, gate on).")
     p.add_argument("--watchdog-interval", type=float, default=WATCHDOG_INTERVAL_S,
                    help="Seconds between reconnection-watchdog polls that "
                         "re-warm pool clients after a Gateway restart (0 disables).")
@@ -1066,9 +1271,12 @@ def main():
         logger.warning("PORT %d looks like a LIVE trading port. Real money at risk.",
                        args.port)
 
+    conditions = load_trigger_conditions(args.trigger_conditions)
+
     clerk = Clerk(args.host, args.port, args.client_qty,
                   args.listen_host, args.listen_port,
-                  watchdog_interval=args.watchdog_interval)
+                  watchdog_interval=args.watchdog_interval,
+                  conditions=conditions)
 
     def _sig(signum, frame):
         logger.info("signal %s received -> shutting down", signum)
