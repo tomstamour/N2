@@ -1,0 +1,107 @@
+Connection Management vs Worker Responsibilities
+1. Single Owner for the WebSocket Connection
+You should have one dedicated component (usually one async task) responsible for:
+Opening the WebSocket connection
+Handling reconnection logic
+Sending/receiving ping-pong (heartbeat)
+Logging connection-level events
+async def ws_listener():
+    while True:
+        try:
+            async with connect_ws() as ws:
+                await subscribe(ws)
+
+                async for msg in ws:
+                    handle_message(msg)
+
+        except Exception as e:
+            log("WS error:", e)
+            await asyncio.sleep(1)  # backoff
+👉 This ensures:
+No race conditions
+No duplicated connections
+Clean reconnection strategy
+2. Workers Should Be Stateless (No Connection Logic)
+Worker threads/tasks should NOT:
+Open WebSocket connections
+Handle reconnections
+Send pings
+Maintain persistent state
+They should only:
+Pull messages from a queue
+Fetch the article (HTTP)
+Process the payload
+async def worker():
+    while True:
+        msg = await queue.get()
+        article = await fetch(msg["url"])
+        process(article)
+        queue.task_done()
+👉 Workers are disposable and scalable, not stateful.
+3. HTTP Connections: Shared, Not Per Thread
+Do NOT create a new HTTP client per worker.
+Instead:
+Use a shared session (aiohttp.ClientSession)
+This enables connection pooling and keep-alive
+async with aiohttp.ClientSession() as session:
+    workers = [asyncio.create_task(worker(session)) for _ in range(50)]
+👉 This avoids:
+TCP handshake overhead
+DNS resolution overhead
+Socket exhaustion
+4. Logging Strategy
+Split logging responsibilities:
+Connection layer
+connect / disconnect
+reconnect attempts
+heartbeat failures
+Worker layer
+fetch latency
+failures per URL
+processing errors
+Avoid:
+Logging synchronously inside hot paths
+Excessive logging per message (can become a bottleneck)
+5. Reconnection Strategy (Centralized)
+Only the WebSocket manager should handle:
+Exponential backoff
+Resubscription
+State recovery (if needed)
+backoff = min(backoff * 2, 30)
+Workers should be completely unaware of reconnections.
+6. Ping / Heartbeat
+Handled only at the connection level:
+Either automatic (library-managed)
+Or manual ping every N seconds
+await ws.ping()
+Never do this in workers.
+Final Architecture
+[ WebSocket Task (1) ]
+    - connection
+    - reconnection
+    - ping/pong
+    - lightweight filtering
+            ↓
+        Queue (buffer)
+            ↓
+[ Worker Pool (N) ]
+    - HTTP fetch (shared session)
+    - processing
+    - retry (optional)
+Key Insight
+If each thread manages its own:
+connection ❌
+ping ❌
+reconnection ❌
+You’ll get:
+duplicated streams
+inconsistent state
+higher latency
+possible bans from provider
+Instead, think:
+👉 1 connection, many consumers
+Rule of Thumb
+WebSocket → single, stateful
+Workers → many, stateless
+HTTP → pooled, shared
+This separation is what allows you to scale cleanly under burst load.

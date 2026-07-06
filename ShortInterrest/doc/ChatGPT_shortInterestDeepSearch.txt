@@ -1,0 +1,433 @@
+A “short squeeze detector” isn’t just one indicator—it’s a confluence engine. If you try to rely on a single signal (like high short interest), you’ll mostly catch noise. The edge comes from combining structure (short positioning) + pressure (volume/price) + constraints (liquidity/float).
+
+Here’s a practical, algo-friendly design you can plug into your current IBKR + Python setup.
+
+1. Core idea
+
+A squeeze typically needs 3 conditions at the same time:
+
+(A) Fuel → Shorts trapped
+High short interest %
+High days to cover
+(B) Trigger → Price starts moving up
+Breakout or strong upward momentum
+(C) Constraint → Hard to exit
+Low float / low liquidity
+Sudden volume spike
+2. Metrics to compute
+Structural (slow-moving, update daily)
+SI_percent = short_interest / float
+days_to_cover = short_interest / avg_volume_20d
+Real-time (from IB)
+rel_volume = current_volume / avg_volume_intraday
+price_change_5m
+breakout = current_price > rolling_high
+Optional (high alpha if you can get it)
+Borrow rate
+Utilization (from Ortex)
+3. Detection logic (simple but effective)
+
+You want a scoring model, not a binary rule.
+
+Example scoring:
+def squeeze_score(data):
+    score = 0
+
+    # --- SHORT PRESSURE ---
+    if data.si_percent > 20:
+        score += 2
+    if data.days_to_cover > 3:
+        score += 2
+
+    # --- VOLUME EXPANSION ---
+    if data.rel_volume > 3:
+        score += 2
+    elif data.rel_volume > 2:
+        score += 1
+
+    # --- PRICE ACTION ---
+    if data.price_change_5m > 2:  # %
+        score += 2
+    if data.breakout:
+        score += 2
+
+    # --- FLOAT CONSTRAINT ---
+    if data.float < 50_000_000:
+        score += 1
+
+    return score
+Signal threshold:
+if score >= 7:
+    trigger_squeeze_alert()
+4. Real-time pipeline (fits your setup)
+
+You already:
+
+Receive TradingView alerts
+Use IBKR via ib_insync
+Run a Sanic server
+
+So structure it like this:
+
+Step 1 — Preload static data (daily job)
+universe[symbol] = {
+    "short_interest": ...,
+    "float": ...,
+    "avg_volume_20d": ...
+}
+Step 2 — Stream real-time data (IB)
+
+Track:
+
+Last price
+Volume per second / minute
+Rolling highs
+Step 3 — Compute intraday metrics
+data.rel_volume = current_volume / avg_volume_same_time
+data.price_change_5m = (price_now - price_5m_ago) / price_5m_ago * 100
+data.breakout = price_now > high_30m
+Step 4 — Evaluate continuously
+score = squeeze_score(data)
+
+if score >= 7 and not already_triggered:
+    send_order_or_alert(symbol)
+5. Important refinements (this is where edge comes from)
+Avoid false squeezes
+
+Filter out:
+
+Large caps (unless extreme conditions)
+News-driven spikes (unless that’s your strategy)
+Add acceleration (very powerful)
+
+Instead of just volume:
+
+volume_acceleration = volume_last_1m / volume_prev_1m
+
+if volume_acceleration > 2:
+    score += 1
+Time-of-day effect
+
+Squeezes often happen:
+
+At open (9:30–10:30)
+Midday lull breakouts
+Power hour
+
+You can weight scores by session.
+
+Entry logic (critical)
+
+Don’t enter blindly on detection:
+
+Better trigger:
+
+Breakout + pullback hold
+OR momentum continuation after halt
+6. What most people get wrong
+Using short interest alone → useless
+Ignoring volume expansion → miss real squeezes
+Entering too early → get chopped
+
+The real signal is:
+
+“Shorts are trapped AND forced to act NOW”
+
+7. If you want to push this further
+
+Given your algo focus, the next upgrades would be:
+
+Integrate FINRA short volume (daily) for better proxy timing
+Detect halts (LULD) → very strong squeeze indicator
+Build a multi-timeframe momentum model (1m + 5m + 15m alignment)
+Use order book imbalance (if you add Level 2 later)
+
+If you want, I can 
+turn this into a fully working Python module plugged into your IBKR feed + webhook system (with async handling and state tracking).
+
+How likely is it that the nasdaq short interest data published twice a month can estimate that a stock is likely to be in a short squeeze set up two weeks after the data was published?
+
+Short answer: on its own, the twice-monthly short interest from Nasdaq is a weak predictor of a squeeze two weeks later—but it’s still useful as a background filter.
+
+Let’s break that down more precisely.
+
+1. The core problem: time lag
+
+Short interest data has two layers of delay:
+
+Settlement lag (T+2 style mechanics)
+Publication lag (reported twice a month)
+
+👉 By the time you see it, the data is often:
+
+~5–10 trading days old
+And you’re asking about 2 weeks later, so now you're potentially 15–25 days behind reality
+
+That’s an eternity in short-selling terms.
+
+2. What actually changes in those 2 weeks?
+
+A lot—and this is why predictive power drops:
+
+Shorts are dynamic
+Funds can enter/exit quickly
+Covering can happen in 1–3 sessions
+New shorts can pile in
+A stock with 20% SI can become 40% quickly
+Or drop to 5% just as fast
+
+👉 So the reported number becomes a stale snapshot of positioning
+
+3. What does remain predictive
+
+Even with the lag, short interest still carries structural information:
+
+Reliable signals (persist over weeks):
+Extremely high SI % (e.g. >30–40%)
+High days to cover (>5–7)
+Low float stocks
+
+These don’t change instantly.
+
+👉 This is why stocks like GameStop or heavily shorted small caps can stay “squeeze candidates” for weeks.
+
+4. What is not predictive after 2 weeks
+Exact timing of a squeeze ❌
+Whether shorts have already covered ❌
+Intraday pressure ❌
+
+This is where most strategies fail.
+
+5. Realistic predictive power (quant intuition)
+
+Think of it this way:
+
+Short interest alone (2-week old)
+→ maybe slightly better than random for squeeze detection
+Short interest + real-time triggers
+→ becomes meaningfully predictive
+
+In practical terms:
+
+SI is a necessary condition
+But not a sufficient trigger
+6. How pros actually use it
+
+They treat it like a pre-filter, not a signal:
+
+Step 1 — Build a watchlist
+
+From Nasdaq data:
+
+SI % > 20%
+Days to cover > 3
+Float < threshold
+Step 2 — Wait for fresh signals
+
+From real-time data:
+
+Volume expansion (2–5×)
+Breakout levels
+Momentum acceleration
+Step 3 — Act only when both align
+
+This is the key:
+
+Old positioning + new pressure = squeeze
+
+7. Your specific setup (important insight)
+
+Since you're working with:
+
+IBKR real-time data
+Intraday signals
+
+👉 You’re actually in a good position to compensate for stale SI
+
+You can:
+
+Use SI as a slow-moving prior
+Use IB data as the timing engine
+8. If you want to improve accuracy significantly
+
+Add one of these:
+
+1. Short volume (daily, FINRA)
+
+Gives more recent short activity
+
+2. Borrow rate / utilization
+
+From Ortex
+→ tells you if shorts are under pressure now
+
+3. Intraday volume anomalies
+
+Your strongest real-time proxy
+
+9. Bottom line
+2-week-old short interest ≠ timing tool
+But it’s still very useful to identify “loaded spring” setups
+
+A good mental model:
+
+Short interest tells you where a squeeze can happen
+Real-time data tells you when it is happening
+
+If you want, I can help you quantify this (e.g., backtest: “probability of +20% move within 5 days given SI% + volume spike”) using your existing data pipeline.
+
+MOre details about this, Short volume (daily, FINRA), is that free?
+
+Yes — FINRA short volume data is free, and it’s actually one of the most useful (and misunderstood) datasets you can plug into a squeeze detector.
+
+Let’s break it down properly so you can use it correctly.
+
+1. Is FINRA short volume free?
+
+Yes.
+The FINRA publishes it publicly:
+
+Daily downloadable files (TXT/CSV)
+Available the same day around ~6pm ET
+
+Free for non-commercial use
+
+👉 You can literally download it every day and feed it into your algo.
+
+2. What exactly is “short volume”?
+
+This is where most people go wrong.
+
+Definition:
+It’s the number of shares sold short during a given day
+Aggregated per stock
+
+BUT:
+
+👉 It is flow (activity), not position
+
+3. Short volume vs short interest (critical distinction)
+Metric	Meaning	Update frequency
+Short Interest	Total open short positions	2x/month
+Short Volume	Shares sold short that day	Daily
+
+FINRA explicitly warns:
+
+Short volume ≠ short interest
+
+Why?
+
+A short trade can be opened and closed the same day
+So it shows up in volume…
+But never appears in short interest
+4. What data you actually get
+
+From FINRA daily files:
+
+For each stock:
+
+short_volume
+total_volume (FINRA-reported subset)
+date
+
+👉 You can compute:
+
+Short Volume Ratio=
+total volume
+short volume
+	​
+
+5. Important limitation (this is big)
+
+FINRA data:
+
+Covers mainly off-exchange trades (dark pools, TRFs)
+Does NOT include all exchange trades
+Is not consolidated
+
+👉 So:
+
+It is incomplete, but still very useful as a signal
+
+6. Why traders still use it
+
+Because it gives something short interest does NOT:
+
+👉 Timing
+
+Short interest:
+
+Tells you who is trapped
+
+Short volume:
+
+Tells you what shorts are doing right now
+7. How to use it in a squeeze detector (practical edge)
+
+Here’s where it becomes powerful.
+
+Key signal:
+Rising short volume + rising price
+
+That means:
+
+Shorts are still entering → but price is going up → they’re getting trapped
+
+Example logic:
+short_ratio = short_volume / total_volume
+
+if short_ratio > 0.5 and price_up:
+    signal += "potential trap building"
+Even stronger signal:
+
+Track multi-day behavior:
+
+if short_ratio_today > short_ratio_yesterday and price_up:
+    signal += "increasing short pressure"
+8. The real “edge” use-case
+
+Combine:
+
+1. Old short interest (structure)
+SI % > 20%
+2. Recent short volume (flow)
+Elevated or rising
+3. Real-time trigger
+Volume spike (IBKR)
+Breakout
+
+👉 This combination is far more predictive than SI alone.
+
+9. What NOT to do (very important)
+
+Don’t assume:
+
+“50% short volume = 50% of trades are new shorts” ❌
+“High short volume = high short interest” ❌
+
+Because:
+
+Market makers generate short volume for liquidity
+Positions can close same day
+10. How it fits your system
+
+Given your setup (IB + Python + real-time alerts), you can:
+
+Daily batch job:
+Download FINRA file
+Store per-symbol short volume
+Real-time:
+Combine with:
+IB volume
+Price momentum
+Output:
+“Short pressure increasing” flag
+11. Bottom line
+✅ Free and accessible
+✅ Daily update (huge advantage vs short interest)
+❌ Incomplete and noisy
+
+But:
+
+Short volume is not a replacement for short interest —
+it’s the missing real-time layer that makes squeeze detection actually work.

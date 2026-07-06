@@ -1,0 +1,260 @@
+# Short Interest Metrics for Small-Float US Stocks — Conceptual & Architectural Overview (Free Sources + IBKR Level 1)
+
+## TL;DR
+- For small-float momentum/squeeze plays the highest-signal metrics are **Short % of Float**, **Days to Cover (DTC)**, **Cost to Borrow (CTB)**, and **Utilization** — but only the first two are reliably obtainable from free sources (FINRA bi-monthly + free volume APIs); CTB and Utilization on the cheap require scraping IBKR's `shortstock` FTP feed, iBorrowDesk, or Finviz, since IBKR's Level 1 subscription does not expose them as API ticks.
+- IBKR's TWS API with Level 1 gives you live bid/ask/last/volume plus, via **generic tick 236**, two proprietary "shortability" signals — `Shortable` (tick 46, a coarse 1/2/3 indicator) and `ShortableShares` (tick 89, the actual count of shares IBKR has located to lend). It does **not** stream short interest, fee rate, or utilization; those live in IBKR's Stock Loan / Borrow (SLB) FTP file (`ftp3.interactivebrokers.com`, user `shortstock`, file `usa.txt`) and in TWS Mosaic / Fundamentals Explorer columns.
+- A clean pipeline joins three time-cadences on `ticker`: (1) bi-monthly short interest from FINRA's free API, (2) daily volume + float from yfinance / Finviz / IBKR `reqHistoricalData`, and (3) intraday borrow-availability/fee from the IBKR `shortstock` FTP (or iBorrowDesk's hidden JSON endpoint as a backup). Cache the bi-monthly file for ~14 days, the float ~weekly, and refresh borrow data every 15–30 min during RTH.
+
+---
+
+## Key Findings
+
+### 1. Short Interest variants — what to actually compute
+
+| Metric | Definition | Cadence available free | Squeeze relevance for small-float |
+|---|---|---|---|
+| **Short Interest (raw)** | Total shares sold short and not yet covered | Bi-monthly (FINRA) | Low on its own |
+| **Short % of Float** | `sharesShort / floatShares` | Bi-monthly (derived) | **Highest** — small floats with >20% are squeeze fuel |
+| **Short % of Outstanding** | `sharesShort / sharesOutstanding` | Bi-monthly (derived) | Lower-quality version of % Float; useful when float is unreliable |
+| **Days to Cover (DTC)** = Short Interest Ratio | `sharesShort / avgDailyVolume` | Bi-monthly SI ÷ daily volume | **Very high** — DTC > 5 with low ADV is structural pressure |
+| **Utilization** | On-loan shares ÷ shares available to lend (institutional definition) | Not reliably free; ORTEX/IBKR pay-walled. IBKR exposes a `Utilization` column inside TWS Mosaic, but not via API | Best demand-side gauge; >80% precedes squeezes |
+| **Cost to Borrow (CTB / Fee Rate)** | Annualized fee paid by short to borrow stock (APR) | IBKR `shortstock` FTP (current only); iBorrowDesk historical (free, scraped) | **Critical**: CTB > 30% is documented (D'Avolio 2002 / Meridian) as 3× more likely to precede a forced cover within 30 days |
+| **Shares Available to Borrow** | Shares the broker has located | IBKR FTP / IBKR API tick 89 (live) | A live proxy when SI data is stale |
+| **Daily Short-Sale Volume / Short Volume Ratio** | Reported short-marked trades ÷ total volume per day (FINRA TRF/ADF/ORF feed) | Daily (free) | Useful intraday sentiment indicator; **NOT** equal to short interest |
+| **Fails-to-Deliver (FTD)** | Aggregated unsettled CNS positions | Bi-monthly (SEC) | Naked-short / squeeze tell when persistent |
+
+For small-float momentum specifically, the highest-edge composite is: **(a)** Short % of Float ≥ 20%, **(b)** DTC ≥ 3–5, **(c)** rising CTB / falling shares-available-to-borrow, **(d)** float < ~50M, **(e)** an actual catalyst. (See the Meridian and Traders Agency frameworks.) Note that Short % of Float alone is documented as a weaker forward-return signal than demand/supply factors like utilization (MSCI / IHS Markit research) — but utilization is hard to obtain free.
+
+### 2. Free data sources — endpoints, fields, and how stale they really are
+
+#### FINRA Equity Short Interest (the canonical bi-monthly file)
+- **Cadence**: Bi-monthly. Settlement dates are the 15th and the last business day of each month; reported by 6 PM ET on the second business day after settlement; **published on the 7th business day** after settlement (i.e., expect a ~9–10 calendar-day lag from settlement to publish, ~16–24 days from "last reliable" data point to "today").
+- **Coverage history**: Pre-June 2021 covered OTC only; from June 2021 forward covers all exchange-listed and OTC equities.
+- **Web grid + downloads**: `https://www.finra.org/finra-data/browse-catalog/equity-short-interest/data` (interactive grid: 5 rolling years; pipe-delimited downloadable text for OTC/Other-OTC at `https://otce.finra.org/otce/equityShortInterest`).
+- **API (free, no auth required for many datasets)**: `POST https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized` (the older `EquityShortInterest` dataset was deprecated April 30, 2021). Filter with a JSON body, e.g.:
+  ```
+  { "compareFilters":[
+      {"compareType":"EQUAL","fieldName":"securitiesInformationProcessorSymbolIdentifier","fieldValue":"AAPL"}
+  ], "limit":5000 }
+  ```
+- **Returned fields include**: `issueSymbolIdentifier`, `settlementDate`, `issueName`, `marketCategoryCode`, `currentShortShareNumber`, `previousShortShareNumber`, `changePercent`, `percentageChangefromPreviousShort`, `averageShortShareNumber` (the FINRA-supplied average daily volume), and a days-to-cover field.
+- **Other "consolidated" view**: `developer.finra.org` exposes a `Consolidated Short Interest` dataset combining OTC submissions across exchanges.
+
+#### FINRA Reg SHO Threshold Securities List
+- **Cadence**: Daily.
+- **Definition**: Securities with aggregate fails-to-deliver ≥ 10,000 shares **and** ≥ 0.5% of outstanding shares for 5 consecutive settlement days. Inclusion is a hard signal of persistent settlement failure (often correlated with squeeze pressure).
+- **Free locations**:
+  - Exchange-listed (NYSE/Nasdaq/Cboe BZX) via `https://www.nasdaqtrader.com/dynamic/symdir/regsho/nasdaqth<YYYYMMDD>.txt` (file format: `Symbol|Security Name|Market Category|Reg SHO Threshold Flag|Rule 3210|Filler`). Cboe BZX has its own at `cboe.com/us/equities/market_statistics/reg_sho_threshold/`.
+  - OTC at `https://otce.finra.org/otce/RegSHOThreshold/archives` (text archives) or via FINRA Data API.
+
+#### FINRA Reg SHO **Daily Short Sale Volume** files (different from short interest!)
+- **Cadence**: Same-day, posted by 6:00 PM ET.
+- **Format** (pipe-delimited): `Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market` where Market ∈ {N=NYSE TRF, Q=Nasdaq TRF Carteret, B=Nasdaq TRF Chicago, D=ADF, …}.
+- **Endpoint**: `https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files`; Query API at `https://developer.finra.org/docs/api-explorer/query_api-equity-reg_sho_daily_short_sale_volume`.
+- **Critical caveat (FINRA's own warning)**: This is **off-exchange (TRF/ADF/ORF) trades only**, **not consolidated with exchanges**, and includes only publicly disseminated trades. It does NOT equal short interest — it's daily flow, not stock. Use it as a sentiment/pressure tell, not as a replacement for SI.
+
+#### SEC Fails-to-Deliver (FTD)
+- **Cadence**: Bi-monthly ZIP files at `https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data` named `cnsfailsYYYYMMa.zip` (first half) and `cnsfailsYYYYMMb.zip` (second half).
+- **Fields**: settlement date, CUSIP, symbol, issuer name, price, total fails-to-deliver shares.
+- Useful for squeeze radar, especially together with the Reg SHO Threshold List.
+
+#### Yahoo Finance / `yfinance`
+- **`Ticker.info` fields relevant to short interest**: `sharesShort`, `sharesShortPriorMonth`, `sharesShortPreviousMonthDate` (UNIX), `dateShortInterest` (UNIX, the FINRA settlement date), `sharesPercentSharesOut`, `shortRatio` (= days to cover by Yahoo's calculation), `shortPercentOfFloat`, `floatShares`, `sharesOutstanding`, `impliedSharesOutstanding`.
+- **Staleness**: Yahoo's short interest fields are sourced from FINRA's bi-monthly report, so expect ~2–3 weeks of lag from "today" to the as-of date in `dateShortInterest`. Volume / `averageVolume` / `averageVolume10days` are daily-current.
+- **Reliability caveats**: yfinance is unofficial, scrapes Yahoo, and has been flaky since early 2024 (rate-limiting, occasional incorrect values reported in GitHub issues). Cache aggressively; expect periodic breakage; have a fallback. `shortPercentOfFloat` and `sharesPercentSharesOut` can occasionally appear wrong — recompute yourself from `sharesShort/floatShares` and `sharesShort/sharesOutstanding` whenever possible.
+
+#### Finviz
+- **No official API**. Two practical paths: (a) scrape `https://finviz.com/quote.ashx?t=<TICKER>` (HTML table), (b) use the unofficial `finviz` PyPI package by `mariostoev` or `pyfinviz`. Also note **Finviz Elite** ($24.96–39.50/mo) provides an authenticated CSV/Screener export endpoint via `screener.ashx?…&ft=4` for paid users.
+- **Fields available per ticker**: `Short Float` (= short % float), `Short Ratio` (= DTC), `Shs Outstand`, `Shs Float`, `Shortable` (Y/N), plus `Avg Volume`, `Rel Volume`, etc.
+- **Quote delay**: 15 min NASDAQ, 20 min NYSE/AMEX. Short interest values are FINRA-derived (same bi-monthly cadence). Finviz's screener filters for `sh_short_*`, `sh_float_u20`, `sh_curvol_*` make pre-screening small-float candidates trivial.
+- **TOS warning**: Finviz's terms restrict scraping; use responsibly and rate-limit (≤ ~1 req/sec). For a 50–500 ticker watchlist, Finviz Elite's CSV export is the cleanest legal channel.
+
+#### Stockanalysis.com / Macrotrends / Nasdaq.com / Barchart
+- **Stockanalysis.com**: `https://stockanalysis.com/list/most-shorted-stocks/` and per-ticker statistics pages contain Short Interest, Short % of Float, Short % of Shares Outstanding, Days to Cover, with FINRA bi-monthly cadence. No public API; HTML scrape only.
+- **Nasdaq.com short interest pages** (`https://www.nasdaq.com/market-activity/stocks/<ticker>/short-interest`): tabular bi-monthly history of SI, settlement date, avg daily share volume, days to cover. Sourced from Nasdaq Data Link (paid for raw API).
+- **Macrotrends / MarketBeat**: similar bi-monthly tables, scrape-only.
+- **Barchart Short Interest Stocks page**: lists Short Float, Short Interest, 20-day avg volume, days to cover, short volume ratio, short date — also scrape.
+
+#### IBKR's `shortstock` FTP — the single best free source of CTB and live availability
+- **Endpoint**: `ftp://shortstock@ftp3.interactivebrokers.com/usa.txt` (no password). Pipe-delimited; first row is a metadata/timestamp header to skip. Documented in IBKR KB article 2024.
+- **Per-row contents** (effectively): Symbol, Currency, Name, Con ID, Shares Available (rebate / fee proxy), Fee Rate, Rebate Rate (negative = cost), Country and similar columns. Reflects what IBKR will let you locate **right now**; updates intraday.
+- **Historical**: not retained on the FTP. iBorrowDesk (`https://iborrowdesk.com/api/ticker/<SYMBOL>`) scrapes IBKR every 15 min and stores history; their JSON has `available`, `fee`, `rebate`, `high_available`, `high_fee`, etc., per day.
+- **Practical: this is the closest thing to a free CTB and availability feed for US equities.**
+
+#### Other legitimate free sources worth flagging
+- **Finnhub free tier**: `/stock/short-interest` (60 calls/min on free; FINRA bi-monthly cadence). API key required.
+- **Quiver Quantitative / Fintel** (limited free tier, paid for full): squeeze scores, off-exchange short volume.
+- **shortsqueeze.com / highshortinterest.com**: human-readable, mostly free; no API.
+- **NasdaqTrader.com FTP** (`ftp://ftp.nasdaqtrader.com/SymbolDirectory/`): not short interest itself, but `nasdaqlisted.txt` and `otherlisted.txt` are essential for ticker universe and float-share resolution.
+
+### 3. What IBKR Level 1 actually gives you over the API
+
+#### Default Level 1 ticks (no generic tick required, work with any L1 subscription)
+Tick IDs returned through `EWrapper.tickPrice` / `tickSize` / `tickString`:
+- `0` Bid Size, `1` Bid Price, `2` Ask Price, `3` Ask Size
+- `4` Last Price, `5` Last Size, `6` High, `7` Low, `8` **Volume** (intraday cumulative; multiplier 100 for US stocks)
+- `9` Close (prior day, dividend/split-adjusted by IBKR)
+- `14` Open, `45` Last Timestamp, `49` Halted
+
+#### Useful generic ticks for L1 (request via `genericTickList` parameter of `reqMktData`)
+- **`165`** "Misc Stats" → ticks `15–20` (13/26/52-week high/low) and tick **`21` Average Volume (90-day daily, multiplier 100)** — handy for computing DTC against IBKR-native ADV.
+- **`233`** RTVolume / **`375`** RTTradeVolume → live trade-by-trade volume (needed if `8` is too coarse).
+- **`236`** "Shortable" group → tick **`46` Shortable** (coded value: ≤1.5 = not shortable; >1.5 ≤2.5 = locate required, hard-to-borrow; >2.5 = ≥1000 shares available, easy to borrow) and tick **`89` ShortableShares** (exact share count available to short at IBKR; requires TWS 974+).
+- **`258` / `47`** Fundamentals ratios → P/E, market cap, etc. **Does NOT contain short interest, CTB, or utilization.**
+- `292` News, `293/294/295` trade rate, `588` futures OI.
+
+#### What Level 1 + the API does **not** expose
+- **No short interest** (FINRA value) field
+- **No fee rate / cost-to-borrow** field via `reqMktData`
+- **No utilization rate** field via `reqMktData`
+- **No "shares on loan"** field
+
+These short-borrow analytics are visible **inside TWS** in:
+- The Order Entry "Shortable" button hover (fee rate + shares),
+- The Stock Loan/Borrow (SLB) rates window (intraday with 1m/3y history charts),
+- The "Short Selling" column group on watchlists (Shortable Shares, **Fee Rate**, **Rebate Rate**, **Utilization**),
+- The "Short Selling" tab of Fundamentals Explorer (with historical fee chart and utilization),
+- The Client Portal "Short-Securities Availability" tool (lists by country, indicative borrow rate, lender count).
+
+These TWS features draw from IBKR's internal SLB system, which is what gets externalized in the **`shortstock` FTP feed** (`ftp3.interactivebrokers.com`, user `shortstock`, file `usa.txt`). For programmatic access to fee rate, you must use the FTP feed (or iBorrowDesk as a wrapper); the regular TWS API will not give it to you, regardless of which Level-1 data subscription you hold.
+
+#### IBKR subscriptions to know
+- **Level 1 streaming for US stocks** = the per-network bundles (Network A NYSE, Network B ARCA/AMEX, Network C NASDAQ) or "US Securities Snapshot Bundle" for snapshots (not streaming). Does not unlock any extra short-side fields.
+- IBKR's "**Short Stock Availability**" / SLB tool is account-feature based, **not** a market-data subscription. Anyone with an active brokerage account (paper or live) gets it via Client Portal and the FTP user `shortstock`. For automation, use the FTP feed.
+
+### 4. Calculation logic & pitfalls
+
+#### Core formulas
+- **Short % of Float** = `sharesShort_FINRA / floatShares` (× 100). Use FINRA's most recent `currentShortShareNumber` for the numerator and Finviz/yfinance/Nasdaq for the denominator.
+- **Short % of Outstanding** = `sharesShort_FINRA / sharesOutstanding`. Always compute both — they diverge sharply for high-insider-ownership stocks.
+- **Days to Cover (DTC)** = `sharesShort_FINRA / averageDailyVolume_N`. Two reasonable choices for ADV: (i) FINRA's own `averageShortShareNumber` shipped in the SI record, or (ii) a fresh 20- or 30-day rolling ADV from yfinance/IBKR (`reqHistoricalData` daily bars or generic tick 165 → tick 21). For squeeze-watching, **a fresh shorter ADV (10–20 day) over yesterday's close is more responsive** than FINRA's reported value.
+- **Utilization (free proxy)** ≈ `1 – (IBKR_shortable_shares_today / max_shortable_shares_observed)` — crude, but the only thing you can build without a paid feed.
+- **CTB**: take it directly from IBKR `usa.txt` "Fee Rate" column. iBorrowDesk's JSON `fee` field is annualized %.
+
+#### Freshness considerations and how they conflict
+- FINRA SI is a snapshot from 16–24 days ago. Yahoo/Finviz/Stockanalysis are all rebadging the same FINRA snapshot, so cross-checking them does **not** give you fresher data, just a sanity check on the value.
+- Daily volume can shift 5–10× within days for small-float names, so **DTC computed today using FINRA SI from 18 days ago and ADV from today can be wildly different from DTC at the SI's settlement date.** Many practitioners report two DTC numbers: "DTC at settlement" (using FINRA's ADV) and "DTC today" (using current 10/20-day ADV). The latter is more useful for squeeze monitoring.
+- Reg SHO daily short volume (today) + IBKR borrow availability (today) + last FINRA SI (≤ 24 days old) is the best assemblable triangulation.
+
+#### Pitfalls specific to small-float / momentum names
+- **Float vs shares outstanding mismatch**: Float numbers from yfinance, Finviz, and Nasdaq routinely disagree by 10–40% for micro-caps. Yahoo's `floatShares` is often stale post-secondary offerings; Finviz tends to update faster. After any S-1/S-3 secondary, ATM-issuance, or PIPE conversion, **all three can be wrong for weeks**. Cross-check against the latest 10-Q cover-page share count from EDGAR for any high-conviction name.
+- **Adjusted vs unadjusted volume after splits**: yfinance returns split-adjusted history by default (`auto_adjust=True` in newer versions). For DTC you want **unadjusted** daily volume (or you must split-adjust the FINRA SI numerator the same way). IBKR's `reqHistoricalData` lets you choose `whatToShow="TRADES"` and unadjusted; be explicit.
+- **Reverse splits** (extremely common in small-cap squeeze candidates): a 1-for-10 reverse split shrinks both `sharesShort` and `floatShares` by 10× on the effective date — but FINRA's pre-split SI value won't be retroactively adjusted, and yfinance often back-adjusts only price, not share counts. Always validate that the SI settlement date's effective-date split factor has been applied before computing % of float across a split boundary.
+- **Ticker changes / reorgs**: SPACs, mergers, and ticker changes break joins. Anchor on CUSIP (in FINRA SI and SEC FTD) or IBKR `conId` instead of ticker where possible.
+- **OTC vs exchange-listed coverage gap**: pre-June 2021 FINRA SI covered OTC only; if you backtest pre-2021, NMS-listed names show no SI in FINRA's free file — you'd need Nasdaq/NYSE proprietary feeds for that history.
+- **"Volume" definitions in IBKR**: tick 8 ("native volume") includes delayed/busted/combo ticks; RTVolume includes odd lots and average-price prints; `reqHistoricalData` matches charts. Pick one and stick with it; mixing produces ghost DTC noise.
+- **Reg SHO daily short volume ≠ short interest ≠ shares borrowed**: many retail/Reddit analyses confuse these. For squeeze logic, treat short volume ratio as a flow indicator (sentiment) and SI as a stock indicator (positioning).
+
+### 5. Architecture for the coding phase
+
+#### Suggested 3-tier pipeline (free + IBKR Level 1)
+
+**Tier A — slow / bi-monthly snapshot (cron once per FINRA settlement publish, ~14 days):**
+1. Pull the latest `equityShortInterestStandardized` rows from FINRA's API for your watchlist (one POST with a comma-list filter on `securitiesInformationProcessorSymbolIdentifier`, or pull the full file and join locally — full file is small enough).
+2. Persist to a `short_interest` table keyed `(ticker, settlement_date)` with `sharesShort`, `prevSharesShort`, `avgDailyVolume_FINRA`, `daysToCover_FINRA`.
+3. Pull SEC `cnsfails<YYYYMM><a|b>.zip` and persist FTDs by `(cusip, settlement_date)`.
+
+**Tier B — daily snapshot (cron once after 6 PM ET):**
+1. Fetch FINRA Reg SHO daily short volume (consolidated TRF/ADF) for today's date; compute `short_volume_ratio = ShortVolume / TotalVolume` per ticker.
+2. Refresh float and shares-outstanding from Finviz Elite CSV (or scraped Finviz/yfinance/Stockanalysis as fallback) — update once daily, not intraday.
+3. Refresh Reg SHO Threshold list (`nasdaqthYYYYMMDD.txt` + OTC list); flag any watchlist tickers present.
+4. Pull adjusted daily bars (last 30 days) from IBKR `reqHistoricalData` (TRADES, useRTH=1, 1 day) for each ticker, compute 10/20/30-day ADV.
+
+**Tier C — intraday (every 15–30 minutes during RTH; on-demand pre-trade):**
+1. Download `ftp://shortstock@ftp3.interactivebrokers.com/usa.txt`; parse pipe-delimited rows; persist `(ticker, ts)` → `shortable_shares_ibkr`, `fee_rate`, `rebate_rate`.
+2. For active watchlist tickers, `reqMktData(contract, "165,236", false, false, [])` → captures generic ticks 21 (avg vol), 46 (shortable code), 89 (shortable shares), plus default L1 prints.
+3. (Optional fallback / cross-check) hit `https://iborrowdesk.com/api/ticker/<SYM>` for the latest `fee` and `available`.
+
+#### Joining and storage
+- Primary key on `ticker`, secondary on `cusip` for SEC/IBKR joins. Maintain a `ticker_aliases` table mapping historical ticker changes (Nasdaq's `otherlisted.txt` carries effective-date metadata).
+- Time-series tables: `short_interest_si` (bi-monthly), `short_volume_daily`, `borrow_intraday`, `bars_daily`. Compute derived metrics in a view: `dtc_today`, `short_pct_float`, `borrow_delta_30m`.
+- Keep raw files in object storage (S3, local) with date-stamped filenames so the pipeline is replayable for backtests.
+
+#### Caching strategy
+- **Bi-monthly SI**: cache for 14 days; invalidate on next scheduled FINRA publish date (well-known calendar). Do not re-pull intraday.
+- **Float / shares outstanding**: cache 1–7 days; force refresh on any FINRA SI publish day or any scheduled earnings/secondary date for that ticker.
+- **Daily volume / bars**: cache by `(ticker, date)`; one daily refresh after 4:30 PM ET.
+- **IBKR borrow file**: cache 15–30 min during RTH; 1 hour overnight.
+- **Live ticks**: ephemeral; persist only summary snapshots (close-of-bar) to keep storage manageable.
+
+#### Batch processing for 50–500 tickers
+- IBKR API: respect `reqMktData` simultaneous-streamer limits (default 100 streams, scalable with the "API Order Type" market-data lines you've paid for). For >100 tickers, **rotate**: subscribe in batches of N, wait for first ticks of generic 236 (89 ShortableShares ticks are infrequent — allow 5–15 sec per batch), `cancelMktData`, advance.
+- yfinance: prefer `yf.download()` with multiple tickers in a single call for prices; for `.info` fields use a thread pool (4–8 workers) but keep total req-rate < ~30/min to avoid blacklisting.
+- FINRA API: a single POST returns all tickers at a settlement date — preferred over ticker-by-ticker. Use `Accept: text/plain` for CSV to keep payload small; filter by `settlementDate` and post-filter your watchlist locally.
+- Finviz: if not Elite, batch scrape with random delays (≥1 s); if Elite, hit the screener export `screener.ashx` with `ft=4&v=152&...&c=...` for a CSV of all tickers in one call.
+
+#### Squeeze-flag composite (a worked logic outline)
+A simple ranker that produces a 0–100 score, weighted toward what the data can actually support free:
+1. **+25** if `short_pct_float >= 0.20`; **+15** more if `>= 0.30`.
+2. **+15** if `dtc_today >= 5`; **+10** more if `>= 10`.
+3. **+15** if `cost_to_borrow_pct >= 30`; **+15** if `>= 80`.
+4. **+10** if `shortable_shares_ibkr` has dropped >50% over the last 5 trading days (supply tightening).
+5. **+10** if `float < 50_000_000`.
+6. **+10** if ticker on Reg SHO Threshold list **or** has rising FTDs across the last two SEC bi-monthly files.
+7. **+5** if recent 5-day `short_volume_ratio` rising and price holding/rising (divergence — bears adding into strength).
+8. Hard veto: drop score to 0 if avg daily $-volume < some liquidity floor (e.g., $1M/day) — squeezes need a market.
+
+Threshold heuristic (consistent with Meridian / Traders Agency / kavout literature): name is "watchable" at >= 50, "actionable" at >= 75 with a fundamental/news catalyst within ~5 trading days.
+
+---
+
+## Caveats
+
+- **All "free" CTB and utilization data is a single-broker proxy** (IBKR's SLB book). It is not the consolidated stock-loan market. ORTEX, S3 Partners, Hazeltree, and DataLend aggregate across prime brokers and produce more accurate utilization — but those are paid. For a retail algo, IBKR's view is what your trade will actually face, so this proxy is fit-for-purpose for execution decisions even if not for "true" market signals.
+- **FINRA short interest lag is structural and unavoidable** in free data. Estimated/intraday SI from ORTEX, S3, and Markit Securities Finance is paid only; their public marketing material claims real-time estimates but with no public methodology. Build your strategy assuming SI is ~2–3 weeks stale.
+- **IBKR API generic tick 89 (`ShortableShares`) update cadence is irregular.** IBKR's documentation and community examples note "there will be a delay before the generic tick event fires and future updates are not infrequent." It's a polled value, not a true tick. Don't expect tick-level resolution; treat it as a 5–30 minute proxy.
+- **Tick 46 (`Shortable`) is coded, not numeric.** Values 1/2/3 (≤1.5, 1.5–2.5, >2.5) — many engineering blog posts misread these as direct counts. Always combine 46 + 89.
+- **Finviz, yfinance, stockanalysis.com all ultimately republish FINRA data**, so they share the same as-of date. Cross-checking them validates correctness but does not freshen the signal.
+- **Reg SHO daily short sale volume is repeatedly misinterpreted** as short interest in retail commentary. FINRA itself publishes notices warning about this. It's daily flow, off-exchange-only, public-disseminated trades — useful as one of several inputs, never as a SI substitute.
+- **Yfinance reliability has been declining**. Yahoo tightened anti-scraping in 2024–2025; expect periodic API breakage. Have a fallback path for every yfinance field you depend on (Finviz / Stockanalysis / direct Nasdaq scraping / IBKR fundamentals XML via `reqFundamentalData` for shares outstanding).
+- **Finviz scraping may violate their Terms of Service**; the `mariostoev/finviz` package readme explicitly notes this. Finviz Elite's official CSV export is the cleanest legal channel if you trade on this stack commercially.
+- **iBorrowDesk uses an unofficial / undocumented endpoint** (`/api/ticker/<SYM>`); it could change without notice. Treat it as best-effort, not contractual.
+- **The IBKR `shortstock` FTP file is "indicative only and subject to change"** per IBKR's own disclosures, especially intraday and on volatile names — actual locate availability is determined when you place the order.
+- **OTC microcaps under IBKR's "US Microcap Stock Restrictions"** have buy-side restrictions (no buy-cover for restricted longs, etc.) that interact strangely with squeeze plays — read the IBKR microcap policy before trading these. Some OTC small-floats are simply not shortable at IBKR regardless of what FINRA SI says.
+- **Not all academic / vendor research agrees that high SI is bullish**. MSCI's 2017 paper and subsequent research show pure short-interest-as-factor produces mixed results; the alpha-bearing variants are demand/supply ratio and active utilization — both paid only. Take the squeeze-screening framework above as a momentum/event-driven setup tool, not a long-horizon factor.
+
+
+
+When you said "Critical: CTB > 30% is documented (D'Avolio 2002 / Meridian) as 3× more likely to precede a forced cover within 30 days" Do you mean that this metric as the best power to predict a short squeeze?
+Reconsidered claim specificity and acknowledged uncertainty about attribution
+
+Good catch to push back on that — I should be more precise and honest about it.
+
+The "3× more likely" framing was too strong and too specific as stated. Here's what's more accurate:
+What D'Avolio (2002) Actually Says
+
+D'Avolio's paper is about the stock loan market, not squeeze prediction specifically. Its core finding is that high loan fees are a proxy for overpricing — heavily shorted, expensive-to-borrow stocks tend to be overvalued relative to their fundamentals, because pessimists can't fully express their view cheaply. The causal arrow is: high fee → shorts are paying to maintain a view → eventually they cover when the pain exceeds conviction, which does correlate with price reversals. But D'Avolio doesn't produce a clean "3× within 30 days" statistic — that level of specificity was me over-attributing.
+What CTB Actually Tells You
+
+High CTB (Cost to Borrow) is better understood as a supply/demand pressure gauge, not a direct squeeze predictor:
+
+    It tells you that borrow supply is scarce relative to demand to short
+    It imposes carry cost on every open short position — at 80% CTB annualized, a short holder is bleeding ~0.22% per day just to hold the position, regardless of price movement
+    This creates a soft time limit on shorts: the longer the stock stays flat or rises modestly, the more economically irrational it becomes to hold
+
+So high CTB doesn't predict when a squeeze happens — it predicts that shorts are under structural financial pressure that makes involuntary covering more likely over time. That's a necessary condition, not a sufficient one.
+What Is Actually the Best Predictor of a Squeeze?
+
+No single metric dominates cleanly. The academic and practitioner consensus is closer to this hierarchy:
+
+Most predictive (but mostly paywalled):
+
+    Utilization rate rising toward 100% — when nearly all lendable supply is on loan, new shorts literally can't enter, and existing shorts face recall risk. This is considered the sharpest early signal by ORTEX, S3 Partners, and Hazeltree research.
+    Recall notices / lending recall events — when lenders pull shares back (often ahead of corporate actions), shorts are forced to cover involuntarily regardless of conviction. Not publicly available.
+
+Strong free-side signals:
+
+    Short % of Float ≥ 20–30% combined with a catalyst (PR, earnings beat, FDA approval) — the catalyst is often what converts a high-SI stock into an actual squeeze. Without it, high SI can just sit there for months.
+    CTB rising sharply over days (delta matters more than absolute level) — an acceleration from 20% to 80% in a week signals that available borrow is evaporating fast.
+    ShortableShares (IBKR tick 89) dropping rapidly — a free proxy for utilization rising, since if IBKR's own locate supply is shrinking, the broader market supply is likely tightening too.
+
+Weaker individually, useful in combination:
+
+    Days to Cover (DTC) — measures how long a forced unwind would take given current volume; high DTC means shorts can't cover quickly without moving the stock against themselves
+    Reg SHO Threshold list inclusion — a lagging but meaningful signal of persistent settlement failure
+    Rising daily short volume ratio into a rising price — shorts adding into strength, increasing the eventual covering pressure
+
+The Honest Summary
+
+CTB > 30% (or better, rapidly rising CTB) is a necessary condition metric — it tells you the squeeze fuel is expensive and shorts are under pressure. But the trigger that actually converts latent pressure into a move is almost always an external catalyst (news, PR, technical breakout above a key level). The best predictors of an imminent squeeze are a high-utilization + rising-CTB environment meeting a hard catalyst, and two of those three inputs (utilization, catalyst timing) are either paywalled or fundamentally unpredictable. What you can screen for freely is the pre-condition state — not the event itself.
+

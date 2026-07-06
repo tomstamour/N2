@@ -1,0 +1,52 @@
+
+output/
+want you to implement a new function to the GGS. This function will be named "previous_day_volume_calculator" (PDV). The PDV will fetch the daily volume data for the 10 previous days starting from (--date-A day)-1 and calculate the "Average 10 Days Volume" of those 10 days (the Average 10 Days Volume does not include the --date-A day volume) then it will use the daily volume of the --date-A day and make the following calculation (--date-A volume)/(Average 10 Days Volume) = xVol. This function will be ran at every refresh of the table and will be printed in a column named "xVol" , this column will be after the BF_BEST column. Also add a new otion to the GSS named --xVolume-smaller-then , this option will take as input a numerical value and will be used to evaluate the "Trade" YES/NO string of the Trade column. \
+Example: \
+--xVolume-smaller-then 12 and the xVol value for a given stock = 10 (xvol=10) so the value will be "true" for xVol for that stock which will allow the Trade value to be "YES" if all other required statements are also "true".
+
+
+
+##
+I want you to create a new feature to the GSS script, it look for the stocks in the GTT if they are "OTC" stocks. It will add a column to the GTT named "OTC", if a stock is OTC then the value in the OTC column for that stock will be "OTC", if th estock is not OTC the value will be "-". Also design a new GSS option named "--discard-otc" that will take "YES" or "NO" as input value, this option will be used in the conditions to determine the value in the "Trade" column of the GTT. If a trade as "--discard-otc YES" and its value is "YES" in the OTC column(GTT) then the value in the "Trade" column would be "NO". If you can, fetch the data once When the GTT is first created, then this information would not have to be fetch again at each refresh of the GTT.
+
+
+##
+This command line in the ./gus-launcher.sh script, I wish it would run in the background, but I see it is monopolising the terminal. can you find a way to have it running purely in the background?
+command:
+/home/tom/Documents/ibkr_scripts/GUS3/scripts_functions/timer.sh --time 09:29:59 \
+  --execute cp /home/tom/Documents/ibkr_scripts/GUS3/runs/$(date +%d-%b-%Y)/GusTradeTable.txt \
+  /home/tom/Documents/ibkr_scripts/GUS3/runs/$(date +%d-%b-%Y)/GTT_930_Print_$(date +%d-%b-%Y).txt &
+
+
+
+
+### Historical Gap Up Finder (HGUF)
+I want you to design a script named the Historical_Gap_Up_Finder (HGUF) that will look into IBKR's historical database and find all the Gap Up Event for all stocks on the market in a define time period and output them in a dataframe named the HGUF-table. 
+Arguments for the script:
+--time-window <25-11-2025 10-12-2025> --minimum-gap-percentage <30> --max-open-price <float> --candles-size <10>
+
+Fisrt lest define a Gap Up Even (GUE): 
+-For a given stock, the price did gap over or equal to the --minimum-gap-percentage value in a time period starting from the previous day close price (RTH, daily candle close price) to the next day premarket end (09:29). Example: day-12 of the month, the price at 09:29 (pre-market) is 10$ and at day-11 of the month at RTH closing time (daily candles)the price was 5$, this represents a 50% GUE. When a GUE is detected the HGUF script will fetch the OHLC data for that stock with candle time as defined by the --candles-size option, the fetch will span from day-11 09:30 RTH (market open) up to day-12 16:00 RTH for that given stock and it will include the ETH (both pre-market and after-market) time period between the two days. 
+
+The outputed HGUF-table will be a tab separated file and have the following header/ columns:
+Symbol  | GUE  | Time  | O | H | L | C | Volume | GAP% | Push% | MAX  | Float | Institution%  |
+
+
+The GUE column will host the "ID"  number of each Gap Up Event (GUE), one GUE id per Symbol per time period detected (day-11 to day-12 represent' a single time period) all the rows relative to a GUE will have the same number ID. The "GAP%" column will host the percentage GAP; The current % price relative to the "day-11" market close (RTH daily candle price), this value will only be displayed at rows of the time period of day-12 during pre-market (ETH), Add NA string in the rows were no value is displayed. The Push% column will host values in the rows at "day-12" RTH time only and the value will be the percentage of the current price relative to the opening price (first O (open) value of the first RTH candle of day-12), add NA string were no value are displayed. In the "MAX" column, enter the string "max" to the rows where the Push% value was the highest for a givent GUE, this string will appear only once per GUE. The Float column will host the float value of the stock on that day (repeat the value accros rows a the same GUE, same for Institution% and use yfinance data api fetch to get thoses values. 
+
+Dont include OTC stock in the HGUF-table.
+
+
+########## Pull% column addition to HGUF table
+
+
+
+
+
+
+
+## Historical Gaps
+I want you to design a new script named "Historical_Gaps.py" (HG). The HG script will look for a specific stock the historical data and identify the gaps. Similar to what the GSS does, but the HG will find all the Gaps in the history of a stock. The HG script will take as input the following options: 
+--stock-symbol <string>
+--smaller-gap-size <float> The 
+

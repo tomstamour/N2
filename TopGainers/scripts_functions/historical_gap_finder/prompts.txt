@@ -1,0 +1,4 @@
+I want you to had an option to the Historical_Gap_Up_Finder.py script to let the user define the number of hours to feth the data. The option could be named --total-time-fetch-per-gap and
+  it would specify the time window for which we want to fetch the data. Example --total-time-fetch-per-gap 72 it would fetch all the available market hours (RTH and ETH) starting from the
+  begining of each event (Pre-market 04:00) 
+

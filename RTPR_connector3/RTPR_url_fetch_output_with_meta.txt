@@ -1,0 +1,228 @@
+============================================================
+RTPR URL FETCH — metadata
+============================================================
+Fetched at      : 2026-06-30 11:20:01.108 America/New_York
+Article URL     : https://rtpr.io/a/nACS0Gsm4a?exp=1782832920&sig=dd57700c4505e960e8c935cbff5ac79c61f85ae901c92da20f37b998ef8b6ba5
+Ticker          : HYLN
+Published at    : 2026-06-30T15:20:00.730Z
+HTTP status     : 200
+Content-Type    : text/html; charset=utf-8
+Body bytes      : 8034
+============================================================
+--- RAW BODY BELOW ---
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>HYLN Investor Alert: Levi &amp; Korsinsky Investigates Hyliion Holdings Corp. (HYLN) for Potential Securities Fraud — RTPR</title>
+<style>* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+  color: #0f172a;
+  min-height: 100vh;
+}
+.nav {
+  border-bottom: 1px solid #e2e8f0;
+  background: rgba(255,255,255,0.8);
+  backdrop-filter: blur(8px);
+}
+.nav-inner {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  height: 3.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  background: linear-gradient(90deg, #2563eb, #9333ea);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-decoration: none;
+}
+.nav-link {
+  font-size: 0.875rem;
+  color: #475569;
+  text-decoration: none;
+}
+.nav-link:hover { color: #0f172a; }
+main { max-width: 64rem; margin: 0 auto; padding: 2rem 1.5rem; }
+.card {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+  overflow: hidden;
+}
+.card-header {
+  padding: 1.5rem 1.5rem 1.5rem 1.5rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  color: #64748b;
+  margin-bottom: 0.75rem;
+}
+.meta-source { font-weight: 500; }
+.title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  line-height: 1.25;
+  word-break: break-word;
+  margin: 0;
+}
+@media (min-width: 768px) { .title { font-size: 2rem; } }
+.tickers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-top: 1rem;
+  align-items: center;
+}
+.ticker {
+  background: #f1f5f9;
+  color: #0f172a;
+  border-radius: 0.375rem;
+  padding: 0.125rem 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+.exchange { font-size: 0.75rem; color: #94a3b8; margin-left: 0.25rem; }
+.card-body { padding: 1.5rem; }
+.article-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+  color: #1f2937;
+}
+.article-body a { color: #2563eb; text-decoration: none; }
+.article-body a:hover { text-decoration: underline; }
+/* Bodies that already carry LSEG HTML let the markup drive layout, so we
+   collapse source whitespace (newlines between tags) instead of pre-wrap. */
+.article-body.is-html { white-space: normal; }
+.article-body.is-html img { max-width: 100%; height: auto; }
+.article-body.is-html table {
+  border-collapse: collapse;
+  width: auto;
+  max-width: 100%;
+  margin: 1rem 0;
+  font-size: 0.875rem;
+  display: block;
+  overflow-x: auto;
+}
+.article-body.is-html th,
+.article-body.is-html td {
+  border: 1px solid #e2e8f0;
+  padding: 0.375rem 0.625rem;
+  text-align: left;
+  vertical-align: top;
+}
+.article-body.is-html th { background: #f8fafc; font-weight: 600; }
+.article-body.is-html a { color: #2563eb; }
+.empty { color: #94a3b8; font-style: italic; margin: 0; }
+.footer-meta {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="https://rtpr.io/">RTPR</a>
+    <a class="nav-link" href="https://rtpr.io/dashboard">Open Dashboard →</a>
+  </div>
+</nav>
+<main>
+  <article class="card">
+    <header class="card-header">
+      <div class="meta">
+        <span class="meta-source">ACCESSWIRE</span> <span aria-hidden="true">·</span> <time datetime="2026-06-30T15:20:00.730Z">Jun 30, 2026, 11:20 AM EDT</time>
+      </div>
+      <h1 class="title">HYLN Investor Alert: Levi &amp; Korsinsky Investigates Hyliion Holdings Corp. (HYLN) for Potential Securities Fraud</h1>
+      <div class="tickers"><span class="ticker">HYLN</span><span class="exchange">NYSE American</span></div>
+    </header>
+    <div class="card-body">
+      <div class="article-body">NEW YORK CITY, NY / ACCESS <a href="https://www.accessnewswire.com/" target="_blank" rel="nofollow noopener">Newswire</a> / June
+30, 2026 / Levi &amp; Korsinsky notifies investors that it has commenced an
+investigation into Hyliion Holdings Corp. (&quot;Hyliion Holdings Corp.&quot;)
+(NYSE:HYLN) concerning potential violations of the federal securities laws.
+
+Hyliion Holdings lost 13-17% of its share price in a single trading session
+after a short-seller report challenged the credibility of a $133 million deal
+that represented roughly one-third of the company&#x27;s disclosed pipeline.
+
+Hyliion&#x27;s Q1 2026 10-Q, filed May 12, 2026, disclosed that a single
+unidentified customer accounted for 100% of quarterly revenue. The filing did
+not name the customer or address concentration risk. During the same period,
+management publicly described a pipeline of &quot;nearly 500 units under
+non-binding letters of intent&quot; across multiple customers on its Q4 2025
+earnings call on February 25, 2026.
+
+The company&#x27;s 10-K for fiscal year 2025, filed February 25, 2026, contained no
+reference to the $133 million AI-data-center LOI with VFG Holdings. CEO Thomas
+Healy signed a Sarbanes-Oxley Section 302 certification on the same filing,
+attesting that it did not omit any material fact necessary to make the
+statements made not misleading.
+
+If you suffered a loss on your Hyliion Holdings Corp. securities and would
+like to explore a potential recovery under the federal securities laws, Learn
+More About the <a href="https://pr.report/n6z9" target="_blank" rel="nofollow noopener">Investigation</a> or contact Joseph E.
+Levi, Esq. via email at jlevi@levikorsinsky.com or call (212)363-7500 to speak
+to our team of experienced shareholder advocates.
+
+WHY LEVI &amp; KORSINSKY: Over the past 20 years, Levi &amp; Korsinsky LLP has
+established itself as a nationally-recognized securities litigation firm that
+has secured hundreds of millions of dollars for aggrieved shareholders and
+built a track record of winning high-stakes cases. The firm has extensive
+expertise representing investors in complex securities litigation and a team
+of over 70 employees to serve our clients. For seven years in a row, Levi &amp;
+Korsinsky has ranked in ISS Securities Class Action Services&#x27; Top 50 Report as
+one of the top securities litigation firms in the United States. Attorney
+Advertising. Prior results do not guarantee similar outcomes.
+
+CONTACT:
+Levi &amp; Korsinsky, LLP
+Joseph E. Levi, Esq.
+Ed Korsinsky, Esq.
+33 Whitehall Street, 27th Floor
+New York, NY 10004
+jlevi@levikorsinsky.com
+Tel: (212)363-7500
+Fax: (212)363-7171
+
+SOURCE: Levi &amp; Korsinsky, LLP
+View the original press <a href="https://www.accessnewswire.com/newsroom/en/business-and-professional-services/hyln-investor-alert-levi-and-korsinsky-investigates-hyliion-hold-1184621" target="_blank" rel="nofollow noopener">release</a>
+on ACCESS Newswire
+
+
+Copyright 2026 ACCESS Newswire. All Rights Reserved.</div>
+      <div class="footer-meta">
+        <span>Article ID: <code>nACS0Gsm4a</code></span>
+        <span>Available for 24 hours after publication</span>
+      </div>
+    </div>
+  </article>
+</main>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"a108b2e709964c2ca97194941f11bbf3","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>

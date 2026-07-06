@@ -1,0 +1,18 @@
+Strategy  Description*	Position Size**	Exit***
+---	-------------	---------------	------
+S1	Entry +10% SL +40% TP 25%	36.67%	EOD
+S2	Entry +10% SL +40% TP 25%	36.67%	EOD
+S3	Entry +10% SL +50% TP 25%	27.50%	EOD
+S4	Entry +10% SL +50% TP 25%	27.50%	13:00h
+S5	Entry 9:45h SL +30% TP 30%	53.26%	13:00h
+S6	Entry 0% SL +40% TP 30%	25.00%	13:00h
+S7	Entry 0% SL +60% TP -15%	16.67%	EOD
+S8	Entry 0% SL +60% TP -55%	16.67%	12:45h
+S9	Entry +2% SL +45% TP -15%	23.72%	15:55h
+S10	Entry 0% SL +60% TP -45%	16.67%	12:45h
+S11	Entry 0% SL +60% TP -40%	16.67%	12:45h
+S12	Entry 0% SL +60% TP -35%	16.67%	12:45h
+S13	Entry 0% SL +50% TP -55%	20.00%	12:45h
+*All Entry values (%) are relative to the Open price. All SL (Stop Loss) values (%) are relative to the Entry price. All TP (Take Profit) values (%) are relative to the Entry price. 			
+**The Position Size column represent the quantity of the total money of the account involved in the trade			
+***EOD = End Of Day			

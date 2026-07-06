@@ -48,3 +48,4 @@ node_modules/
 
 # --- keep this local-only helper file out of the repo ---
 /git-workflow.txt
+/RTPR_connector3/RTPR_connector3_Firehose.py

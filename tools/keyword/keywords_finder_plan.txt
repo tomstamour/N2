@@ -1,0 +1,308 @@
+Goal
+
+Build a supervised text-regression pipeline that answers:
+
+Which unigrams or bigrams in a text field are associated with higher or lower numeric target values, and how strong is each term’s predictive contribution?
+
+The standard workflow is:
+
+text column → vectorizer → ElasticNetCV regressor → cross-validation → coefficient extraction → ranked keyword-impact file
+
+This is a good fit because scikit-learn vectorizers expose learned terms through get_feature_names_out(), and linear regressors expose learned weights through coef_. ElasticNetCV is especially appropriate because it combines L1 and L2 regularization and selects its regularization strength by cross-validation.
+
+Recommended pipeline plan
+1. Define the input data contract
+
+Your source table should have at minimum:
+
+Column	Meaning
+text	Raw text, around 200 words per row
+value	Numeric target to predict
+
+Before modeling, validate:
+
+Check	Why
+Remove rows with missing text or missing target	Avoid invalid training examples
+Ensure value is numeric	Required for regression
+Remove duplicate rows if needed	Avoid overweighting repeated texts
+Inspect target distribution	Detect skew, outliers, extreme values
+Keep row IDs	Needed to trace predictions back to source rows
+
+Also decide whether the target should be transformed. For example, if the value column is heavily right-skewed, a log transform may make the regression more stable. If the value can be negative or zero, use care with transformations.
+
+2. Split the data before fitting anything
+
+Use a held-out test set or repeated cross-validation.
+
+Recommended structure:
+
+Dataset part	Purpose
+Training set	Fit vectorizer and ElasticNetCV
+Validation folds	Select alpha and l1_ratio inside ElasticNetCV
+Test set	Final unbiased performance check
+The vectorizer must be fitted only on the training data inside a scikit-learn Pipeline; this avoids leaking vocabulary or document-frequency information from validation/test data into training. scikit-learn’s Pipeline is designed to chain transformers and final estimators together.
+3. Vectorize the text
+
+Use either:
+
+Default recommendation
+
+TfidfVectorizer with unigrams and bigrams
+
+Recommended starting settings conceptually:
+
+Parameter	Recommendation
+lowercase	True
+ngram_range	(1, 2)
+min_df	Remove rare terms, for example terms appearing in fewer than 3–10 documents
+max_df	Remove overly common terms, for example terms appearing in >80–95% of documents
+stop_words	Optional; test both with and without
+max_features	Optional cap if vocabulary becomes huge
+TfidfVectorizer converts raw documents into a TF-IDF feature matrix and supports parameters like n-grams, min/max document frequency, lowercasing, and token filtering.
+Alternative for easier interpretation
+
+Use CountVectorizer(binary=True) if you want the coefficient to be closer to:
+
+“When this term is present, the predicted value tends to move up/down.”
+
+With TF-IDF, the coefficient means:
+
+“For each unit increase in the term’s TF-IDF feature value, the prediction changes by this coefficient.”
+
+For keyword-impact reporting, binary count features are often easier to explain, while TF-IDF often performs better predictively.
+
+4. Fit ElasticNetCV inside a Pipeline
+
+The core model should be:
+
+Vectorizer → ElasticNetCV
+
+ElasticNetCV should tune:
+
+Hyperparameter	Meaning
+alpha	Overall regularization strength
+l1_ratio	Mix between Lasso-like sparsity and Ridge-like stability
+cv	Number of internal cross-validation folds
+
+Recommended l1_ratio search values:
+
+Value	Meaning
+0.1	Mostly Ridge-like, keeps more correlated terms
+0.3	Moderate shrinkage
+0.5	Balanced
+0.7	More sparse
+0.9	Very Lasso-like
+0.95 / 0.99	Strong feature selection
+
+For your task, I would start with something like:
+
+l1_ratio = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95]
+
+Why ElasticNetCV instead of pure Lasso? Text features are highly correlated. Example: profit, revenue, sales growth, and strong revenue may all co-occur. Pure Lasso may arbitrarily keep one and zero out the others. Elastic Net is usually more stable because it combines L1 and L2 regularization.
+
+5. Evaluate predictive quality before trusting keywords
+
+Do not export keyword impact as “meaningful” unless the model predicts the numeric value out of sample.
+
+Use cross-validation metrics such as:
+
+Metric	Meaning
+Cross-validated R²	How much target variance the text explains
+MAE	Average absolute prediction error
+RMSE	Penalizes large errors
+Baseline comparison	Compare against predicting the mean/median target
+
+Interpretation:
+
+Result	Meaning
+Good CV performance	Keyword table is more trustworthy
+Near-zero or negative R²	Text may not predict the value well
+Big train/test gap	Overfitting
+Unstable scores across folds	Model may be fragile
+
+A keyword table can always be generated, but it should only be trusted if the model has real out-of-sample predictive signal.
+
+6. Compute univariate term scores
+
+In parallel with the multivariate ElasticNet model, compute one-term-at-a-time scores.
+
+Use:
+
+Method	Output
+r_regression	Signed Pearson correlation between each term and target
+f_regression	F-statistic and p-value for each term
+r_regression is especially useful because it gives a signed marginal association: positive means the term appears more in higher-value rows; negative means the term appears more in lower-value rows.
+
+This gives you the marginal effect:
+
+What does this word do by itself?
+
+ElasticNet coefficient gives you the multivariate effect:
+
+What does this word contribute after accounting for all other words?
+
+You want both.
+
+7. Extract final model coefficients
+
+After fitting the final Pipeline on the training data, extract:
+
+Object	What to extract
+Vectorizer	get_feature_names_out()
+ElasticNetCV	coef_
+ElasticNetCV	selected alpha_
+ElasticNetCV	selected l1_ratio_
+Vectorized matrix	document frequency / term prevalence
+
+Each coefficient is signed:
+
+Coefficient sign	Interpretation
+Positive	Term pushes predicted value upward
+Negative	Term pushes predicted value downward
+Zero	Term was not selected or was shrunk to zero
+
+Rank terms by abs(coef_), but keep the sign.
+
+8. Build the final keyword-impact table
+
+The final exported file should have one row per unigram or bigram.
+
+Recommended columns:
+
+Column	Meaning
+term	Word or phrase
+ngram_type	unigram or bigram
+document_frequency	Number of rows containing the term
+document_frequency_pct	Percentage of rows containing the term
+mean_feature_value	Average TF-IDF/count/binary value
+univariate_r	Signed marginal correlation with target
+univariate_f_score	F-statistic from univariate regression
+univariate_p_value	Optional p-value
+elasticnet_coef	Multivariate signed coefficient
+abs_elasticnet_coef	Absolute coefficient magnitude
+direction	increases_value or decreases_value
+selected_by_model	Whether coefficient is non-zero
+rank_by_abs_coef	Main model-based rank
+rank_by_abs_r	Marginal correlation rank
+model_alpha	Selected ElasticNet alpha
+model_l1_ratio	Selected ElasticNet L1 ratio
+
+Optional but valuable:
+
+Column	Meaning
+coef_mean_across_folds	Average coefficient across CV refits
+coef_std_across_folds	Coefficient instability
+sign_stability	% of folds where sign is same
+selection_frequency	% of folds where coefficient is non-zero
+
+These stability columns are useful because text coefficients can be unstable when terms are correlated.
+
+9. Export ranked files
+
+Export at least three files:
+
+File	Contents
+keyword_impact_all_terms.csv	All terms with univariate and multivariate scores
+keyword_impact_positive_terms.csv	Terms with strongest positive coefficients
+keyword_impact_negative_terms.csv	Terms with strongest negative coefficients
+
+Suggested sorting:
+
+File	Sort order
+All terms	abs_elasticnet_coef descending
+Positive terms	elasticnet_coef descending
+Negative terms	elasticnet_coef ascending
+
+The main report should focus on terms with:
+
+Non-zero ElasticNet coefficient
+Reasonable document frequency
+Consistent sign across folds
+Good cross-validated model performance
+Agreement between univariate and multivariate direction when possible
+Final implementation sequence
+Phase 1 — Data preparation
+Load table.
+Select text and value.
+Drop invalid rows.
+Normalize text only lightly.
+Preserve original text separately.
+Inspect target distribution.
+Optionally transform target if skewed.
+Create train/test split.
+Phase 2 — Feature extraction
+Build vectorizer.
+Use lowercase normalization.
+Use unigrams and bigrams.
+Apply min_df to remove rare terms.
+Apply max_df to remove near-universal terms.
+Test stop-word removal, but do not assume it always helps.
+Fit vectorizer only inside the Pipeline.
+Phase 3 — Model training
+Build Pipeline: vectorizer → ElasticNetCV.
+Define l1_ratio search grid.
+Use internal CV inside ElasticNetCV.
+Fit on training data.
+Record selected alpha and l1_ratio.
+Save fitted Pipeline.
+Phase 4 — Model validation
+Predict on held-out test set.
+Compute R², MAE, RMSE.
+Compare against baseline model.
+Inspect residuals.
+Check whether performance is stable across folds.
+Only trust keyword impact if out-of-sample performance is acceptable.
+Phase 5 — Keyword scoring
+Transform training text with the fitted vectorizer.
+Extract term names with get_feature_names_out().
+Compute document frequency per term.
+Compute univariate r_regression.
+Compute univariate f_regression.
+Extract ElasticNet coefficients from coef_.
+Join all outputs into one term-level table.
+Add direction, ranks, and selection flags.
+Phase 6 — Stability analysis
+Refit the full Pipeline across multiple CV folds or repeated splits.
+Extract coefficients from each fitted model.
+Align coefficients by term name.
+Compute coefficient mean, standard deviation, sign stability, and selection frequency.
+Add those columns to the final keyword-impact table.
+
+This step is not mandatory for a first version, but I would include it in a serious production/research workflow.
+
+Phase 7 — Export final artifacts
+
+Final exported files:
+
+keyword_impact_all_terms.csv
+keyword_impact_positive_terms.csv
+keyword_impact_negative_terms.csv
+model_performance_summary.csv
+fitted_text_elasticnet_pipeline.joblib
+
+The most important file is:
+
+keyword_impact_all_terms.csv
+
+It should contain both:
+
+Univariate score — how the term correlates with the target by itself
+Multivariate coefficient — how the term contributes inside the full ElasticNet model
+Practical interpretation rule
+
+Use this hierarchy:
+
+Pattern	Interpretation
+High positive coefficient + positive univariate r	Strong upward keyword
+High negative coefficient + negative univariate r	Strong downward keyword
+High univariate r but zero coefficient	Term is correlated but redundant with other terms
+Non-zero coefficient but weak univariate r	Term may matter only conditionally with other words
+Unstable sign across folds	Do not overinterpret
+Very rare term with huge coefficient	Likely overfit or noisy
+Final summary
+
+The implementation should end with a ranked term table where each row is a unigram or bigram and each term has both a marginal association score and a regularized multivariate coefficient.
+
+The core defensible workflow is:
+
+Vectorize the text with unigrams and bigrams, fit ElasticNetCV inside a scikit-learn Pipeline, evaluate predictive performance with cross-validation, extract signed coefficients with coef_, combine them with univariate r_regression / f_regression scores, and export a ranked keyword-impact file.

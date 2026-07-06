@@ -1,0 +1,50 @@
+# Stock Universe File for Historical Gap Up Finder (HGUF)
+# Complete listing of US stocks from NASDAQ, NYSE, and AMEX exchanges
+# Generated from NASDAQ FTP symboldirectory
+# Format: One symbol per line
+#
+# Total symbols: 11715
+#
+
+A
+AA
+AAA
+AAAA
+AAAC
+AAAU
+AACB
+AACBR
+AACBU
+AACG
+AADR
+AAEQ
+AAL
+AALG
+AAM
+AAM.U
+AAM.W
+AAME
+AAMI
+AAOI
+AAON
+AAP
+AAPB
+AAPD
+AAPG
+AAPL
+AAPR
+AAPU
+AAPW
+AAPX
+AAPY
+AARD
+AAT
+AAUC
+AAUM
+AAUS
+AAVM
+AAXJ
+AB
+ABAT
+ABBV
+ABCB

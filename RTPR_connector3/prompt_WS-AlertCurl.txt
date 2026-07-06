@@ -1,0 +1,27 @@
+I want you to create a script named "RTPR_connector3_curl.py" that will connect to the RTPR.io Web Socket (WS) and receive the Alerts payloads provided by RTPR.io. You will not use the file @./doc/rtpr_WebSocket_documentation.txt is was only relevant for the creation of the script RTPR_connector3_Firehose.py. The most important documentation file you have to use is the file : @doc/rtpr_WebSocket_rtpr-official-curl-advices.txt
+
+In this file I pasted a personal conversation I had with the RTPR owner and administrator (rtpr_official). In that conversation the rtpr_official gives me the recipie from is own Claude Code session for an efficient and fast curl of the RTPR article fetch, again, here is the conversation:doc/rtpr_WebSocket_rtpr-official-curl-advices.txt. I want you to base and respect these recommandations for the structure of the RTPR_connector3_curl.py script as these information have very high value and are probably the best way to implement the curl/fetch process/architecture to reduce latency and avoid the problems that I will describe below.
+
+Overall, the problems is that (and this is a huge concern) if the curl process is not properly multithreaded or multiprocessed, the curl latency will increase drasticaly. We want to stay in the milliseconds time length for all the processes. The latency issue happens when many PR arrive in "burst", i.e. several (up to 10-15) PRs arrives in the same ~1 second time window. The main challenge is to perform the fetch/curl process of several articles at the same time using proper threading so that every fetch will completess fast (as fast as if there was only a single PR article to fetch).
+
+
+For the RTPR WebSocket connectivity documentation, I created a file here @./doc/rtpr_WebSocket_documentation.txt
+
+
+Also the RTPR_connector3_curl.py script as to avoid all pitfalls that would decrease the ingestion of the alerts pushed by the WebSocket to my local computer. We want to stay in the millisecond time length for all the processes of the PR ingestion to cache encoding in the dataframe.
+
+
+The RTPR_connector3_curl.py script will have to have indentical outputs to the script @RTPR_connector3_Firehose.py so it can also directly be sending/sharing its data with the script @../orchestrator5/Orchestrator5.0.py
+
+
+The logs will be written here: ./logs with an extention "curl" in the name to differentiatiate from the RTPR_connector3_Firehose.py
+
+This script has to get ist RTPR API key from the config file here: ../config/n2_config_file.txt ( I think this will be a distinct behavior to/from the RTPR_connector3_Firehose.py script)
+
+Treat this as a completely isolated task.
+Do not rely on any previous conversation, stored memory, or external context.
+Only use the information explicitly provided in this prompt.
+I dont want you to get content or aRTPR_connector3_curl.pyccess to any other information outside of this directory to avoid recreate past mistakes.
+
+
+Use the AskUserQuestion tool to deeply and thouroughly understand my needs, then make a plan for the RTPR_connector3_curl.py script production.

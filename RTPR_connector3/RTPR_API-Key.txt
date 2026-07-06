@@ -1,0 +1,7 @@
+#RTPR.io API key informations
+
+API Endpoint:
+GET https://api.rtpr.io/articles
+
+Key:
+rtpr_UQKaMpWKEzE4tFQKdDd3eav5PyrvUwkX

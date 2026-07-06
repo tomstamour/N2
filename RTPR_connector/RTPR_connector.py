@@ -93,7 +93,7 @@ log = logging.getLogger("rtpr")
 
 # --------------------------------------------------------------------------------------
 # Optional consumer hooks (latency-neutral) — set by an embedding process such as
-# Orchestrator5.0. Both default to None so a standalone run is byte-for-byte unaffected:
+# Orchestrator4.2. Both default to None so a standalone run is byte-for-byte unaffected:
 # the only added cost is a single `is not None` check. When set, each is fired with a
 # NON-BLOCKING submit (the consumer offloads its own heavy work to its own threads), so
 # neither touches the WS-ingest / curl / parse hot-path latency.

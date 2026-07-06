@@ -45,7 +45,7 @@ from finBERT_neutral_management_addON import aggregate as _nocoref_aggregate
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── RTPR_connector import (the news source) ──────────────────────────────────
-# Orchestrator5.0 drives RTPR_connector's asyncio loop IN-PROCESS and taps each
+# Orchestrator4.2 drives RTPR_connector's asyncio loop IN-PROCESS and taps each
 # article via the connector's latency-neutral hooks (set_alert_hook / set_row_hook,
 # both default None so a standalone connector run is unaffected). Executing the
 # module only defines its functions/Cfg/hooks — main() is __main__-guarded.
@@ -121,7 +121,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
-logger = logging.getLogger('Orchestrator5.0')
+logger = logging.getLogger('Orchestrator4.2')
 
 _iti_df: pd.DataFrame = None
 _last_iti_reload_date = None
@@ -888,7 +888,7 @@ def _on_row_built(job: dict, row: dict) -> None:
 
 def main():
     global _inscope_set, _nw_excluded_strings, _excluded_strings, _last_iti_reload_date
-    logger.info("Orchestrator5.0 starting...")
+    logger.info("Orchestrator4.2 starting...")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -980,7 +980,7 @@ def main():
         _finbert_executor.shutdown(wait=True)
         _collect_executor.shutdown(wait=True)
         _body_executor.shutdown(wait=True)
-        logger.info("Orchestrator5.0 stopped.")
+        logger.info("Orchestrator4.2 stopped.")
 
 
 if __name__ == '__main__':

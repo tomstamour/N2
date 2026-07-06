@@ -1,0 +1,12 @@
+# Caches
+__pycache__/
+*.pyc
+cache/
+
+# Logs
+logs/*.log
+nohup.out
+scripts_functions/trend_verifier/logs
+
+# Data and Output
+runs/*

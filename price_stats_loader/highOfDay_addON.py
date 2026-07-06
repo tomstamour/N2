@@ -240,6 +240,7 @@ def main():
     df = pd.read_csv(args.input_file, sep='\t')
     df['DailyHigh($)'] = None
     df['DailyHigh(%)'] = None
+    df['LastDailyClose'] = None
 
     ib = IB()
     try:
@@ -308,6 +309,7 @@ def main():
                 high, prev_close = cache[cache_key]
 
             df.at[idx, 'DailyHigh($)'] = high
+            df.at[idx, 'LastDailyClose'] = prev_close
 
             if high is not None and prev_close is not None and prev_close != 0:
                 pct = round((high - prev_close) / prev_close * 100, 2)

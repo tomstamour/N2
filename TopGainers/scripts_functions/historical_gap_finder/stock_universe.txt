@@ -1,0 +1,71 @@
+# Stock Universe File for Historical Gap Up Finder (HGUF)
+# Format: One symbol per line (lines starting with # are ignored)
+#
+# This is a SAMPLE file with representative symbols for testing.
+# For production use, populate this file with ALL US stocks from NASDAQ, NYSE, and AMEX exchanges.
+#
+# You can obtain complete stock lists from:
+# - NASDAQ FTP: ftp://ftp.nasdaqtrader.com/symboldirectory/
+# - NYSE data feeds
+# - Financial data providers (e.g., Polygon.io, Alpha Vantage)
+#
+# IMPORTANT: Do NOT include OTC stocks (PINK, OTCBB, etc.) as they are automatically filtered.
+#
+# Sample symbols (expand this list for production):
+AAPL
+TSLA
+NVDA
+AMD
+MSFT
+GOOGL
+AMZN
+META
+NFLX
+DIS
+BA
+INTC
+WMT
+JPM
+BAC
+XOM
+CVX
+PFE
+JNJ
+MRNA
+F
+GM
+PYPL
+SQ
+COIN
+ROKU
+ZM
+PLTR
+RBLX
+SNAP
+UBER
+LYFT
+ABNB
+DASH
+SOFI
+HOOD
+AFRM
+CVNA
+RIVN
+LCID
+QS
+CHPT
+PLUG
+ENPH
+SPWR
+FSLR
+RUN
+BLNK
+NIO
+XPEV
+LI
+BABA
+JD
+PDD
+BILI
+IQ
+VIPS

@@ -1,0 +1,156 @@
+===============================================================================
+ Orchestrator — version_control
+ Differences from Orchestrator4.0.py  ->  Orchestrator4.2.py
+===============================================================================
+
+ONE-LINE SUMMARY
+----------------
+Orchestrator4.2 is Orchestrator4.0 with the news source swapped from
+NewsWatcher4.2.py (NW4) to RTPR_connector.py. The downstream pipeline
+(FinBERT-headliner + noCoref body pipeline + two-step clerk handshake + daily
+TSV) is byte-for-byte the same code; only the layer that RECEIVES the news
+changed. Created 2026-06-23 (originally drafted as "Orchestrator5.0.py", renamed
+to 4.2 because it is a 4.x-family variant, not a new generation).
+
+
+1. NEWS SOURCE  (the central change)
+------------------------------------
+  4.0 : NewsWatcher4.2.py — a push/callback module. Orchestrator registered
+        3 callbacks (on_news_accepted, _on_alert, _on_alert_release) and called
+        nw.start(...) / nw.stop(). NW4 owned universe/blacklist/float/price/
+        excluded-strings filtering and the alert->curl fetch.
+
+  4.2 : RTPR_connector.py — a standalone asyncio firehose. Orchestrator4.2
+        imports it and drives it IN-PROCESS:
+          - registers two latency-neutral hooks on the connector
+            (rtpr.set_alert_hook / rtpr.set_row_hook),
+          - builds a connector cfg (rtpr.Cfg) mirroring its CLI defaults,
+          - runs asyncio.run(rtpr.main_async(cfg)) on the main thread.
+        The connector's WS-ingest / curl / parse hot path is untouched; all
+        heavy work runs on Orchestrator4.2's own thread pools.
+
+
+2. CONNECTOR EDITS REQUIRED  (RTPR_connector.py)
+------------------------------------------------
+  Two OPTIONAL, default-None, latency-neutral hooks were added to the connector
+  (+ set_alert_hook / set_row_hook setters). Standalone connector runs are
+  unaffected (the only added cost is one `is not None` check):
+    _alert_hook(symbol, art_id, arrival_dt) — fired in ws_listener the instant a
+        universe+dedup-passing alert is enqueued (PRE-CURL, the "arm" moment).
+    _row_hook(job, row)                     — fired in worker the instant a row
+        is built (POST-CURL), before the batched store.
+  No other connector change. `--self-test` still passes.
+
+
+3. HOW ROWS FLOW
+----------------
+  4.0 : NW4 background thread -> on_news_accepted(payload) per accepted article.
+  4.2 : connector loop thread ->
+          _alert_hook  -> _on_alert(...)      : clerk ARM + stash future  (pre-curl)
+          _row_hook    -> _on_row_built(job,row): filter + fan-out + sentiment + TSV
+        Both hooks only do non-blocking submits; heavy work is on thread pools.
+        on_news_accepted() was replaced by _on_row_built(job, row).
+
+
+4. FILTERING  (the one intended behavioural difference)
+-------------------------------------------------------
+  4.0 relied on NW4's FULL filter set. 4.2 keeps the connector's own gate
+  (universe membership + dedup) plus only TWO of NW4's input filters:
+
+    KEPT in 4.2 :  universe membership   (connector)
+                   dedup by article ID   (connector)
+                   ticker count <= 2     (Orchestrator, MAX_TICKERS_PER_ARTICLE)
+                   NW4-level excluded-strings -> DROP article
+                                         (newswatcher3/excluded_strings.txt)
+
+    DROPPED in 4.2 (NO LONGER APPLIED):
+                   blacklist
+                   price <= $10
+                   float <= 50M
+                   exchange-mismatch skip
+
+    KEPT clerk-side gates (unchanged from 4.0):
+                   FinBERT positive >= SENTIMENT_POSITIVE_MIN (0.8) -> OK/BAD
+                   orchestrator excluded-strings-2 arm-block
+                        (orchestrator3/excluded_strings-2.txt: writes the row but
+                         does not arm the clerk)
+
+  >>> CONSEQUENCE: Orchestrator4.2's daily TSV contains MORE rows than 4.0
+      (it no longer drops blacklisted / >$10 / >50M-float / exchange-mismatch
+      articles). This is BY DESIGN — not a bug. The TSV schema, analysis, and
+      clerk logic are identical; only the SET of rows differs.
+
+
+5. UNIVERSE HANDLING
+--------------------
+  4.0 : _split_universe_files() pre-filtered the universe to Float_M <= 50M and
+        fed that to NW4; _inscope_set was that filtered subset. Daily reload via
+        nw.update_universe() / nw.update_priced_tsv().
+  4.2 : float pre-filter dropped. Uses the full latest universe TSV as-is;
+        _inscope_set = the full Symbol set (plain membership). Daily reload
+        (03:00+ ET) reloads _iti_df, rebuilds _inscope_set, and live-swaps
+        cfg.universe = rtpr.load_universe(...) (atomic attribute set; the
+        connector's ws_listener reads cfg.universe per alert).
+
+
+6. PER-ARTICLE FIELD SOURCING  (TSV cells)
+------------------------------------------
+  TSV header (_TSV_COLUMNS) is IDENTICAL to 4.0 — byte-for-byte. Sourcing:
+    Author         : 4.0 nw.get_news_object()['author']  -> 4.2 connector row 'Source'
+    Created        : 4.0 nw.get_news_object()['created']  -> 4.2 connector row 'Created'
+    Exchange       : 4.0 NW payload single string         -> 4.2 first element of the
+                                                             connector's JSON Exchange array
+    ArrivalTime,   : pass-through from the connector row (already 'HH:MM:SS.mmm');
+    CurlTime         CurlTime is the connector's fetch-complete stamp.
+    ArrivalDate    : computed from job['arrival_dt'] (real datetime) -> ET date.
+    all others     : unchanged (FinBERT scores, 5 nocoref scores, clerk arm/sentiment,
+                     Float/MktCap/LastDailyClose/iti/tradeSize universe lookups).
+
+
+7. CODE ADDED / REMOVED vs 4.0
+------------------------------
+  REMOVED : NewsWatcher4.2 import + every nw.* call (register_*, start, stop,
+            get_news_object, update_universe, update_priced_tsv);
+            _lookup_author, _lookup_created;
+            _split_universe_files() (float pre-filter).
+  ADDED   : RTPR_connector import (importlib);
+            _on_row_built(job, row) (replaces on_news_accepted);
+            RTPR_* config block + MAX_TICKERS_PER_ARTICLE + NW4_EXCLUDED_STRINGS_FILE;
+            two-file _load_excluded_strings (NW4-level drop + orchestrator arm-block).
+  ADAPTED : _collect_and_log (Author/Created/Arrival*/CurlTime now read from the
+            connector row); _iti_reload_worker (swaps cfg.universe, not nw.*);
+            main() (builds cfg + sets hooks + asyncio.run instead of nw.start()).
+  REUSED VERBATIM : analyze_finbert, _run_body_pipeline, _compute_nocoref_scores,
+            evaluate_sentiment, _send_clerk, _arm_clerk, _send_sentiment, _on_alert,
+            _on_alert_release, _release_armed, _TSV_COLUMNS, _append_to_tsv, all
+            _lookup_* / _universe_cell / _coerce_float / _is_rth_now helpers,
+            _init_body_worker + all executors.
+
+
+8. DEPENDENCIES
+---------------
+  4.0 : NewsWatcher4.2.py (newswatcher3/)
+  4.2 : RTPR_connector.py (RTPR_connector/) + its deps: aiohttp, lxml,
+        websockets, uvloop (venv). No NewsWatcher dependency at all.
+  Unchanged: FinBERT-headliner, FinBERT_body_noCoref, clerk-1.1.py, the daily
+  universe TSV.
+
+
+9. RUNNING
+----------
+  4.0 : python3 Orchestrator4.0.py            (NW4 runs internally)
+  4.2 : # start the clerk FIRST, then:
+        /home/tom/venv/bin/python Orchestrator4.2.py
+        (drives RTPR_connector in-process; use the venv python — it has aiohttp/
+         spaCy/FinBERT. The connector's own once-daily CSV flush to
+         RTPR_connector/tables still happens as a harmless side effect.)
+
+
+10. VERIFICATION (2026-06-23)
+-----------------------------
+  - RTPR_connector.py --self-test : PASS (hooks default None, standalone unchanged)
+  - Orchestrator4.2.py imports cleanly; py_compile OK
+  - Offline smoke test (stubbed FinBERT/clerk): TSV header byte-identical to 4.0,
+    correct field mapping, pre-curl arm reused (1 arm not 2), and count>2 /
+    NW4-excluded articles dropped + released.
+===============================================================================

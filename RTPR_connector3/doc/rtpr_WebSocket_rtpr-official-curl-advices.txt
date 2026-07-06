@@ -1,0 +1,16 @@
+tom — 7/1/26, 6:01 PM
+If you curl all articles, you must be performing some type of parallelization right, like multithreading?
+
+rtpr_official — 7/1/26, 6:04 PM
+yes the article fethes and curls are multithreaded
+here are suggestions from my claude session about how my personal app handles all the requets:
+Read thread does zero blocking work. The ws-alerts on-message handler stamps received_at the instant the frame is read, replies to ping frames inline (so we never get dropped), and then immediately hands the alert off to a thread pool. It does not fetch, parse, run AI, or place orders on the read thread — that keeps our arrival timestamp clean and guarantees we always answer heartbeats.
+
+Fetches run in a dedicated thread pool. Alerts are dispatched to a ThreadPoolExecutor with 12 workers, so up to 12 article curls run concurrently. This is isolated from a separate 16-worker pool we use for firehose timing, so a top-of-minute firehose burst can't starve alert processing.
+
+One long-lived HTTP client, not a curl-per-alert. All fetches go through a single persistent requests.Session (HTTP keep-alive, X-API-Key header) with a connection pool sized to 20 — deliberately ≥ the 12 workers, so burst concurrency never overflows the pool and re-pays TLS handshakes. We do not spawn a curl subprocess per article.
+
+We request article_url exactly as sent (the signed rtpr.io/a/{id}?exp&sig permalink), then parse the returned HTML. Our fetch timer wraps only the GET, so the number we report is pure request time.
+
+tom — 7/1/26, 6:07 PM
+Yes I use the signed urls for the curl

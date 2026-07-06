@@ -1,0 +1,518 @@
+#IBKR Short selling fees informations
+I asked the following question to different AI agents: What is the best way to find the current Borrow fee for US stocks on Interactive Brokers? Suggests data sources that can be accessible via command line fetching (ibapi or web download or other third-party data sources also acceptable...). Don't suggest code. 
+
+And I got the following answers:
+
+#Gemini
+Programmatic Retrieval and Analysis of Indicative Borrow Fees for US Equities on Interactive Brokers
+
+I. Executive Summary: The Optimal Strategy for Borrow Fee Retrieval
+
+The determination of the best methodology for programmatically retrieving the current indicative borrow fee (rate percentage) for US stocks from Interactive Brokers (IBKR) hinges critically on distinguishing between the requirement for strategic cost analysis (the rate) and tactical real-time execution (liquidity/availability).
+
+A quantitative system operating purely through command-line accessible data streams cannot rely on a single source to maximize both data breadth and real-time accuracy regarding short selling costs. Analysis of IBKR’s core interfaces—the Public FTP, the TWS API (ibapi), and the Client Portal (CP) Web API—reveals that a hybrid data acquisition strategy is mandatory for rigorous quantitative trading.
+
+    For Comprehensive Daily Rate Data (Cost Analysis): The Public FTP Method is the technically superior, most reliable, and easiest-to-script approach for obtaining the full daily universe of shortable US stocks, including their associated indicative rate percentages. This method utilizes standard, non-proprietary command-line utilities for bulk transfer.   
+
+For Real-Time Availability (Liquidity Check): The TWS API (ibapi) is essential for tactical operations. While inefficient for broad rate retrieval, it offers the necessary low-latency confirmation of immediate share availability via Generic Tick Type 236 prior to order submission.  
+
+The indicative borrow rate is defined as the rate at which dealers in the Securities Lending/Borrowing Market are willing to transact today. This rate serves as the operational benchmark for clients and is noted to update periodically throughout the trading day. The ensuing analysis details the architecture, access protocols, and inherent limitations of each retrieval method, establishing the framework for this integrated strategy.  
+
+A. Report Mandate and Scope
+
+This report serves as a definitive technical roadmap for quantitative researchers and algorithmic traders detailing the acquisition paths for US stock borrow cost data compatible with command-line automation. The scope is strictly limited to interfaces that can be accessed programmatically: the Public FTP, the TWS API (via ibapi), and the Client Portal Web API (via REST). Specific code implementations are outside this scope, focusing instead on the underlying data protocols and required infrastructure.
+
+B. Data Hierarchy Distinction: Rate vs. Availability
+
+A critical functional distinction exists between the bulk data provided by the FTP and the real-time stream offered by the TWS API. The indicative rate percentage is the primary driver of lending cost calculations, whereas shortable share quantity determines immediate execution feasibility (liquidity). The TWS API, while unparalleled for providing sub-second market data, struggles to efficiently expose the specific indicative rate percentage as a standard, streamable generic tick. Consequently, high-fidelity borrow cost data (the rate itself) is efficiently collected via the stable, bulk daily FTP feed, while real-time API connectivity is leveraged exclusively for checking last-minute availability, which is the necessary prerequisite for placing an order.
+
+II. Foundational Understanding of IBKR Securities Lending Data
+
+Programmatic access to short selling data requires an understanding of how IBKR calculates, updates, and distributes the underlying figures, particularly differentiating between the rate used for client monitoring and the final rate applied for billing.
+
+A. The Nature of the Borrow Fee Data
+
+1. Indicative Rate vs. Final Cost Calculation
+
+The data retrieved through programmatic interfaces, whether API or FTP, provides the indicative borrow rate used for ongoing monitoring and projected cost analysis. This rate is an estimate of the current market rate for borrowing that specific security.  
+
+The final borrow fee assessed to the client account is a highly complex calculation performed daily and displayed on the monthly Activity Statement. This final fee is calculated using the following structure :  
+
+Borrow Fee=(Value×Fee Rate)/360
+
+Crucially, the "Value" in this formula is not simply the market price multiplied by the quantity. Instead, the collateral value used to determine the hard-to-borrow fees is based on an adjusted price. Industry convention generally requires a deposit equal to 102% of the prior day's settlement price, which is then rounded up to the nearest whole dollar and multiplied by the number of shares borrowed. The Fee Rate (%) applied is determined after IBKR applies its own 102% markup and rounding conventions. Therefore, the indicative rate retrieved programmatically is a critical input, but the final cost calculation is multi-layered, particularly affecting low-priced or hard-to-borrow securities.  
+
+2. Data Update Frequency and Prerequisites
+
+While IBKR’s core market data stream (e.g., price, size) is designed for extreme low-latency environments, updating four times per second (every 250 milliseconds) via socket connection , the indicative borrow rate is a slower-moving, strategic data point. The system documentation confirms that the indicative borrow rate is updated only periodically throughout the day. This lower update frequency reinforces the operational validity of using a daily, stable bulk download (like the FTP method) for strategic rate analysis, rather than relying on complex, persistent, low-latency API infrastructure solely for a value that does not update on a tick-by-tick basis.  
+
+Furthermore, utilization of the TWS API or the Client Portal API for market data retrieval carries specific prerequisites. API functionality is considered "off-platform" by exchanges, meaning users typically require paid market data subscriptions. Access also requires an active, funded IBKR account, generally with a minimum balance of $500 USD. The Client Portal Web API is specifically restricted to IBKR PRO account types.  
+
+B. Mandatory Filtering: DTC Continuous Net Settlement (CNS)
+
+A secondary layer of data validation is imposed by IBKR's short-selling policies, which must be incorporated into any robust quantitative system utilizing this data.
+
+1. DTC CNS Constraint
+
+IBKR maintains a strict criterion regarding the types of US stocks eligible for short sale orders. The firm does not accept short sale orders for US stocks that are not eligible for DTC continuous net settlement (CNS). This constraint dictates the ultimate tradability of any security identified as "shortable."  
+
+2. Pre-Processing Requirement Implication
+
+The consequence of the DTC CNS constraint is that simply retrieving the list of "shortable securities grouped by country" from IBKR is necessary but not sufficient for determining trade eligibility.  
+
+If the retrieved daily file contains securities that IBKR lists as shortable but are ineligible due to the CNS requirement, a trading algorithm that relies solely on the IBKR-provided file could attempt to short a prohibited security. Therefore, a quantitative system must incorporate an internal filtering layer post-download. This layer involves cross-referencing the retrieved indicative borrow rate data against independent or derived CNS eligibility data for US stocks. This additional data processing step ensures that the short sale orders conform to IBKR’s internal compliance rules, preventing order rejection and ensuring system integrity.
+
+C. Table 1: IBKR Programmatic Data Channels for Borrow Fee Data
+
+The three primary programmatic methods for accessing borrow data offer trade-offs between data breadth, latency, and operational complexity.
+
+Table 1: IBKR Programmatic Data Channels for Borrow Data
+Channel	Primary Data Type	Latency/Frequency	Access Method	Command Line Fetching Suitability
+Public FTP (shortstock)	Comprehensive Daily List (Rate & Availability)	Daily/End-of-Day (EOD)	Standard FTP Client	
+
+High (Simple, direct utility integration)
+TWS API (ibapi)	Real-time Availability (Tick 236)	Real-time (Socket Stream)	TCP Socket connection to IB Gateway/TWS	
+
+Moderate (Requires running daemon and complex wrapper)
+Client Portal Web API	Real-time Market Data Snapshots	Snapshot/Low Latency	HTTPS/REST	
+
+Moderate (Requires running CP Gateway for auth)
+ 
+
+III. Method 1: Bulk Data Retrieval via Public FTP (The Recommended Solution for Rate %)
+
+For algorithmic systems requiring a comprehensive, daily list of indicative borrow rates for strategic cost modeling, the Public FTP site is the most effective and simplest command-line accessible solution. This method requires no complex API libraries or persistent socket connections, relying instead on universally available network utilities.
+
+A. Architecture and Access Protocol
+
+Interactive Brokers maintains an explicitly supported Public FTP endpoint designed for data delivery, particularly for short stock availability.  
+
+    Connection Details: Access is standardized and anonymous. The required host address is ftp2.interactivebrokers.com.   
+
+Credentials: The designated username for access is shortstock, and importantly, the password field must be left empty.  
+
+Command-Line Integration: This protocol facilitates straightforward scripting using standard command-line tools available across major operating systems (Windows Command Prompt, macOS, Linux Terminal). The standard workflow involves initiating the connection, authenticating with the fixed credentials, listing the contents of the directory (dir or ls), and then issuing a get filename.txt command to download the desired US short stock file. The anonymity and fixed credentials make this connection highly predictable and simple to wrap in shell scripts or batch files for unattended daily automation.  
+
+B. File Structure and Content
+
+The purpose of the FTP site is to allow clients to "Download prepared lists of shortable securities grouped by country".  
+
+    File Naming and Format: While the exact daily filename for US data is dynamic or not explicitly listed, the files are typically structured text or CSV formats, derived from data sets that list securities by country (e.g., US stocks are grouped by USD currency). The content includes fundamental identifier fields such as Symbol, Currency (USD), and Long Name.   
+
+Rate Inclusion: Based on the service description (which promises "prepared lists of shortable securities" ) and the need for comprehensive cost data, this bulk file is the expected repository for the daily indicative borrow rate percentage for all listed instruments. The file provides the necessary breadth for market scanning that the real-time APIs cannot efficiently deliver.  
+
+C. Operational Reliability Through Public Utility
+
+The reliance on a Public FTP utility for strategic data collection offers significant operational advantages over the real-time API methods, particularly for quantitative systems prioritizing stability and minimal operational overhead.
+
+The FTP method requires no proprietary API wrappers (like ibapi), no persistent socket connection (unlike TWS API), and no running authentication daemon (unlike CP Gateway). It functions independently of the client's account funding status, API subscriptions, or the need to maintain a local running instance of TWS or IB Gateway. Furthermore, standard FTP bulk data transfers are typically exempt from the severe, per-request pacing limitations imposed on API endpoints. This low barrier to entry and robust simplicity makes the Public FTP the superior choice for retrieving the complete, daily snapshot of the indicative borrow rate percentage for all US shortable equities.  
+
+IV. Method 2: Real-Time Access via TWS API (ibapi)
+
+The Trader Workstation (TWS) API, accessed via the Python wrapper (ibapi) or other language implementations, is the established method for highly granular, tactical execution data. However, its complex architecture and specific data limitations render it unsuitable for simple bulk rate retrieval, mandating its use be focused narrowly on real-time share availability.
+
+A. TWS API Infrastructure and Operational Requirements
+
+    Architecture and Dependencies: The TWS API operates fundamentally as a TCP Socket Protocol and relies on a message-based structure. It is not a standalone web service; it requires continuous connectivity to a locally running instance of either the Trader Workstation (TWS) or the unattended IB Gateway. This requires maintaining a dedicated daemon process on the user's local or virtual machine. Implementation requires expertise in Object-Oriented Programming (OOP) concepts to properly handle the asynchronous message flow and the underlying decoder structure.   
+
+Pacing Limitations: The TWS API environment enforces strict message rate limits to preserve system stability. The system has a global limit, where high-rate API messages (above 50 per second) can be automatically paced by TWS to the maximum rate, or they may cause disconnection if the pacing limit is exceeded three times. This constraint requires careful design of any system seeking to stream real-time data for a large volume of symbols.  
+
+B. Acquiring Shortable Availability (Quantity)
+
+The primary utility of the TWS API for short selling preparation is the immediate confirmation of liquidity via the reqMktData function. This request is asynchronous and returns data via callback functions.  
+
+    Generic Tick Type 236: To request availability data, the request must include the generic tick type 236.   
+
+Evolution of Data Interpretation: The interpretation of the data returned by Tick 236 has evolved, requiring users to ensure their TWS/IB Gateway installation is current.
+
+    Legacy Interpretation (pre-TWS v974): The tick returned an enumerated value, often described using codes corresponding to colors (GREEN, DARK GREEN, RED) in the TWS watchlist. For example, a value of '3' historically indicated that "there are at least 1000 shares available for a short sale".   
+
+Modern Standard (TWS v974+): Modern implementations (requiring TWS version 974 or higher) now return the precise and explicit data point: the exact number of shares available to short. This transition from an enum status to an exact quantity is fundamentally important for quantitative systems that rely on accurate pre-trade sizing and execution feasibility checks.  
+
+C. The Critical Data Gap: Indicative Borrow Rate Percentage
+
+Despite the TWS API's sophistication in delivering real-time execution metrics, there is a confirmed difficulty in efficiently retrieving the actual indicative borrow rate percentage as a standard, streamable market data field.
+
+The core principle governing the TWS API states that if information is not available in the TWS application itself, it will not be dispatched through the API socket. A review of the available generic tick types used for real-time market data requests confirms that while Tick 236 addresses availability (quantity) , a corresponding dedicated, standard generic tick ID for the indicative rate percentage is notably absent from the general documentation for streaming market data.  
+
+This structural limitation implies that while the TWS API excels at real-time liquidity checks (shares available), it is inefficient or incapable of replacing the FTP as the bulk data source for the actual daily borrow rate percentage. Data related to borrowing rates, such as auction borrow and auction lend rates and sizes, are exposed through highly specific, dedicated data structures intended for the continuous Borrow/Loan market, which are separate from the generic market data stream. To avoid developing highly complex, customized data polling functions within the socket environment merely to retrieve a semi-static rate that updates periodically , the quantitative practitioner must adopt the FTP for rate data.  
+
+D. Table 2: TWS API Tick Types for Short Selling Data
+
+The TWS API uses tick types to specify the data requested via reqMktData.
+
+Table 2: TWS API Tick Types for Short Selling Data
+Generic Tick Type	Topic String	Description	Data Returned (TWS v974+)
+236	"Shortable"	Describes shortability and available quantity.	
+
+Exact Number of Shares Available
+N/A	N/A	Current Indicative Borrow Rate (%)	
+
+Not exposed by a dedicated, standard generic tick for streaming market data.
+ 
+
+V. Method 3: Real-Time Snapshot Access via Client Portal Web API (REST)
+
+The Interactive Brokers Client Portal (CP) Web API offers a modern, RESTful alternative to the legacy TWS API. While structurally appealing due to its use of standard HTTP and JSON protocols, this method is severely constrained by architectural dependencies and prohibitive pacing limits, making it impractical for bulk borrow fee retrieval.
+
+A. CP API Architecture and Authentication Overhead
+
+    Protocol: The CP Web API uses standard HTTP verbs and communicates using JSON-formatted messages over secure HTTPS.   
+
+Mandatory Gateway: For individual accounts accessing trading functionalities, authentication is not a simple key exchange. Developers must use the Client Portal Gateway, a separate Java program that acts as a local proxy to route web requests and handle the necessary OAuth 2.0 authentication. This means the CP API cannot be executed as a "pure" command-line process (i.e., a simple curl request) without maintaining a running daemon process locally, similar to the TWS API's requirement for IB Gateway.  
+
+Account Eligibility: Access to this API is limited strictly to active, funded IBKR PRO accounts.  
+
+B. Retrieval Mechanism and Cost
+
+Market data snapshots via the CP API are retrieved using a GET request to the /iserver/marketdata/snapshot endpoint.  
+
+    Field Identification: Data points are requested by passing numerical Field IDs in the URL parameters. While common fields like Last Price (31), Bid (84), and Ask (86) are documented, the specific numerical Field ID corresponding to the indicative borrow rate percentage is generally not published in the easily accessible documentation, indicating a lack of native support for this specialized metric within the standard snapshot API framework.   
+
+Economic Constraint (Snapshot Fee): Unlike streaming API data (which is covered by monthly subscriptions), retrieving a one-time snapshot of current market price or related metrics incurs a transaction fee of 1 cent per snapshot. This immediate per-request cost dramatically increases the overall expenditure for any quantitative system seeking to poll data from a large universe of symbols.  
+
+C. RESTful Pacing Limits and Scalability Failure
+
+The most significant constraint preventing the CP Web API from being a viable solution for bulk data retrieval is its strictly enforced pacing limit.
+
+Interactive Brokers enforces a global request rate limit of 50 requests per second for authenticated users. However, clients utilizing the mandatory Client Portal Gateway—the required authentication tool for accessing brokerage functionality—are restricted to a severely limited rate of 10 requests per second. Violators exceeding this rate face potential 429 "Too Many Requests" status codes and possible temporary IP banning ("penalty box").  
+
+Given that the universe of shortable US stocks exceeds 17,900 listed instruments , attempting to poll this entire universe at 1 cent per snapshot and a maximum speed of 10 requests per second is neither economically practical nor functionally scalable. This severe pacing limit dictates that the CP Web API is functionally limited to low-volume, tactical queries for a handful of symbols, explicitly ruling it out as a candidate for daily exhaustive market scanning for borrow rates.  
+
+VI. Comparative Analysis and Integrated Best Practice
+
+A comparative assessment underscores the necessary reliance on a hybrid architecture that leverages the simplicity and comprehensiveness of the Public FTP for cost data, complemented by the low latency of the TWS API for real-time risk mitigation.
+
+A. Evaluation Matrix of Data Acquisition Methods
+
+Table 3: Comparative Analysis of Borrow Data Acquisition Methods
+Metric	Public FTP (Bulk/Daily)	TWS API (ibapi/RT)	CP Web API (REST Snapshot)
+Rate (%) Access	High (Comprehensive List)	Low (Not a standard generic tick)	Low (Undocumented field ID, high cost)
+Availability (Quantity) Access	Moderate (Daily snapshot)	High (Real-time Tick 236)	Moderate (Snapshot)
+Latency	Daily (EOD/Morning)	Real-time (Sub-second)	Snapshot (Near real-time)
+Command-Line Setup Complexity	Very Low (Standard curl/ftp utility)	High (Requires IB Gateway, socket wrapper)	Moderate (Requires CP Gateway, curl over HTTPS)
+Pacing/Limits	N/A (Bulk download)	50 messages/sec (Socket stream)	
+
+10 requests/sec (via CP Gateway)
+Cost	
+
+Free (Public access)
+	
+
+Requires data subscriptions
+	
+
+1 cent per snapshot
+ 
+
+B. Integrated Strategy: The Hybrid Approach for Quant Automation
+
+The analysis confirms that the singular "best way" to access the data involves combining the strengths of the different interfaces. A robust quantitative system must employ a bifurcated strategy:
+
+    Strategic Cost Modeling (Rate %): The system must execute an automated, daily command-line retrieval (using FTP utilities) of the shortstock file. This provides the entire universe of US shortable securities and their current indicative borrow rates, fulfilling the mandate for finding the Rate %. This data is used for strategic decision-making, such as determining position size, target profitability, and identifying high-cost borrow candidates.   
+
+Tactical Liquidity Confirmation (Availability): Immediately prior to placing a short sale order, the system must establish an ephemeral or persistent connection using the TWS API (ibapi) wrapper to execute a reqMktData query using Generic Tick 236. This request is vital for obtaining the precise, real-time quantity of shares currently available.  
+
+C. Causal Relationship between Rate and Liquidity
+
+The efficacy of this hybrid approach is rooted in the causal relationship between the indicative borrow rate and real-time liquidity.
+
+The indicative rate provided by the FTP is generally stable and reflects the long-term cost profile of the security based on current market lending conditions. However, rapid, short-term depletion of available shares can instantaneously alter the risk and feasibility of a short trade. The quantity of shares available is a highly dynamic data point that reflects immediate supply and demand pressures.
+
+A situation where the daily FTP rate is low, but the real-time TWS API Tick 236 indicates a sharp drop in shortable quantity, signals an immediate liquidity crisis. Such a reduction in availability often precedes or accompanies extreme cost increases and elevates the risk of mandatory buy-ins or short squeezes. By fusing the static cost parameter (FTP Rate) with the dynamic availability metric (TWS API quantity), the quantitative system possesses the necessary data inputs to assess both the projected profitability (cost) and the execution risk (liquidity) concurrently, leading to superior tactical trade management.  
+
+VII. Conclusion: Operational Summary for the Quant Trader
+
+For the quantitative researcher focused on high-volume, automated screening for US stock borrow fees, the Public FTP protocol is the most efficient and scalable command-line utility for strategic retrieval of the indicative rate percentage. Conversely, the TWS API, while operationally more complex, remains indispensable for real-time tactical confirmation of share availability via Generic Tick 236.
+
+The fundamental recommendation is the implementation of a dedicated two-part data pipeline:
+
+    Rate Pipeline (Strategic): Automated execution of standard FTP client commands (ftp, open shortstock@ftp2.interactivebrokers.com, get [filename]) daily to ingest the bulk indicative borrow rate data into the quantitative database.   
+
+Availability Pipeline (Tactical): Use of the TWS API (ibapi) wrapper connected to a running IB Gateway/TWS instance for pre-trade, low-latency checks on liquidity (Generic Tick 236).  
+
+This integrated approach ensures the system maintains access to the complete universe of shortable costs without incurring the high operational complexity, pacing limitations, or per-snapshot costs associated with attempting to use either of the API interfaces for comprehensive, bulk rate discovery.
+ibkrguides.com
+Monitoring Stock Loan Availability - IBKR Guides
+Opens in a new window
+ibkrguides.com
+TWS API 2022 Production Release Notes - IBKR Guides
+Opens in a new window
+interactivebrokers.github.io
+TWS API v9.72+: Available Tick Types - Interactive Brokers - API Software
+Opens in a new window
+interactivebrokers.com
+Short-Securities Availability | Interactive Brokers LLC
+Opens in a new window
+interactivebrokers.com
+The Risks of Shorting Series, Part II: Borrow Fees - Interactive Brokers
+Opens in a new window
+ibkrguides.com
+Borrow Fee Details - IBKR Guides
+Opens in a new window
+ibridgepy.com
+IBKR API - IBridgePy
+Opens in a new window
+interactivebrokers.com
+Python API – Requesting Market Data | Trading Lesson - Interactive Brokers
+Opens in a new window
+interactivebrokers.com
+Web API v1.0 Documentation | IBKR API | IBKR Campus
+Opens in a new window
+interactivebrokers.com
+View Shortable Stocks - Interactive Brokers
+Opens in a new window
+interactivebrokers.com
+View Shortable Securities | Interactive Brokers LLC
+Opens in a new window
+interactivebrokers.com
+TWS API Documentation | IBKR API | IBKR Campus
+Opens in a new window
+interactivebrokers.com
+Trading Web API | IBKR API
+Opens in a new window
+interactivebrokers.com
+View Shortable Securities | Interactive Brokers LLC
+Opens in a new window
+interactivebrokers.github.io
+TWS API v9.72+: EClient Class Reference - Interactive Brokers - API Software
+Opens in a new window
+interactivebrokers.github.io
+TWS API v9.72+: Simple Syntax
+Opens in a new window
+interactivebrokers.co.uk
+Borrow/Loan Fields - Interactive Brokers
+Opens in a new window
+interactivebrokers.com
+Requesting Market Data | Trading Lesson | Traders' Academy - Interactive Brokers
+Opens in a new window
+interactivebrokers.com
+Securities Lending Dashboard | Interactive Brokers LLC
+
+# ChatGPT
+Interactive Brokers (IBKR) Data
+
+Public FTP (“shortstock”): IBKR publishes a daily text file of shortable securities on a public FTP server (ftp2.interactivebrokers.com) under user shortstock (no password). You can use any FTP or command‐line tool (e.g. curl or wget) to download the file for US markets. Each file lists ticker, identifiers, shares available to borrow, and the fee rate (annual borrow interest) and rebate rate. For example, IBKR’s documentation shows that the sample FTP output includes “rebate & fee rates and shares available”
+ibkrguides.com
+. This data is updated daily (end‐of‐day) and is completely free to use (no IB account needed). The limitation is that it reflects IB’s inventory only (one broker’s perspective) and has at most daily resolution, not tick‑level real time.
+
+IBKR TWS/API (ibapi): If you have an IBKR account and run TWS or IB Gateway, you can use IB’s API to query short data. The IB TWS API provides a “Shortable” tick (tick type 89) that returns the number of shares currently shortable when you request market data for a symbol. It also has a “Shortable” generic field (tickGeneric 46) indicating borrow difficulty. However, the current borrow fee rate is not directly returned by these ticks. Instead, IBKR’s Web API (REST) allows you to fetch a market data “snapshot” that includes short data fields by ID: field 7636 = Shortable Shares, and field 7637 = Fee Rate (annualized borrow rate)
+interactivebrokers.com
+. To use the Web API you must have an active IBKR account (Pro), enable API access, and be logged in to TWS/Gateway on your machine. You then send an HTTPS GET (e.g. via curl) to /iserver/marketdata/snapshot with the contract ID(s) and fields=7637,7636. The response JSON includes the current borrow fee as a percentage. (In practice this requires an API session/login cookie and IBKR permissions. It’s not free beyond your normal IB fees and requires market‐data permissions.)
+
+Client Portal (SLB Tool): IBKR’s Client Portal has a graphical Short Stock Availability (SLB) Tool for account holders (login required) that shows current borrow costs and availability per stock (and historical trends). It is not a command‐line API, but IBKR notes you can query multiple symbols in bulk and download a CSV via the portal
+ibkrguides.com
+. However, this requires logging into the portal manually (or scripting a web login).
+
+Requirements/Limits: IBKR methods generally require an IBKR account (for API or portal). The FTP is public. The API/Web API approach requires IB Gateway/TWS running and appropriate permissions. IBKR data is up‐to‐date (near real-time during market hours for the API; end‐of‐day for the FTP), but may not include stocks that IBKR cannot borrow. There are no extra licensing costs beyond IBKR membership (the FTP is free; API access is included with a Pro account).
+
+Third-Party Data Sources
+
+iBorrowDesk (free IB data): iBorrowDesk (iborrowdesk.com) is an independent website that scrapes IBKR data and presents short availability and fees. It exposes an (unofficial) JSON API: e.g. https://iborrowdesk.com/api/ticker/TSLA returns recent borrow records for TSLA. Each record has fields like "date","available","fee","rebate", etc. (See the example JSON structure in a developer write-up
+medium.com
+.) You can fetch this with curl or wget by imitating a browser user-agent header. Pros: It’s free and easy (no login), and returns recent borrow fees (the “fee” field is the borrow fee rate in basis points or percent) along with shares available. Cons: It only reflects IBKR’s data (one broker), updates roughly daily (a few times per day at best), and is not officially supported (the API could change). There is no formal authentication (but heavy use may be blocked).
+
+Nasdaq Data Link – Securities Lending Data (SLD): Nasdaq Data Link (formerly Quandl) offers a Securities Lending dataset (code “FIS/SLD”, among others) containing daily loan-fee data (the “intrinsic rate” or cost to borrow) for thousands of stocks. This is a professional feed (sourced from lenders and borrowers) with daily historical loan rates
+esma.europa.eu
+. You access it via Nasdaq’s REST API (with API key) using curl/wget to download CSV/JSON. Pros: Very reliable and comprehensive (covers US equity loan markets broadly), updated daily. Cons: Paid subscription required (Nasdaq sells it; not free). Also, data is end‐of‐day (not tick-level real time) and may have a 1–2 day reporting lag. Nasdaq describes “Loan fee (intrinsic rate): measure of the ‘cost to borrow’ a security…”
+esma.europa.eu
+. (Unlike IBKR’s broker-specific file, this is an aggregate market rate.)
+
+DataLend (IHS Markit) / S3 Partners: Institutional data vendors like IHS Markit’s DataLend or S3 Partners (via FactSet) provide up-to-the-minute borrow fee and availability data for US stocks through their APIs or data feeds. These are enterprise services (requiring licensing and often a commercial terminal or API subscription). They offer real-time or near-real-time rates and hard-to-borrow lists used by professional firms. Pros: Very comprehensive, authoritative, and timely. Cons: They require negotiation, licensing fees, and often a specialized interface (not simple curl). They are “reputable” but not typically accessible without significant cost.
+
+Broker/Platform APIs (others): Some brokers/platforms offer short-availability info. For example, Alpaca provides an “easy-to-borrow” list via API (but free borrow on those; no explicit fees), and certain platforms may display borrow rates at trade time. However, no major retail API other than IBKR openly exposes the raw borrow fee.
+
+QuantRocket (CLI tool): QuantRocket is a data platform (requires account) that can fetch IBKR’s borrow fee data via its command-line interface. For example, quantrocket fundamental collect-ibkr-borrowfees --countries usa will download current IBKR borrow fees to its database
+quantrocket.com
+. This is essentially wrapping the IB methods above. Pros: Automates IB data collection, easy for Python users. Cons: Requires a QuantRocket installation and subscription.
+
+Summary of Requirements/Costs:
+
+The IBKR public FTP is free and requires no account.
+
+The IBKR API/Web API requires an IBKR Pro account and running TWS/IB Gateway (no extra fee beyond normal account costs).
+
+iBorrowDesk is free to use (no account needed), but is unofficial.
+
+Nasdaq Data Link (SLD) requires a paid data subscription and API key.
+
+DataLend/S3 require enterprise licenses (often >$10k/year).
+
+Each method provides fairly recent borrow rates (from end‐of‐day up to streaming), with IBKR’s API being the most “real-time” of the group. The IBKR FTP and iBorrowDesk are updated at least daily. The choice depends on your access level: for programmatic CLI access without code, the IBKR FTP and iBorrowDesk (via curl) are the easiest free options; professional users can leverage Nasdaq’s SLD API or vendor feeds for more depth and coverage.
+
+Sources: IBKR documentation (public FTP and API)
+ibkrguides.com
+interactivebrokers.com
+; iBorrowDesk developer guide
+medium.com
+; Nasdaq Data Link description
+esma.europa.eu
+; and industry data providers.
+
+# DeppSeek
+Excellent question. Finding the borrow fee (stock loan rate) on Interactive Brokers is a common challenge because it's not always directly displayed in the main trading interface. Here are the best methods, with a focus on command-line/API accessibility.
+Method 1: The Official IBKR Web Service (Most Reliable for Pre-trade)
+
+This is the primary method and the one most suitable for programmatic access.
+
+Data Source: IBKR's publicly accessible "Stock Yield" web page. This is not an official API, but it's a structured web table you can scrape.
+
+URL: https://www.interactivebrokers.com/en/index.php?f=2342
+
+How to Access via Command Line (using curl and tools like jq or pup):
+
+You can fetch this page and parse the HTML table. Here's a conceptual example using curl and a parser:
+bash
+
+# 1. Fetch the HTML page
+curl -s "https://www.interactivebrokers.com/en/index.php?f=2342" -o stock_yield.html
+
+# 2. Parse it. This requires an HTML parser. Using 'pup' (a command-line HTML parser) as an example:
+# Let's assume we want the row for Apple (AAPL)
+cat stock_yield.html | pup 'table#table_id json{}' | jq '.[] | .children | .[] | select(.tag=="tr") | .children | .[] | select(.tag=="td") | .text'
+
+Important Caveats:
+
+    Parsing Complexity: The HTML structure can change, so your parser would need to be robust. You'd need to identify the correct table by its ID or class.
+
+    Data Format: The page provides the fee as an annualized interest rate (e.g., 0.5% for easy-to-borrow stocks).
+
+    Limited Universe: This page only lists a subset of stocks, primarily those that are "Easy-to-Borrow" (ETB). It will not show you the exorbitant fees for "Hard-to-Borrow" (HTB) stocks.
+
+Method 2: Using the IB API (ibapi) - Post-Trade & Real-Time
+
+This is the most powerful and direct method, but it provides data after you have a position or have queried a contract.
+
+Data Source: The ibapi (TWS API) provides real-time data points, including the shortable quantity and the approximate borrow rate.
+
+Key ibapi Components:
+
+    reqMktData with Generic Tick Tags: You can subscribe to real-time data and request specific "generic tick tags".
+
+        Tick Tag 101: shortableShares - Indicates the number of shares available for shorting.
+
+        Tick Tag 104: shortableValue - While not the direct fee, this can be related to the cost. The most direct fee indicator is not a standard tick tag.
+
+    reqSecDefOptParams (Security Definition Option Parameters): This method returns a wealth of information about a contract, including stock loan details.
+
+Example Python Code Skeleton using ibapi:
+python
+
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+import time
+
+class BorrowFeeApp(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.nextOrderId = None
+
+    def nextValidId(self, orderId: int):
+        super().nextValidId(orderId)
+        self.nextOrderId = orderId
+        print(f"NextValidId: {orderId}")
+        # Now we can make requests
+        self.req_borrow_fee()
+
+    def req_borrow_fee(self):
+        # Define the contract (e.g., AAPL)
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+
+        # Request security definition optional parameters
+        # This is the key call for pre-trade loan data
+        self.reqSecDefOptParams(self.nextOrderId, contract.symbol, "", contract.secType, contract.conId)
+
+    def securityDefinitionOptionParameter(self, reqId: int, exchange: str, underlyingConId: int, tradingClass: str, multiplier: str, expirations: set, strikes: set):
+        # This callback returns a lot of data, but for stocks, the borrow fee info is NOT here.
+        # This is more for options. We need a different approach.
+        print(f"SecDefOptParam. ReqId: {reqId}, Exchange: {exchange}, TradingClass: {tradingClass}")
+
+    # A more practical approach is to check the data after making a real-time data request.
+    def tickGeneric(self, reqId, tickType, value):
+        # TickType (number) to String mapping:
+        # 101: shortableShares
+        if tickType == 101:
+            print(f"Shortable Shares: {value}")
+        # There isn't a direct 'borrow fee' tick type. The fee is often found in account values.
+
+    def error(self, reqId, errorCode, errorString):
+        print(f"Error. Id: {reqId}, Code: {errorCode}, Msg: {errorString}")
+
+def main():
+    app = BorrowFeeApp()
+    app.connect("127.0.0.1", 7497, clientId=123) # 7497 for TWS, 4001 for Gateway
+
+    # Run the socket in a separate thread
+    import threading
+    api_thread = threading.Thread(target=app.run, daemon=True)
+    api_thread.start()
+
+    # Keep the script running
+    time.sleep(10)
+    app.disconnect()
+
+if __name__ == "__main__":
+    main()
+
+The Reality of ibapi for Borrow Fees:
+The borrow fee is often not a single, easily accessible real-time data point in the API. The most reliable way to get it programmatically is often to:
+
+    Place a small, paper trade short order for 100 shares.
+
+    In the order confirmation dialog before transmitting, IBKR will display the estimated annualized borrow fee.
+
+    Cancel the order. This is a manual process and hard to automate reliably.
+
+Method 3: Account Window Query (Post-Trade)
+
+If you already have a short position, the data is readily available in your account.
+
+Data Source: The ibapi method reqAccountSummary or by parsing the account updates.
+
+How it works:
+Once you are short a stock, IBKR will send you daily account updates that include a line item for the stock loan fee. You can calculate the effective annual rate from this.
+
+Example ibapi code to listen for account updates:
+python
+
+def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str):
+    if tag == "StockLoanValue": # This is the total value of stocks on loan
+        pass
+    # The actual fee is often in a tag like "MoneyRate" or a specific description in the account updates.
+    # You would need to parse the `updateAccountValue` and `updatePortfolio` callbacks carefully.
+
+Summary & Recommendation
+Method	Best For	Accessibility via CLI/API	Pros	Cons
+1. Stock Yield Page	Pre-trade screening of ETB stocks.	Good (Web Scraping)	Structured data, no IBKR connection needed.	Limited to ETB stocks, HTML structure can change.
+2. IB API (ibapi)	Real-time data & integration into trading systems.	Excellent (Direct API)	Real-time, programmable, most accurate for your account.	Complex; borrow fee is not a single, straightforward field.
+3. Account Query	Post-trade analysis and monitoring.	Good (Direct API)	Accurate reflection of actual costs incurred.	Only works after you have already taken the position.
+
+Best Practical Approach:
+
+For a command-line tool, your most robust method is a hybrid approach:
+
+    Primary Source: Create a script that scrapes the official IBKR Stock Yield page (https://www.interactivebrokers.com/en/index.php?f=2342). Use a robust parser like beautifulsoup4 in Python or pup in bash. This covers most of your needs for liquid, ETB stocks.
+
+    Fallback for HTB Stocks: For stocks not on that list, you must assume they are HTB. The only way to get the exact fee is through the ibapi by attempting a pre-trade check (which is complex) or by checking the "Stock Loan" tab in TWS/Client Portal manually. There is no simple, free, public feed for HTB borrow rates from IBKR.
+
+Example Command-Line Tool Workflow:
+bash
+
+# Your script
+#!/bin/bash
+
+SYMBOL=$1
+
+# Try to get the rate from the cached/downloaded Stock Yield page
+RATE=$(grep -A 10 "$SYMBOL" stock_yield.html | grep "Yield" | awk '{print $2}')
+
+if [ -z "$RATE" ]; then
+  echo "Symbol $SYMBOL is not Easy-to-Borrow. Rate is likely high and must be checked manually in TWS."
+else
+  echo "Borrow Fee for $SYMBOL: $RATE% (Annualized)"
+fi

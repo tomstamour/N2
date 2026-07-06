@@ -16,7 +16,24 @@ logger = logging.getLogger("enriched_tsv_concatener")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Concatenate enriched TSV files listed in a text file into a single TSV.",
+        description=(
+            "Concatenate several enriched TSV files into a single TSV, aligning columns\n"
+            "across files so nothing is lost.\n"
+            "\n"
+            "What it does:\n"
+            "  1. Reads a list file containing one TSV filename per line.\n"
+            "  2. Loads each TSV from the input directory (missing or unreadable files\n"
+            "     are skipped with a warning, not treated as fatal).\n"
+            "  3. Builds the union of all columns seen, preserving first-seen order.\n"
+            "  4. Reindexes every file to that full column set; columns a file lacks\n"
+            "     are filled with NA.\n"
+            "  5. Concatenates all rows and writes one combined TSV."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  enriched_tsv_concatener.py -l files.txt\n"
+            "  enriched_tsv_concatener.py -l files.txt --input-dir ./tsvs -o merged.tsv"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -24,21 +41,21 @@ def main() -> None:
         required=True,
         metavar="FILE",
         dest="list_file",
-        help="Text file with one TSV filename per line.",
+        help="Required. Text file with one TSV filename per line; blank lines are ignored.",
     )
     parser.add_argument(
         "--input-dir",
         metavar="DIR",
         dest="input_dir",
         default=None,
-        help="Directory containing the TSV files. Defaults to the list file's directory.",
+        help="Directory the TSV filenames are resolved against. Default: the list file's own directory.",
     )
     parser.add_argument(
         "--output", "-o",
         metavar="FILE",
         dest="output",
         default=None,
-        help="Output TSV path. Defaults to <list-file-dir>/concatenated.tsv.",
+        help="Path for the combined TSV. Default: concatenated.tsv next to the list file.",
     )
     args = parser.parse_args()
 
