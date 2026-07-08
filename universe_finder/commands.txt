@@ -1,4 +1,5 @@
-python closing_price_fetch_addOn.py \
+ommands.txt
+thon closing_price_fetch_addOn.py \
 --input-table data/nasdaq_symbols_data.tsv \
 --clientID 10 \
 --port 4001

@@ -133,7 +133,6 @@ NOCOREF_SENTENCES_TO_ANALYSE = 20  # cap spaCy sentences scored per article (Non
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEDUP_MAX_IDS = 50_000  # FIFO cap on the per-day seen-article-ID stash (leak guard)
-CONTENT_DEDUP_TTL_S    = 600     # same headline+tickers within 10 min = re-publish → drop
 CONTENT_DEDUP_MAX_KEYS = 10_000  # FIFO cap on the content-fingerprint stash (leak guard)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -184,11 +183,11 @@ _excluded_strings: set = set()
 _seen_ids: dict = {}
 _seen_day = None
 
-# Content-level dedup: RTPR sometimes re-publishes the same article seconds
-# apart under a NEW ID (PRZO 2026-07-06), so the ID dedup above misses it.
-# key = (normalized headline, sorted ticker tuple) → arrival_dt of first
-# sighting; a hit within CONTENT_DEDUP_TTL_S is dropped. Same lock-free
-# single-thread + insertion-order-FIFO regime as _seen_ids.
+# Content-level dedup: RTPR sometimes re-publishes the same article under a
+# NEW ID (PRZO 2026-07-06 227ms apart; FOFO 2026-07-07 ~12min apart), so the
+# ID dedup above misses it. key = (normalized headline, sorted ticker tuple)
+# → arrival_dt of first sighting; any same-day hit is dropped. Same lock-free
+# single-thread + per-day-clear + insertion-order-FIFO regime as _seen_ids.
 _seen_content: dict = {}
 
 
@@ -824,11 +823,11 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
         logger.info(f"[Row] id={art_id}: {len(tickers)} tickers > {MAX_TICKERS_PER_ARTICLE} — dropped")
         return
 
-    # Content dedup — same headline+tickers within CONTENT_DEDUP_TTL_S is an
-    # RTPR re-publish under a new ID (PRZO 2026-07-06) → drop like an ID dup.
+    # Content dedup — same headline+tickers the same day is an RTPR re-publish
+    # under a new ID (PRZO 2026-07-06, FOFO 2026-07-07) → drop like an ID dup.
     fp = (' '.join(headline.lower().split()), tuple(sorted(tickers)))
     prev = _seen_content.get(fp)
-    if prev is not None and (arrival_dt - prev).total_seconds() <= CONTENT_DEDUP_TTL_S:
+    if prev is not None:
         logger.info(f"[Row] id={art_id}: duplicate content (headline+tickers seen "
                     f"{(arrival_dt - prev).total_seconds():.1f}s ago) — skipped")
         return

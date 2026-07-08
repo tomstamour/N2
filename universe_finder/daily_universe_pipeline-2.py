@@ -315,6 +315,21 @@ def _run_concurrent(ib, symbols, coro_factory, is_empty, nan_value, label, args)
         empties = sum(1 for r in out if is_empty(r))
         log.debug(f"  {label}: {done}/{total}  (batch empties: {empties}/{len(batch)})")
 
+        # Contention canary (2026-07-06 incident): >50% of the FIRST batch
+        # empty means the Gateway's historical path is starved from minute
+        # one (mass 30s timeouts + Error 162, zero pacing violations, socket
+        # up) — not the slot-exhaustion cascade, which builds up over time.
+        if start == 0 and len(batch) >= 50 and empties > len(batch) / 2:
+            log.error(
+                f"  {label}: CONTENTION CANARY — {empties}/{len(batch)} of the "
+                f"first batch came back empty. Historical queries are being "
+                f"starved at the Gateway on {args.host}:{args.port} (the "
+                f"2026-07-06 signature: mass timeouts from the first request, "
+                f"Error 162, no pacing violations). Check what else is "
+                f"connected to this Gateway (clerk/moles/daily-board on the "
+                f"live GW) — the rest of this step will likely fail the same "
+                f"way.")
+
     return results
 
 

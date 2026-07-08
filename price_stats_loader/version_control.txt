@@ -4,3 +4,11 @@ highOfDay_addON_1.0.py — 2026-06-01
 3. For after-market arrivals (>= 16:00 ET), fetches both the same day and the next trading day via the new get_target_dates() function.
 4. DailyHigh(%) is computed independently for each fetched day; the higher value is written to the output along with its corresponding DailyHigh($).
 5. Caching and pacing are unchanged: each unique (symbol, date) pair triggers one IBKR request and one pacing sleep, so after-market rows may incur two sleeps if both dates are uncached.
+
+fromPR_HighOfDay_addOn.py — 2026-07-06
+1. New add-on: measures the highest price reached AFTER the PR "Created" time (HH:MM:SS.mmm ET, from createdTime_AddOn.py), as a % of the price just before the PR (close of the last 1-min bar before Created) — unlike DailyHigh(%) which is vs. the previous daily close.
+2. Window: Created -> 20:00 ET of the target session; created before 16:00 ET on a trading day = same day, otherwise (after close / weekend / holiday) rolls to the next trading session (in-between after-hours included).
+3. Extended hours included (useRTH=False), 1-min TRADES bars, durationStr='2 D' so the pre-Created baseline bar exists even for 04:00 pre-market PRs and Friday-evening -> Monday rolls.
+4. New columns: fromPR_High(%) and fromPR_HighTime(m:s) (elapsed MM:SS from Created to the high's bar, minutes unbounded, clamped at 00:00).
+5. Same scaffolding as highOfDay_addON.py (clientId 7, reconnects, 'ok'/'failure'/'skip' status, consecutive-failure HMDS abort, (symbol, created) cache). Output: <input_stem>_fromPRhigh.tsv.
+6. --timeout/-t flag (default 180s): 1-min extended-hours queries on illiquid small caps take 80-150s+ per symbol when the live stack (clerk/daily-board/scanner) shares the Gateway — run the full backfill when those are idle.

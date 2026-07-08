@@ -168,6 +168,30 @@ BSLN_OVER_PREV_TRD_GAP_THRESHOLD = 100.0
 # (first accepted trade, or no valid ITI baseline), so it cannot false-fire.
 BSLN_ITI_LAST3_THRESHOLD = 100.0
 
+# 2026-07-07 re-calibration (see mole-outputs/trigger-analysis-2026-07-07.md,
+# re-runnable via analyze_trade_mole/analyze_trigger_rules.py). Fit on the
+# _pos_/_neg_ labels of 2026-07-07 with the June labeled set as regression:
+# 8/8 + 20/20 positives fire, 0/4 of the day's false positives survive, June
+# false-positive names unchanged. All hardcoded (not CLI-tunable), like BSLN_*.
+
+# Rule A flow gate: quote churn alone false-fired on 1-share dust prints
+# (BLIN $0.28/s, SYNX $0.22/s); churn-confirmed positives trade >= $2/s (CMND $5.6/s).
+SURGE_A_MIN_DOLLAR_RATE_5S = 2.0
+
+# Rule D — baseline-free ITI collapse: the tape prints <= this fast with at least
+# this many trades in the 5s window. Covers 44444-sentinel names that Rules B/C
+# must skip (BIAF fires D@0.25s). Nearest labeled negative: DYAI at 0.95s (3x margin).
+SURGE_ITI_COLLAPSE_MAX_SEC = 0.3
+SURGE_ITI_COLLAPSE_MIN_TRADES_5S = 3
+
+# Rule E — dollar-flow burst confirmed by price: >= $10/s in the 5s window AND last
+# price >= +1% above session start. Recovers sentinel-name positives with slow
+# prints but real flow (SUGP fires E@2.62s). The +1% gate is what rejects AUID
+# (max +0.78% before its -2.3% SELL) and SMCI (never +1%) — 0.22pp margin vs AUID
+# is the thinnest in the rule set; tune here first if a similar FP reappears.
+SURGE_FLOW_MIN_DOLLAR_RATE_5S = 10.0
+SURGE_FLOW_MIN_PRICE_RISE_PCT = 0.01
+
 # Trade-size baseline (v2.1). The universe pipeline writes 44444 when the
 # historical trade-size fetch was ATTEMPTED but FAILED (see
 # universe_finder/tradeSizeExplained.txt); treat it as "no baseline".
@@ -423,6 +447,9 @@ class IBKRSurgeApp(EWrapper, EClient):
         # Current trade's bslnITI_on_last3trades_avrgITI, exposed to should_fire
         # (Rule C). Set each accepted/duplicate trade just before surge detection.
         self._cur_bsln_on_last3: Optional[float] = None
+        # Current trade's measured_ITIsec, exposed to should_fire (Rule D).
+        # Forward-filled on deduped twin prints, mirroring Rule C's value.
+        self._cur_measured_iti: Optional[float] = None
 
         # Captured event records -> DataFrame at end
         self.records: list = []
@@ -621,8 +648,10 @@ class IBKRSurgeApp(EWrapper, EClient):
 
         # Surge detection — composite rule on new metrics
         session_age = now_mono - self._session_start_mono
-        # Expose this trade's bslnITI_on_last3trades_avrgITI to should_fire (Rule C).
+        # Expose this trade's bslnITI_on_last3trades_avrgITI (Rule C) and
+        # measured_ITIsec (Rule D) to should_fire.
         self._cur_bsln_on_last3 = bsln_on_last3
+        self._cur_measured_iti = measured_iti
         surge, reason = self._detect_surge(win, iti)
 
         rec = {
@@ -995,28 +1024,27 @@ class IBKRSurgeApp(EWrapper, EClient):
 
     def should_fire(self, w: dict, iti: Optional[float]) -> tuple:
         """
-        OR of three trigger rules — any one alone fires the buy-signal.
+        Price-drop VETO, then OR of five trigger rules — any one alone fires the
+        buy-signal. Re-calibrated 2026-07-07 on that day's _pos_/_neg_ labels with
+        the June labeled set as regression (see
+        mole-outputs/trigger-analysis-2026-07-07.md, re-runnable via
+        analyze_trade_mole/analyze_trigger_rules.py): 8/8 + 20/20 positives fire,
+        0/4 of the day's false positives survive, June false-positive names
+        unchanged.
 
-        Rule A — Quote-churn (active since 2026-06-11): fire when the NBBO is being
-        repainted rapidly, i.e.
-
-            quote_updates_{window}s >= surge_min_quote_updates
-
-        Calibrated on the 2026-06-08..11 labeled set (see
-        mole-outputs/iti-threshold-analysis-2026-06-11.md). It replaced the prior
-        price-momentum rule (bid_drift + mid_velocity), which only fired on a
-        *fresh* upward price thrust and therefore missed surges that were already
-        in progress when recording started (flat/choppy/retracing price, zero
-        bid_drift). Quote-churn is high from the first tick on a genuine surge, so
-        this fires sub-second even when the price move predates the recording, and
-        it does not disadvantage illiquid low-float names.
+        VETO — price drop (wired in 2026-07-07): no rule may fire while the last
+        trade price is more than surge_max_price_drop_pct (default 0.5%) BELOW the
+        session-start price. A surge we want to buy does not print under where it
+        started; AUID false-fired on a SELL print 2.3% below start. Re-evaluated
+        every trade, so a dip only defers firing. (The threshold existed since v4
+        but was never consulted by the quote-churn-era rules.)
 
         Rule B — Start-staleness (added 2026-06-14): fire when
 
             bsln_over_prev_trd_gap > BSLN_OVER_PREV_TRD_GAP_THRESHOLD
 
         i.e. the tape was very stale at subscribe relative to the stock's own
-        historical cadence — another signature of a surge that began before we hit
+        historical cadence — the signature of a surge that began before we hit
         record. This ratio is constant per session and known from the first accepted
         trade, so Rule B can fire on the very first trade row. It is skipped when
         there is no valid ITI baseline (missing / <=0 / 44444 sentinel) so a failed
@@ -1030,9 +1058,55 @@ class IBKRSurgeApp(EWrapper, EClient):
         ITIs — the tape has accelerated sharply vs the stock's own cadence over the
         last couple of trades. Unlike Rule B (a fixed, start-of-session ratio), this
         updates every accepted trade, so it catches surges that develop after we hit
-        record. Skipped when the value is None (first accepted trade, or no valid ITI
-        baseline), so it cannot false-fire.
+        record. Skipped when the value is None (first accepted trade) and — fixed
+        2026-07-07 — when there is no valid ITI baseline: previously the ratio was
+        still computed from the 44444 fetch-failed sentinel, so 44444/avg2 cleared
+        the threshold on essentially any tape (AUID and DYAI false-fired through
+        this). Guarded at the rule level like Rule B; the recorded column stays
+        unguarded, matching bsln_over_prev_trd_gap.
+
+        Rule A — quote-churn with flow behind it (churn active since 2026-06-11;
+        dollar-rate gate added 2026-07-07): fire when the NBBO is being repainted
+        rapidly AND real money is trading:
+
+            quote_updates_{window}s >= surge_min_quote_updates
+            AND dollar_rate_5s >= SURGE_A_MIN_DOLLAR_RATE_5S
+
+        Ungated churn false-fired on single 1-share MID dust prints (BLIN with 26
+        updates at $0.28/s, SYNX with 12 at $0.22/s); churn-confirmed positives
+        trade >= $2/s. Rule A's history/rationale vs the old price-momentum rule is
+        in mole-outputs/iti-threshold-analysis-2026-06-11.md.
+
+        Rule D — absolute ITI collapse (added 2026-07-07): fire when
+
+            measured_ITIsec <= SURGE_ITI_COLLAPSE_MAX_SEC
+            AND trades_in_5s >= SURGE_ITI_COLLAPSE_MIN_TRADES_5S
+
+        Baseline-free fallback for Rule C: sub-0.3s prints with >=3 trades in 5s is
+        surge cadence for any name in our low-float universe, no history needed.
+        Covers the 44444-sentinel names Rules B/C must skip (BIAF), and fires
+        several confirmed positives faster than C (STAK 3.2s -> 0.25s).
+
+        Rule E — dollar-flow burst confirmed by price (added 2026-07-07): fire when
+
+            dollar_rate_5s >= SURGE_FLOW_MIN_DOLLAR_RATE_5S
+            AND price_change_since_start >= SURGE_FLOW_MIN_PRICE_RISE_PCT
+
+        The June analysis showed dollar_rate_5s >= 10 alone is a 0.00s-latency
+        full-recall trigger but fires on flow with no direction; requiring the last
+        price to already sit >= +1% above session start keeps only bought-up tape
+        (rejects AUID at max +0.78% and SMCI, recovers SUGP which prints slowly but
+        large).
         """
+        # VETO — last price too far below session start blocks every rule this row.
+        sp = self._start_price
+        lp = self._last_trade_price
+        pc = None
+        if sp and lp is not None:
+            pc = (lp - sp) / sp
+            if pc < -self._surge_max_price_drop_pct:
+                return (False, "")
+
         # Rule B — start-staleness (OR). Constant per session; may fire immediately.
         bsln_gap = self._bsln_over_prev_trd_gap()
         if bsln_gap is not None and bsln_gap > BSLN_OVER_PREV_TRD_GAP_THRESHOLD:
@@ -1043,7 +1117,8 @@ class IBKRSurgeApp(EWrapper, EClient):
             )
 
         # Rule C — last-3-trades ITI collapse (OR). Updates every accepted trade.
-        bsln_last3 = self._cur_bsln_on_last3
+        # _has_iti_baseline guard (2026-07-07): never ratio against the 44444 sentinel.
+        bsln_last3 = self._cur_bsln_on_last3 if self._has_iti_baseline else None
         if bsln_last3 is not None and bsln_last3 > BSLN_ITI_LAST3_THRESHOLD:
             return (
                 True,
@@ -1051,11 +1126,43 @@ class IBKRSurgeApp(EWrapper, EClient):
                 f"{BSLN_ITI_LAST3_THRESHOLD:.0f}",
             )
 
-        # Rule A — quote-churn (OR).
+        # Rule A — quote-churn backed by dollar flow (OR).
         col = f"quote_updates_{self._surge_quote_window}s"
         qu = w.get(col)
-        if qu is not None and qu >= self._surge_min_quote_updates:
-            return (True, f"{col}={qu:.0f}>={self._surge_min_quote_updates:.0f}")
+        rate5 = w.get("dollar_rate_5s")
+        if (
+            qu is not None and qu >= self._surge_min_quote_updates
+            and rate5 is not None and rate5 >= SURGE_A_MIN_DOLLAR_RATE_5S
+        ):
+            return (
+                True,
+                f"{col}={qu:.0f}>={self._surge_min_quote_updates:.0f}"
+                f"&$rate_5s={rate5:.1f}>={SURGE_A_MIN_DOLLAR_RATE_5S:g}",
+            )
+
+        # Rule D — absolute ITI collapse, baseline-free (OR).
+        m_iti = self._cur_measured_iti
+        trades5 = w.get("trades_in_5s")
+        if (
+            m_iti is not None and m_iti <= SURGE_ITI_COLLAPSE_MAX_SEC
+            and trades5 is not None and trades5 >= SURGE_ITI_COLLAPSE_MIN_TRADES_5S
+        ):
+            return (
+                True,
+                f"measured_ITI={m_iti:.3f}<={SURGE_ITI_COLLAPSE_MAX_SEC:g}"
+                f"&trades_5s={trades5:.0f}>={SURGE_ITI_COLLAPSE_MIN_TRADES_5S}",
+            )
+
+        # Rule E — dollar-flow burst confirmed by a rising price (OR).
+        if (
+            rate5 is not None and rate5 >= SURGE_FLOW_MIN_DOLLAR_RATE_5S
+            and pc is not None and pc >= SURGE_FLOW_MIN_PRICE_RISE_PCT
+        ):
+            return (
+                True,
+                f"$rate_5s={rate5:.1f}>={SURGE_FLOW_MIN_DOLLAR_RATE_5S:g}"
+                f"&price_chg={pc * 100:+.2f}%>=+{SURGE_FLOW_MIN_PRICE_RISE_PCT * 100:g}%",
+            )
 
         return (False, "")
 
@@ -1338,8 +1445,9 @@ def main():
                         help="Composite rule: minimum trades_in_5s floor.")
     parser.add_argument("--surge-max-price-drop-pct", type=float,
                         default=DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
-                        help="Composite rule: block trigger if last price is more than "
-                             "this fraction below the session-start price "
+                        help="Active VETO (since 2026-07-07): block every trigger rule "
+                             "while the last price is more than this fraction below "
+                             "the session-start price "
                              "(e.g. 0.005 = 0.5%%; 0 blocks any net drop).")
     parser.add_argument("--surge-min-quote-updates", type=int,
                         default=DEFAULT_SURGE_MIN_QUOTE_UPDATES,

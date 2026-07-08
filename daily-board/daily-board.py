@@ -39,7 +39,7 @@ import os
 import re
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from ib_insync import IB, Stock
@@ -91,6 +91,17 @@ DEFAULT_WIDTH_CAP = 22
 
 LOG_PATH = os.path.join(LOG_DIR, 'daily-board.log')
 log = logging.getLogger('daily-board')
+
+
+def _parse_stop_time(s):
+    """Parse a HH:MM auto-stop time (ET) into a datetime.time.
+
+    Returns None when disabled (empty/blank string). Raises ValueError on a
+    malformed value so the caller can report it.
+    """
+    if s is None or not s.strip():
+        return None
+    return datetime.strptime(s.strip(), '%H:%M').time()
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +288,7 @@ class DataManager:
             return
 
         secs = int((now_utc - min(past.values())).total_seconds())
-        duration, bar_size = self._duration_and_bar(secs)
+        duration, bar_size, bar_len = self._duration_and_bar(secs)
         try:
             bars = self.ib.reqHistoricalData(
                 contract,
@@ -299,26 +310,34 @@ class DataManager:
                   flush=True)
             return
 
+        # IBKR labels each intraday bar by its START time, so the bar that
+        # actually CONTAINS the arrival instant has a date a fraction of a
+        # second (up to bar_len) before arrival_utc. Include it: that minute is
+        # where the PR spike lands. Its open is the pre-spike baseline and its
+        # high captures the pop. A bar starting at `d` spans [d, d + bar_len),
+        # so it covers the arrival when d + bar_len > arrival_utc.
+        cutoff = timedelta(seconds=bar_len)
         for i, arrival_utc in past.items():
-            later = [b for b in bars if b.date >= arrival_utc]
+            later = [b for b in bars if b.date + cutoff > arrival_utc]
             if not later:
                 continue
             self.backfill_high[i] = round(max(b.high for b in later), 4)
-            # First (oldest) bar's open ~ price at ArrivalTime.
+            # Containing (oldest) bar's open ~ price just before the PR spike.
             self.arrival_price[i] = round(later[0].open, 4)
 
     @staticmethod
     def _duration_and_bar(secs):
         """Pick an IBKR durationStr / barSize for a span of `secs` seconds.
 
+        Returns (durationStr, barSizeSetting, bar_len_seconds).
         Intraday (the real use case) uses 1-min bars. Stale files spanning more
         than a day are capped so the request still succeeds (the high then covers
         the capped window rather than the full since-arrival range).
         """
         if secs <= 86400:
-            return f"{max(secs, 60)} S", '1 min'
+            return f"{max(secs, 60)} S", '1 min', 60
         days = min(math.ceil(secs / 86400) + 1, 10)
-        return f"{days} D", '10 mins'
+        return f"{days} D", '10 mins', 600
 
     # -- live updates ------------------------------------------------------
 
@@ -672,7 +691,7 @@ def _handle_key(ch, snap, state):
     return True
 
 
-def run_board(stdscr, dm: DataManager):
+def run_board(stdscr, dm: DataManager, stop_time=None):
     curses.curs_set(0)
     stdscr.timeout(50)            # getch blocks at most 50ms
     _init_colors()
@@ -681,6 +700,14 @@ def run_board(stdscr, dm: DataManager):
     snap = dm.build_snapshot()
     last_compute = time.time()
     last_write = 0.0              # 0 => write immediately on the first iteration
+
+    # Concrete cutoff datetime (ET). The launch-time guard in main() ensures we
+    # start before it, so today's date always yields a future cutoff.
+    stop_dt = None
+    if stop_time is not None:
+        stop_dt = datetime.now(ET).replace(
+            hour=stop_time.hour, minute=stop_time.minute,
+            second=0, microsecond=0)
 
     while True:
         _draw(stdscr, snap, state)
@@ -704,6 +731,13 @@ def run_board(stdscr, dm: DataManager):
         if now - last_write >= WRITE_SECONDS:
             write_tsv(dm, snap, state)
             last_write = now
+
+        # Auto-stop at the scheduled ET time so the board stops holding an IB
+        # Gateway API slot + streaming subscriptions overnight. Flush first,
+        # mirroring the quit path above.
+        if stop_dt is not None and datetime.now(ET) >= stop_dt:
+            write_tsv(dm, snap, state)
+            break
 
 
 # --------------------------------------------------------------------------- #
@@ -740,11 +774,22 @@ def main():
                              f"(default: daily-board_<input-date>.tsv in {_SCRIPT_DIR})")
     parser.add_argument('--rth', action='store_true',
                         help="regular trading hours only (default: all hours)")
+    parser.add_argument('--stop-time', default='20:00',
+                        help="auto-stop the board at this ET wall-clock time "
+                             "(HH:MM, default 20:00; use '' to disable) so it "
+                             "stops holding an IB Gateway slot overnight")
     args = parser.parse_args()
 
     global USE_RTH
     if args.rth:
         USE_RTH = True
+
+    try:
+        stop_time = _parse_stop_time(args.stop_time)
+    except ValueError:
+        print(f"[daily-board] Invalid --stop-time {args.stop_time!r} "
+              f"(expected HH:MM, e.g. 20:00).")
+        return
 
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -767,6 +812,18 @@ def main():
         return
     print(f"[daily-board] Loaded {len(rows)} rows from {os.path.basename(path)}.")
 
+    # Late-start guard: if we're already past the auto-stop time, don't even
+    # open an IB Gateway connection.
+    if stop_time is not None:
+        stop_dt = datetime.now(ET).replace(
+            hour=stop_time.hour, minute=stop_time.minute,
+            second=0, microsecond=0)
+        if datetime.now(ET) >= stop_dt:
+            print(f"[daily-board] Past stop time {args.stop_time} ET — "
+                  f"exiting without connecting.")
+            return
+        print(f"[daily-board] Will auto-stop at {args.stop_time} ET.")
+
     ib = IB()
     print(f"[daily-board] Connecting to IBKR {args.host}:{args.port} "
           f"clientId={args.client}...")
@@ -787,7 +844,7 @@ def main():
     dm.out_path = args.out or _default_out_path(path)
     try:
         dm.prepare(max_symbols=args.max_symbols)
-        curses.wrapper(run_board, dm)
+        curses.wrapper(run_board, dm, stop_time)
     except KeyboardInterrupt:
         pass
     finally:

@@ -728,9 +728,19 @@ def main(argv: list[str] | None = None) -> int:
     n_complete = int(masks["complete"].sum())
     if n_complete < args.min_train_rows:
         log.error(f"Only {n_complete} complete rows (< --min-train-rows={args.min_train_rows}). "
-                  f"Writing input copy with empty sidecars and aborting.")
+                  f"Writing input copy (44444 sentinels preserved, cohort flags, "
+                  f"method='') and aborting.")
         df_out = df_in.copy()
-        df_out["ITI_impute_flag"]        = "skipped_nan"
+        # Undo the load-time sentinel→NaN conversion so the attempted-but-failed
+        # provenance survives the abort (mirrors trade_size_imputer's gate).
+        df_out.loc[was_rth_sentinel, "RTH_avgITI_sec"] = _PIPELINE_SENTINEL
+        df_out.loc[was_eth_sentinel, "ETH_avgITI_sec"] = _PIPELINE_SENTINEL
+        flag_col = pd.Series("ok", index=df_out.index, dtype=object)
+        flag_col.loc[masks["rth_target"]]   = "rth"
+        flag_col.loc[masks["eth_target"]]   = "eth"
+        flag_col.loc[masks["both_target"]]  = "both"
+        flag_col.loc[masks["nan_skipped"]]  = "skipped_nan"
+        df_out["ITI_impute_flag"]        = flag_col
         df_out["ITI_impute_method"]      = ""
         df_out = df_out[ORIG_COLS + SIDECAR_COLS]
         _write_output(df_out, output_path, input_path)

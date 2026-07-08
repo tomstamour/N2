@@ -118,13 +118,46 @@ TZ=America/New_York
 
 ---
 
-# `daily_universe_pipeline-2.py` — trade-size-enabled successor (NOT in cron)
+# `daily_universe_pipeline-2.py` — trade-size-enabled successor (THE nightly cron since 2026-06-08)
 
 Parallel to `pipeline_daily.py` but Step 3 also fetches a per-trade trade-size
 baseline (shares/trade) for RTH and ETH from the *same* TRADES bars (via
 `trade_frequency_and_size.addOn.py`'s 4-tuple `fetch_freq_async`), and the
 output gets two extra columns. Writes to a DISTINCT stem so it never collides
-with the production output: `data/nasdaq_symbols_data_priced_sized_YYYY-MM-DD.tsv`.
+with the old pipeline's output: `data/stocks_universe_YYYY-MM-DD.tsv`.
+
+## Cron entry (since 2026-07-07: paper Gateway + reduced Step 3 pressure)
+
+```
+30 20 * * * /home/tom/venv/bin/python3 …/daily_universe_pipeline-2.py --port 4002 --freq-concurrency 2 --freq-timeout 60 >> …/runs/cron.log 2>&1
+```
+
+**Why `--port 4002` (paper Gateway):** the 2026-07-06 incident. The pipeline
+shared the LIVE Gateway (4001) with the whole live trading stack (clerk-1.1's
+30-client pool, x-wing/mole RTVolume tick streams, daily-board's ~100 market
+data lines) for the first time that night, and the Gateway's historical path
+was starved from the very first request: 709× Error 162 + 745 timeouts
+(baseline: 18–57/night), 691/819 Step 3 failures, ~170/200 empties in every
+batch, zero pacing violations, zero disconnects, live data unaffected. None of
+the live-stack scripts issue ongoing `reqHistoricalData` — the contention is
+the live Gateway JVM itself servicing ~130+ tick lines while assembling
+historical responses (intraday-bar queries slow to 80–150 s+; daily bars stay
+fast, which is why Step 2 was 98% fine). The paper Gateway (IBC, port 4002,
+same 03:59 restart) is idle and serves the identical TRADES history —
+verified 2026-07-07. Isolation also kills the run-stacking hazard: daytime
+test runs on 4002 no longer poison the Gateway session the cron uses…
+as long as those tests also use 4002.
+
+`_run_concurrent` now has a **contention canary**: if >50% of the FIRST batch
+(≥50 symbols) comes back empty, it logs an ERROR naming this signature and the
+port — distinguishing it from the slot-exhaustion cascade (which builds up
+over time and floods Error 366).
+
+**`--freq-concurrency 2 --freq-timeout 60`** (cron flags; code defaults stay
+4/30): July 6 showed 30 s mass-times-out real queries when the historical path
+is under pressure; 60 s rides them out and concurrency 2 halves the standing
+load. Healthy-night cost: Step 3 wall time roughly doubles (~25 → ~50 min at
+~820 symbols), still far inside the 03:59 window.
 
 ## Steps 4–8 and the 38-column output
 
@@ -163,8 +196,16 @@ RTH_tradeSize, ETH_TradeSize, TradeSize_impute_flag, TradeSize_impute_method`.
 
 ## `trade_size_imputer.py` — the trade-size analogue of `ITI_imputer.py`
 
-**`ITI_imputer.py` is NEVER modified** — it's imported by the production cron
-`pipeline_daily.py` and enforces a strict 8-column schema. `trade_size_imputer.py`
+**`ITI_imputer.py` is treated as frozen** — it enforces a strict 8-column
+schema and is shared by both pipelines; don't touch it without explicit user
+approval. One approved exception (2026-07-07): the `< --min-train-rows` abort
+branch used to write the file with the 44444 sentinels erased (converted to
+NaN at load, never restored) and a blanket `ITI_impute_flag=skipped_nan` —
+which destroyed the attempted-vs-skipped provenance on the 2026-07-06
+catastrophic-fetch night. It now restores the sentinels and writes
+cohort-accurate flags (`ok`/`rth`/`eth`/`both`/`skipped_nan`) with method=""
+— the same gate behavior `trade_size_imputer.py` always had. Still rc=1;
+the normal imputation path is untouched. `trade_size_imputer.py`
 *imports* its schema-agnostic helpers (`_build_feature_frame`, `_fit_predict_hgb`,
 `_clip_to_p1_p99`, `_bin_counts`, `_is_feature_degenerate`) so both imputers share
 one feature/HGB engine and can't drift. Differences:
