@@ -18,6 +18,7 @@ config/n2_config_file.txt
 trade_mole_outputs/
 mole-outputs/
 outputs/
+outputs_*/
 ibkr_data/
 tables/
 # generated run logs — the *.txt ones can leak IBKR account IDs (e.g. preTrade_log.txt)
@@ -33,6 +34,10 @@ finbert_onnx/
 # --- and DO track the .tsv tables in orchestrator3/tables/ ---
 !orchestrator3/tables/
 !orchestrator3/tables/*.tsv
+
+# --- DO track only the filtered daily universe .tsv (stocks_universe_YYYY-MM-DD.tsv, no suffix variants) ---
+!universe_finder/data/
+!universe_finder/data/stocks_universe_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].tsv
 
 # --- always-ignore noise ---
 __pycache__/

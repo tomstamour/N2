@@ -244,9 +244,9 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            'Enrich a news TSV with fromPR_High(%%) and fromPR_HighTime(m:s) columns.\n\n'
+            'Enrich a news TSV with fromPR_High(%) and fromPR_HighTime(m:s) columns.\n\n'
             'Connects to an IBKR TWS/Gateway instance and, for each row, measures '
-            'the highest price reached since the PR "Created" time as a %% of the '
+            'the highest price reached since the PR "Created" time as a % of the '
             'price just before the PR came out (close of the last 1-min bar before '
             'Created), extended hours included. The window runs until 8 PM ET of '
             'the same session, or of the next trading session for PRs created '
