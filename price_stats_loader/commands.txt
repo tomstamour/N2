@@ -1,4 +1,9 @@
-ommands.txt
+
+
+
+
+
+Commands.txt
 ######
 python3 exchange_AddON.py --input inputs/news_output_2026-05-11.tsv --output-dir outputs
 
@@ -12,10 +17,10 @@ python3 finBERT_noCoref_AddON.py --input outputs/concatenated_enriched.tsv
 python3 rule-based-AddOn.py --column-name Headline --input outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings.tsv --output outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv
 
 #######
-python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir inputs/ -o outputs/PR-stats-2026-05-19to06-19-unfiltered.tsv
+python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir outputs/ -o outputs/PRstats_2026-06-20-2026-07-16_unfiltered.tsv
 
 ######
-python3 filter_float_dailyhigh.py --input outputs/PR-stats-2026-05-19to06-19-unfiltered.tsv --output outputs/PR-stats-2026-05-19to06-19-filtered-50float.tsv --MaxFloat 50 --string-to-exclude excluded_strings-2.txt 
+python3 coffee_filter.py --input outputs/PRstats_2026-06-20-2026-07-16_unfiltered.tsv --output outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter.tsv --MaxFloat 50 --string-to-exclude ../orchestrator5/excluded_strings-2.txt --remove-duplicates true
 
 ###### This command will get all the jsons files in the table and bring them to a single directory
 python3 json_regrouper.py -i ./outputs/PR-stats-2026-05-03to18-filtered-50float-12high.tsv

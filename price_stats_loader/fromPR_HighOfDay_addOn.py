@@ -4,11 +4,15 @@ import pandas_market_calendars as mcal
 import argparse
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 IB_HOST = '127.0.0.1'
-IB_PORT = 4001
+# Default to the idle paper Gateway (4002): these bulk 1-min extended-hours
+# queries contend with the live stack on 4001 (Error 162 "query cancelled").
+# Override with --port 4001 to use the live Gateway.
+IB_PORT = 4002
 CLIENT_ID = 7
 # 1-min extended-hours queries on illiquid small caps are slow on HMDS
 # (80-150s+ observed when the live stack shares the Gateway) — default high.
@@ -21,8 +25,9 @@ RECONNECT_ATTEMPTS = 3       # reconnect tries when the connection drops
 RECONNECT_BACKOFF_SECONDS = 5
 CONSECUTIVE_FAILURE_ABORT = 10  # abort run after this many US fetches fail in a row
 
-# US market closes at 4 PM ET; extended session ends at 8 PM ET.
+# US market closes at 4 PM ET; extended session runs 4 AM - 8 PM ET.
 MARKET_CLOSE_ET_HOUR = 16
+EXTENDED_OPEN_ET_HOUR = 4
 EXTENDED_CLOSE_ET_HOUR = 20
 
 EASTERN = ZoneInfo('America/New_York')
@@ -147,6 +152,29 @@ def bar_time_et(bar) -> datetime:
     return dt.astimezone(EASTERN)
 
 
+def open_seconds_between(start: datetime, end: datetime) -> int:
+    """Seconds between start and end that fall within extended trading sessions
+    (4 AM-8 PM ET on US trading days). Overnight closes (8 PM-4 AM) and
+    non-trading days contribute zero, so the result reflects only time the
+    market was open (extended hours included)."""
+    if end <= start:
+        return 0
+    total = 0
+    day = start.date()
+    while day <= end.date():
+        if is_trading_day(day):
+            sess_open = datetime(day.year, day.month, day.day,
+                                 EXTENDED_OPEN_ET_HOUR, tzinfo=EASTERN)
+            sess_close = datetime(day.year, day.month, day.day,
+                                  EXTENDED_CLOSE_ET_HOUR, tzinfo=EASTERN)
+            lo = max(start, sess_open)
+            hi = min(end, sess_close)
+            if hi > lo:
+                total += int((hi - lo).total_seconds())
+        day += timedelta(days=1)
+    return total
+
+
 def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
                        target_dt: date, request_timeout: int = REQUEST_TIMEOUT):
     """
@@ -235,13 +263,16 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
         return None, None, 'skip'
 
     pct = round((high - baseline) / baseline * 100, 2)
-    delta_s = max(0, int((high_time - created_dt).total_seconds()))
+    # Count only market-open (extended-session) time, so overnight closes and
+    # weekends/holidays between the PR and the high are not included.
+    delta_s = open_seconds_between(created_dt, high_time)
     high_time_str = f"{delta_s // 60:02d}:{delta_s % 60:02d}"
 
     return pct, high_time_str, 'ok'
 
 
 def main():
+    global IB_HOST, IB_PORT, CLIENT_ID
     parser = argparse.ArgumentParser(
         description=(
             'Enrich a news TSV with fromPR_High(%) and fromPR_HighTime(m:s) columns.\n\n'
@@ -251,7 +282,9 @@ def main():
             'Created), extended hours included. The window runs until 8 PM ET of '
             'the same session, or of the next trading session for PRs created '
             'after the close / on non-trading days. fromPR_HighTime(m:s) is the '
-            'elapsed MM:SS from Created to the bar where that high printed.\n\n'
+            'elapsed MM:SS from Created to the bar where that high printed, '
+            'counting only market-open (extended-session, 4 AM-8 PM ET) time so '
+            'overnight closes and weekends/holidays are excluded.\n\n'
             'Output file is named <input_stem>_fromPRhigh.tsv and written to '
             '--output-dir (defaults to the same directory as the input file).'
         ),
@@ -272,6 +305,23 @@ def main():
         help='Directory where the enriched TSV will be written. Defaults to the input file\'s directory.',
     )
     parser.add_argument(
+        '--output',
+        metavar='FILE',
+        dest='output_file',
+        default=None,
+        help='Exact output file path (overrides the <input_stem>_fromPRhigh.tsv naming). '
+             'May be the input file itself: the file is written to a temp path and '
+             'atomically renamed, so in-place enrichment is safe.',
+    )
+    parser.add_argument(
+        '--only-missing',
+        action='store_true',
+        dest='only_missing',
+        help='Incremental mode: keep existing fromPR_High(%%) values and only fetch rows '
+             'where it is empty and fromPR_status is not "skip". Without this flag all '
+             'rows are (re)scored, as before.',
+    )
+    parser.add_argument(
         '--timeout', '-t',
         type=int,
         default=REQUEST_TIMEOUT,
@@ -286,20 +336,58 @@ def main():
         default=None,
         help='Path to a log file. Log output is written here (appended) in addition to the console.',
     )
+    parser.add_argument(
+        '--host',
+        default=IB_HOST,
+        metavar='HOST',
+        help=f'IBKR TWS/Gateway host (default: {IB_HOST}).',
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=IB_PORT,
+        metavar='PORT',
+        help=f'IBKR TWS/Gateway API port (default: {IB_PORT}). 4002 = idle paper '
+             'Gateway, recommended for bulk historical to avoid live-stack '
+             'contention (Error 162); 4001 = live Gateway.',
+    )
+    parser.add_argument(
+        '--client-id',
+        type=int,
+        default=CLIENT_ID,
+        metavar='ID',
+        dest='client_id',
+        help=f'IBKR API client id (default: {CLIENT_ID}). Use a distinct id to '
+             'avoid collisions when running alongside other scripts on the same Gateway.',
+    )
     args = parser.parse_args()
+
+    IB_HOST = args.host
+    IB_PORT = args.port
+    CLIENT_ID = args.client_id
 
     setup_logging(args.log_file)
     if args.log_file:
         logging.info(f"Logging to {os.path.abspath(args.log_file)}")
 
-    df = pd.read_csv(args.input_file, sep='\t')
+    # dtype=str keeps every untouched column byte-for-byte on the round-trip;
+    # default inference would e.g. rewrite integer columns that contain gaps as
+    # floats, silently mutating the master on --only-missing in-place runs.
+    df = pd.read_csv(args.input_file, sep='\t', dtype=str)
     if 'Created' not in df.columns:
         logging.error("Column 'Created' not found in input file. Run createdTime_AddOn.py first.")
         return
-    df['fromPR_High(%)'] = None
-    df['fromPR_HighTime(m:s)'] = None
+    result_cols = ['fromPR_High(%)', 'fromPR_HighTime(m:s)', 'fromPR_status']
+    if args.only_missing:
+        for col in result_cols:
+            if col not in df.columns:
+                df[col] = None
+    else:
+        for col in result_cols:
+            df[col] = None
 
     ib = IB()
+    aborted = False
     try:
         logging.info(f"Connecting to IBKR at {IB_HOST}:{IB_PORT} clientId={CLIENT_ID}...")
         try:
@@ -309,20 +397,33 @@ def main():
                 f"Connection refused on {IB_HOST}:{IB_PORT}. "
                 "Make sure TWS or IB Gateway is running with API connections enabled."
             )
-            return
+            sys.exit(1)
         except Exception as e:
             logging.error(f"Could not connect to IBKR: {e}")
-            return
+            sys.exit(1)
         if not ib.isConnected():
             logging.error("Failed to connect to IBKR. Exiting.")
-            return
+            sys.exit(1)
         logging.info("Connected.")
 
         cache: dict = {}
         consecutive_failures = 0
+        already_scored = 0
 
         for idx, row in df.iterrows():
             symbol = str(row['Symbol']).strip()
+
+            if args.only_missing:
+                # Keep rows that already have a value, and don't retry rows marked
+                # 'skip' (permanent per-symbol/data conditions). 'failure' rows
+                # (transient HMDS/connectivity) stay blank and are retried here.
+                if pd.notna(row['fromPR_High(%)']):
+                    already_scored += 1
+                    continue
+                prior_status = str(row['fromPR_status']).strip() if pd.notna(row['fromPR_status']) else ''
+                if prior_status == 'skip':
+                    continue
+
             created_str = str(row['Created']).strip() if pd.notna(row['Created']) else ''
             arrival_str = str(row.get('ArrivalTime', '')).strip()
             arrival_date_str = str(row.get('ArrivalDate', '')).strip()
@@ -330,10 +431,12 @@ def main():
 
             if not created_str:
                 logging.info(f"Row {idx} ({symbol}): empty Created — skipping.")
+                df.at[idx, 'fromPR_status'] = 'skip'
                 continue
 
             if exchange and not is_us_exchange(exchange):
                 logging.info(f"{symbol}: exchange '{exchange}' not in US subscription — skipping.")
+                df.at[idx, 'fromPR_status'] = 'skip'
                 continue
 
             if not exchange:
@@ -344,6 +447,7 @@ def main():
                 target_dt = get_target_date(created_dt)
             except Exception as e:
                 logging.warning(f"Row {idx} ({symbol}): could not parse Created '{created_str}' — {e}")
+                df.at[idx, 'fromPR_status'] = 'skip'
                 continue
 
             cache_key = (symbol, created_dt)
@@ -351,7 +455,7 @@ def main():
                 logging.info(f"Fetching fromPR high for {symbol} since {created_dt} (window ends {target_dt} 20:00 ET)...")
                 pct, high_time_str, status = fetch_from_pr_high(
                     ib, symbol, created_dt, target_dt, args.timeout)
-                cache[cache_key] = (pct, high_time_str)
+                cache[cache_key] = (pct, high_time_str, status)
 
                 # Track consecutive genuine fetch failures to detect an HMDS outage.
                 # 'skip' (unqualifiable contract / no baseline/window bars) is a
@@ -364,32 +468,45 @@ def main():
                             f"Aborting to avoid silent data loss; restart IB Gateway and re-run. "
                             f"Last attempted: {symbol} since {created_dt} (row {idx})."
                         )
+                        aborted = True
                         break
                 elif status == 'ok':
                     consecutive_failures = 0
 
                 ib.sleep(PACING_SLEEP_SECONDS)
             else:
-                pct, high_time_str = cache[cache_key]
+                pct, high_time_str, status = cache[cache_key]
 
             df.at[idx, 'fromPR_High(%)'] = pct
             df.at[idx, 'fromPR_HighTime(m:s)'] = high_time_str
+            df.at[idx, 'fromPR_status'] = status
 
     finally:
         if ib.isConnected():
             ib.disconnect()
             logging.info("Disconnected.")
 
-    input_stem = os.path.splitext(os.path.basename(args.input_file))[0]
-    out_dir = args.output_dir if args.output_dir else os.path.dirname(os.path.abspath(args.input_file))
-    out_path = os.path.join(out_dir, f"{input_stem}_fromPRhigh.tsv")
-    df.to_csv(out_path, sep='\t', index=False)
+    if args.output_file:
+        out_path = os.path.abspath(args.output_file)
+    else:
+        input_stem = os.path.splitext(os.path.basename(args.input_file))[0]
+        out_dir = args.output_dir if args.output_dir else os.path.dirname(os.path.abspath(args.input_file))
+        out_path = os.path.join(out_dir, f"{input_stem}_fromPRhigh.tsv")
+    tmp_path = out_path + '.tmp'
+    df.to_csv(tmp_path, sep='\t', index=False)
+    os.replace(tmp_path, out_path)
     logging.info(f"Saved enriched file to {out_path}")
     filled = df['fromPR_High(%)'].notna().sum()
     logging.info(
         f"Rows processed: {len(df)}, unique (symbol, created) lookups: {len(cache)}, "
         f"rows with fromPR_High(%): {filled}, blank: {len(df) - filled}"
     )
+    if args.only_missing:
+        logging.info(f"Rows already scored, kept untouched: {already_scored}")
+    if aborted:
+        # Partial results are saved above; nonzero exit lets a caller (cron
+        # pipeline) flag the run. Missing rows are retried on the next run.
+        sys.exit(2)
 
 
 if __name__ == '__main__':

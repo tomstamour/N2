@@ -55,6 +55,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from ib_insync import IB, Stock
 
+try:
+    import pandas_market_calendars as _mcal
+except ImportError:
+    _mcal = None
+
 log = logging.getLogger(__name__)
 
 # ── Session constants (seconds-since-midnight ET) ────────────────────────────
@@ -100,8 +105,33 @@ _IBKR_VOLUME_LOT_MULTIPLIER = 1
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def past_trading_days(n: int) -> list:
-    """Return the last n weekdays (Mon–Fri) as YYYYMMDD strings, newest first."""
-    days, d = [], datetime.now(tz=ET).date() - timedelta(days=1)
+    """
+    Return the last n complete NYSE trading days as YYYYMMDD strings, newest
+    first. "Today" counts as complete once the after-hours session has closed
+    (now >= 20:00 ET); before that the walk starts at yesterday, so a partial
+    session can never enter the lookback (a partial day's trade count divided
+    by the full session length would inflate the ITI).
+
+    Trading days come from the NYSE calendar (pandas_market_calendars), so
+    market holidays are skipped — essential at lookback=1, where a holiday in
+    the window would otherwise blank the entire universe (all metrics → 44444
+    → whole-file imputation). Falls back to a weekday-only walk when the
+    calendar library is unavailable.
+    """
+    now = datetime.now(tz=ET)
+    d = now.date()
+    if now.hour < 20:
+        d -= timedelta(days=1)
+
+    if _mcal is not None:
+        start = d - timedelta(days=max(2 * n + 10, 15))
+        valid = _mcal.get_calendar("NYSE").valid_days(start_date=start, end_date=d)
+        if len(valid) >= n:
+            return [ts.strftime("%Y%m%d") for ts in reversed(valid[-n:])]
+        log.warning("past_trading_days: NYSE calendar returned only %d of %d "
+                    "days — falling back to weekday walk", len(valid), n)
+
+    days = []
     while len(days) < n:
         if d.weekday() < 5:
             days.append(d.strftime("%Y%m%d"))
@@ -158,7 +188,17 @@ def compute_session_itis(bars, days: list) -> tuple:
     """
     Scan 1-minute bars (useRTH=False) and compute per-day trade counts for RTH
     and ETH sessions. Returns (rth_itis, eth_itis) as lists of per-day ITI values.
-    Days with zero trades in a session are excluded from that session's list.
+
+    A session with zero trades contributes a *censored* real value: the full
+    session length (RTH 23,400 s / ETH 34,200 s). Zero trades in a session is a
+    genuine observation ("gap between trades is at least the whole session"),
+    not missing data — both callers only reach this function after verifying
+    the fetch returned bars, so a zero count is trustworthy. This keeps
+    genuinely dead sessions as huge REAL ITIs (imputer flag `ok`, and they
+    join the imputer's training set) instead of cascading into NaN → 44444 →
+    model-imputed values. The scale stays continuous: 1 trade also scores the
+    session length. True fetch failures (no bars at all) still return NaN
+    upstream and follow the sentinel/imputation path.
     """
     rth_by_date: dict = {}
     eth_by_date: dict = {}
@@ -180,19 +220,17 @@ def compute_session_itis(bars, days: list) -> tuple:
     rth_itis, eth_itis = [], []
     for day in days:
         rth_trades = rth_by_date.get(day, 0)
-        if rth_trades > 0:
-            rth_itis.append(RTH_SEC / rth_trades)
+        rth_itis.append(RTH_SEC / rth_trades if rth_trades > 0 else float(RTH_SEC))
         eth_trades = eth_by_date.get(day, 0)
-        if eth_trades > 0:
-            eth_itis.append(ETH_SEC / eth_trades)
+        eth_itis.append(ETH_SEC / eth_trades if eth_trades > 0 else float(ETH_SEC))
 
     return rth_itis, eth_itis
 
 
-def compute_session_volumes(bars) -> tuple:
+def compute_session_volumes(bars, days: list) -> tuple:
     """
-    Aggregate average volume-per-trade for RTH and ETH sessions over the full
-    set of bars (the whole lookback window). For each session:
+    Aggregate average volume-per-trade for RTH and ETH sessions over the
+    lookback days. For each session:
 
         volPerTrade = (Σ bar.volume × _IBKR_VOLUME_LOT_MULTIPLIER) / Σ bar.barCount
 
@@ -200,17 +238,23 @@ def compute_session_volumes(bars) -> tuple:
     the live detector's mean_size_{w}s. No per-day split or IQR filtering: the
     aggregate ratio is the intended statistic.
 
+    Only bars whose date is in `days` are counted — same filter as
+    compute_session_itis, so trade size and ITI always describe the same
+    sessions. (Previously every fetched bar was aggregated, silently including
+    the +4-calendar-day request buffer and today's partial session.)
+
     Returns (rth_volPerTrade, eth_volPerTrade); either is None when that session
     had zero trades across the window.
     """
+    day_set = set(days)
     rth_vol_sum = 0.0
     eth_vol_sum = 0.0
     rth_trades = 0
     eth_trades = 0
 
     for bar in bars:
-        tod, _date_str = _bar_et_components(bar)
-        if tod is None:
+        tod, date_str = _bar_et_components(bar)
+        if tod is None or date_str not in day_set:
             continue
         bc = int(getattr(bar, "barCount", 0) or 0)
         if bc <= 0:
@@ -309,7 +353,7 @@ def fetch_freq(ib: IB, symbol: str, days: list, delay_ms: int) -> tuple:
         return nan, nan, nan, nan
 
     rth_itis, eth_itis = compute_session_itis(bars, days)
-    rth_vpt, eth_vpt   = compute_session_volumes(bars)
+    rth_vpt, eth_vpt   = compute_session_volumes(bars, days)
 
     rth_avg = iqr_filtered_mean(rth_itis)
     eth_avg = iqr_filtered_mean(eth_itis)
@@ -394,7 +438,7 @@ async def fetch_freq_async(ib: IB, symbol: str, days: list, sem: asyncio.Semapho
             return nan, nan, nan, nan
 
         rth_itis, eth_itis = compute_session_itis(bars, days)
-        rth_vpt, eth_vpt   = compute_session_volumes(bars)
+        rth_vpt, eth_vpt   = compute_session_volumes(bars, days)
         rth_avg = iqr_filtered_mean(rth_itis)
         eth_avg = iqr_filtered_mean(eth_itis)
         return (

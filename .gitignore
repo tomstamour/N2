@@ -19,6 +19,7 @@ trade_mole_outputs/
 mole-outputs/
 outputs/
 outputs_*/
+model_trained_on_*/
 ibkr_data/
 tables/
 # generated run logs — the *.txt ones can leak IBKR account IDs (e.g. preTrade_log.txt)

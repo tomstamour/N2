@@ -1,0 +1,1 @@
+In the directory/project we are implementing different scripts each running en  encoder model that will score a PR headline text and output the usual sentiment score metrics.  The headliine scoring as to process in under 150 milliseconds with a prewarmed model.

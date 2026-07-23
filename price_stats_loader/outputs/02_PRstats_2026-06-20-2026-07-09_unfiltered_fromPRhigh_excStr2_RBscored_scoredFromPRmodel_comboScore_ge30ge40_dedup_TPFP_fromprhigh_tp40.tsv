@@ -1,0 +1,7 @@
+level	positive	nocoref_neutral_filter	model_proba_PLUS_kw_mult_nb	model_proba	model_proba_hl	kw_mult_nb_log	Headline-RBscore
+0.5	17/132	12/69	16/58	21/156	14/136	33/271	34/337
+0.6	16/119	1/21	14/46	15/51	11/71	33/267	16/116
+0.7	12/88	1/2	10/35	2/11	7/25	31/264	10/45
+0.8	9/52	0/0	5/24	0/0	2/2	31/257	1/11
+0.9	4/18	0/0	1/11	0/0	0/0	29/246	1/5
+0.95	0/1	0/0	0/3	0/0	0/0	29/235	1/2

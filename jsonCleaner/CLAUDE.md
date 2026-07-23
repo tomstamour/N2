@@ -4,35 +4,6 @@
 
 `jsonCleaner.py` extracts and cleans news article text from Alpaca Benzinga JSON files for downstream FinBERT sentiment analysis. It processes three text fields (headline, summary, content) through a multi-step cleaning pipeline and writes the results to a single JSON output file with flexible field selection.
 
-## Usage
-
-### Basic Usage
-```bash
-./jsonCleaner.py --input FEED_28-jan-2026.json
-```
-
-### With Custom Log Directory
-```bash
-./jsonCleaner.py --input /path/to/news.json --log-dir /var/logs/jsonCleaner
-```
-
-### Selective Field Processing
-```bash
-# Headline only
-./jsonCleaner.py --input FEED_28-jan-2026.json --parts-to-process 1
-
-# Headline + Summary
-./jsonCleaner.py --input FEED_28-jan-2026.json --parts-to-process 2
-
-# All fields (headline, summary, content) - default
-./jsonCleaner.py --input FEED_28-jan-2026.json --parts-to-process 3
-```
-
-### Command-Line Arguments
-- `--input` (required): Path to input JSON file from Alpaca News API
-- `--log-dir` (optional): Directory for log files. Default: `./logs`
-- `--parts-to-process` (optional): Select fields to include (1=headline only, 2=headline+summary, 3=all fields). Default: `3`
-
 ## Input/Output
 
 ### Input Format
@@ -231,20 +202,6 @@ ERROR: Missing required fields: {'summary'}
 4. **Worker failures** → Log error, continue processing other fields
 5. **Partial results** → Report which fields succeeded (e.g., "2/3 fields")
 
-## Installation
-
-### Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-**Requires:**
-- Python 3.7+ (for ProcessPoolExecutor, asyncio, os.replace)
-- `lxml>=4.9.0` (for efficient HTML parsing)
-
-**Standard library only (no installation):**
-- `json`, `re`, `html`, `argparse`, `logging`, `pathlib`, `concurrent.futures`, `signal`, `os`
-
 ## Performance Characteristics
 
 ### Cleaning Speed
@@ -266,81 +223,6 @@ Text is ready for:
 - FinBERT sentiment analysis
 - Other NLP pipelines expecting clean text
 
-## Example Workflow
-
-### 1. Download Alpaca News
-```bash
-# Use historicalNewsFetch.py to get JSON files
-./historicalNewsFetch.py --symbol FEED --start-time 2026-01-01 --end-time 2026-01-31
-```
-
-### 2. Clean JSON Files
-```bash
-# Process with all fields
-./jsonCleaner.py --input FEED_28-jan-2026.json
-
-# Process headline only for quick scanning
-./jsonCleaner.py --input FEED_28-jan-2026.json --parts-to-process 1
-
-# Process headline + summary for medium analysis
-./jsonCleaner.py --input FEED_28-jan-2026.json --parts-to-process 2
-
-# Or process in batch with find
-find . -name "FEED*.json" -exec ./jsonCleaner.py --input {} \;
-```
-
-### 3. Use Cleaned Output
-```python
-# In your FinBERT pipeline
-import json
-
-with open('FEED_28-jan-2026_cleaned.json', 'r') as f:
-    data = json.load(f)
-    headline_text = data['headline']
-    sentiment = finbert_model(headline_text)
-
-    # Access other fields if available
-    if 'summary' in data:
-        summary_sentiment = finbert_model(data['summary'])
-    if 'content' in data:
-        content_sentiment = finbert_model(data['content'])
-```
-
-## Troubleshooting
-
-### "Input file not found"
-Check path is correct:
-```bash
-ls -la /path/to/file.json
-```
-
-### "Invalid JSON file"
-Validate JSON syntax:
-```bash
-python3 -m json.tool input.json | head
-```
-
-### "Missing required fields"
-Verify JSON has headline, summary, content:
-```bash
-python3 -c "import json; print(json.load(open('file.json')).keys())"
-```
-
-### "lxml parsing failed"
-Check if lxml is installed:
-```bash
-pip install lxml>=4.9.0
-```
-
-The script will fall back to regex if lxml fails, so cleaning continues even without lxml.
-
-### Empty or missing output file
-Check if the input file exists and has valid JSON:
-```bash
-python3 -m json.tool FEED_28-jan-2026.json | head
-tail -20 ./logs/jsonCleaner_*.log
-```
-
 ## Known Limitations
 
 1. **URL removal is greedy** - Removes URLs even if embedded in words (rare)
@@ -348,11 +230,3 @@ tail -20 ./logs/jsonCleaner_*.log
 3. **No output validation** - Assumes FileWriter always succeeds
 4. **JSON output only** - Use jq or Python to convert to other formats if needed
 
-## Future Enhancements
-
-Potential improvements (not implemented):
-- Batch mode: process directory of JSON files
-- Output format options: JSON, CSV, Parquet
-- Custom cleaning profiles (enable/disable steps)
-- Text statistics: readability score, token count
-- Incremental processing: skip already-cleaned files

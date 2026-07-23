@@ -1,0 +1,90 @@
+Orchestrator5 — version control
+================================================================================
+One standalone process that turns the RTPR firehose news stream into (a) a daily
+TSV of scored press releases and (b) real-time arm/sentiment trade signals to the
+clerk's warm IBKR client pool.
+
+Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
+  - Standalone feed-client of RTPR_connector3 over loopback TCP 127.0.0.1:8900
+    (successor of orchestrator3/Orchestrator4.2.py).
+  - Reception in _on_row_built (main/feed thread, kept lean) -> per-ticker
+    _collect_and_log on worker pools.
+  - Per-day article-ID dedup + same-day (headline+tickers) content dedup
+    (RTPR re-publishes under new IDs: PRZO, FOFO).
+  - Two kept NW4 input filters (ticker count <= 2; NW4 excluded_strings drop) +
+    local arm-block excluded_strings-2.txt.
+  - Clerk handshake: STEP 1a ARM on reception, STEP 1b SENTIMENT "OK"/"BAD" after
+    scoring. Missed-while-disconnected PRs are dropped by design (gap logged).
+  - Run exactly ONE orchestrator at a time — never two of 5.0/5.1/5.2 (double-arm).
+
+Current version: Orchestrator5.2.py.  5.1 and 5.0 are frozen predecessors.
+
+
+--------------------------------------------------------------------------------
+O5.0  (frozen baseline; Orchestrator5.0.py)
+--------------------------------------------------------------------------------
+Scoring:
+  - Headline FinBERT (ProsusAI/finbert, ONNX INT8) only.
+  - Body pipeline: 5 "nocoref_*" body-FinBERT scores via
+    finBERT_neutral_management_addON.aggregate (neutral_filter,
+    confidence_weighted, net_score, top_k, positional) — recorded, NOT gated on.
+Trade gate (_evaluate_sentiment):
+  - Headline FinBERT alone: positive >= 0.8  -> "OK", else "BAD".
+TSV: 31 columns, incl. OrchTime, Sentiment, ClerkArm, ClerkSentiment, the 5
+     nocoref_* scores, NoCorefCompletedAt.  Body cell = RAW payload one-lined.
+
+
+--------------------------------------------------------------------------------
+5.0 -> 5.1  (~2026-07-15; Orchestrator5.1.py)
+--------------------------------------------------------------------------------
+Scoring / body pipeline:
+  - DROPPED the entire nocoref body-FinBERT pipeline (all 5 nocoref_* scores +
+    NoCorefCompletedAt, and the finBERT_neutral_management_addON import).
+  - ADDED the keyword/combo body scorer (tools/keyword/keyword_scorer-2.py,
+    frozen ge15 artifacts + pinned prevalence 0.185 + frozen combo JSON),
+    producing model_proba_PLUS_kw_mult_nb.  Startup hard-fails if the combo JSON
+    is missing (a trading process must not run with a silently-missing score).
+Trade gate (_evaluate_trigger) — now an OR of two legs (no vetoes):
+  - FinBERT leg: headline positive >= 0.83   (SENTIMENT_POSITIVE_MIN)
+  - Keyword leg: body combo    >= 0.6        (COMBO_TRIGGER_MIN)
+  - A None leg is false; both None -> BAD.  Trigger source recorded in the TSV
+    ClerkSentiment cell ("Keyword_FinBERT:sent" / "Keyword:sent" / "BAD:sent" /
+    "skipped:*"); wire protocol to the clerk stays OK/BAD.
+TSV: 31 -> 24 columns.
+  - Removed: OrchTime (now log-only), Sentiment, ClerkArm, the 5 nocoref_*,
+    NoCorefCompletedAt.
+  - Added: model_proba_PLUS_kw_mult_nb (exact name — downstream tooling matches
+    on it), KwScoreCompletedAt.
+  - Header-mismatch rotation (old file -> *_rotated.tsv) makes switching versions
+    mid-day safe.  Live combo == offline rescore of the Body cell at 6 dp
+    (verified 2026-07-15).
+
+
+--------------------------------------------------------------------------------
+5.1 -> 5.2  (2026-07-20; Orchestrator5.2.py)  [CURRENT]
+--------------------------------------------------------------------------------
+Scoring:
+  - ADDED a 2nd headline model, FinMarBa (baptle/FinBERT_market_based, ONNX INT8;
+    tools/Encoder_Models/FinMarBa_headliner.py), run in its OWN thread pool
+    (_finmarba_executor) submitted alongside FinBERT in _on_row_built so the two
+    run concurrently (both ONNX -> session.run() releases the GIL).  Its
+    "indecisive" class is the new headline-leg confirmation.
+  - Both headline models are pre-warmed + smoke-inferred at startup.
+Trade gate (_evaluate_trigger) — still an OR of two legs; headline leg tightened:
+  - Headline leg: FinBERT positive >= 0.6  AND  FinMarBa indecisive <= 0.1
+                  (SENTIMENT_POSITIVE_MIN=0.6, new FMB_INDECISIVE_MAX=0.1)
+  - Keyword  leg: body combo >= 0.6        (unchanged)
+  - REMOVED the old 5.1 "positive >= 0.83"-alone leg.
+  - None-safe per condition (missing positive OR indecisive kills the headline
+    leg; missing combo kills the keyword leg; both legs false -> BAD).
+  - ClerkSentiment labels: Keyword_FinBERT_FMB / FinBERT_FMB / Keyword / BAD.
+TSV: 24 -> 30 columns.
+  - Added a FinMarBa block after the FinBERT "label" column: FMB_time,
+    FMB_positive, FMB_indecisive, FMB_negative, FMB_sentiment_score, FMB_label.
+    Only FMB_indecisive feeds the gate; the rest are for offline re-analysis.
+Logs: logs/Orchestrator5.2_YYYY_MM_DD.log.
+Note (parallelism): threads (not multiprocessing) were chosen deliberately — both
+  models are ONNX INT8, so processes would only add IPC on the same CPU.  On this
+  8-thread box each ~8 ms inference already spreads across all cores, so two at
+  once mostly time-share (pair ~20 ms, ~no wall-clock overlap); the win is that
+  both start at reception and overlap the longer clerk-arm round-trip + kw scoring.

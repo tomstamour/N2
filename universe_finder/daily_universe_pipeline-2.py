@@ -117,7 +117,7 @@ _OUTPUT_STEM = "stocks_universe"
 # Strict: NaN in any criterion = drop.
 _FILTER_MAX_FLOAT_M = 50.0    # Float_M must be < 50 M shares
 _FILTER_MAX_MCAP_M  = 40.0    # MarketCap_M must be < 40 M
-_FILTER_MAX_PRICE   = 4.00    # LastDailyClosePrice must be < $4.00
+_FILTER_MAX_PRICE   = 6.00    # LastDailyClosePrice must be < $6.00
 
 # The trade-size addon module has a literal '.' in its filename
 # (trade_frequency_and_size.addOn.py), so it can't be imported by name — load
@@ -342,8 +342,10 @@ def main() -> None:
     parser.add_argument("--clientID", type=int, default=10,   metavar="ID")
     parser.add_argument("--refresh",  action="store_true",
                         help="Force fresh symbol/float fetch (ignore 24h cache)")
-    parser.add_argument("--past-days-lookback", type=int, default=3, metavar="N",
-                        help="Trading days to average for RTH/ETH avg ITI (Step 3)")
+    parser.add_argument("--past-days-lookback", type=int, default=1, metavar="N",
+                        help="Complete trading sessions to average for Step 3 "
+                             "ITI/trade-size (default 1 = last complete session "
+                             "only; 'today' counts once past 20:00 ET)")
     parser.add_argument("--price-concurrency", type=int, default=12, metavar="N",
                         help="Max in-flight IBKR requests for Step 2 (close prices)")
     parser.add_argument("--freq-concurrency", type=int, default=4, metavar="N",
@@ -728,12 +730,25 @@ def main() -> None:
         try:
             existing = pd.read_csv(output_path, sep="\t")
             existing_total = max(1, len(existing))
-            existing_rth = int(
-                existing["RTH_avgITI_sec"].notna().sum()
-                - (existing["RTH_avgITI_sec"] == 44444).sum())
-            existing_eth = int(
-                existing["ETH_avgITI_sec"].notna().sum()
-                - (existing["ETH_avgITI_sec"] == 44444).sum())
+            if "ITI_impute_flag" in existing.columns:
+                # The existing file is post-imputation: its 44444 sentinels
+                # were already filled with predictions, so a raw value/44444
+                # count scores it as a perfect N/N and unfairly demotes every
+                # nightly cron whose new (pre-impute) df still carries un-fetched
+                # ETH sentinels. Recover the ACTUAL fetched counts from the
+                # cohort flag so we compare like-for-like (fetched-vs-fetched).
+                #   ok  -> both fetched; rth -> RTH imputed; eth -> ETH imputed;
+                #   both -> neither fetched; skipped_nan -> never attempted.
+                flag = existing["ITI_impute_flag"].astype(str)
+                existing_rth = int(flag.isin(["ok", "eth"]).sum())
+                existing_eth = int(flag.isin(["ok", "rth"]).sum())
+            else:
+                existing_rth = int(
+                    existing["RTH_avgITI_sec"].notna().sum()
+                    - (existing["RTH_avgITI_sec"] == 44444).sum())
+                existing_eth = int(
+                    existing["ETH_avgITI_sec"].notna().sum()
+                    - (existing["ETH_avgITI_sec"] == 44444).sum())
         except Exception as exc:
             log.warning(f"Could not read existing {output_path.name} to "
                         f"compare ({exc!r}); proceeding to overwrite.")

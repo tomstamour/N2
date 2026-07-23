@@ -1,0 +1,131 @@
+x-wing-mole — version control
+================================================================================
+IBKR (ibapi) trading trio. A trade-frequency surge detector (trade-mole) hands a
+buy-signal to a yield-laddered trailing-stop trader (x-wing); a clerk runs BOTH
+as an in-process "duo" on ONE shared, pre-warmed ibapi client from a pool.
+
+Live chain (three separate processes):
+    RTPR_connector3 ─tcp8900─► orchestrator5 ─tcp8765─► clerk-1.1 ─► Gateway
+Current live scripts: clerk-1.1.py, trade-mole-2.1.py, x-wing-2.1.py.
+Run everything with the venv python (system python3 lacks ibapi).
+Ports: 4001 = LIVE Gateway, 4002 = paper GW, 7497 = paper TWS.
+
+Legacy X-wing-1.0.py and trade_mole_4.1.py have been DELETED (refactor complete);
+only their successors remain on disk.
+
+
+================================================================================
+x-wing  —  yield-laddered trailing-stop trader (long side, one symbol)
+================================================================================
+Constant across versions:
+  - On buy-signal: BUY LMT for floor(CAPITAL / entry) shares, then a protective
+    SELL STP LMT that RATCHETS (only ever moves UP, holds when price falls). A
+    synthetic trigger converts it to a SELL LMT at the held table limit to force
+    the ETH-safe exit. Yield -> Trigger%/Limit% comes from the banded limits TSV.
+  - Never uses reqGlobalCancel (would nuke other instances on the shared account)
+    or reqTickByTickData (3-request cap).
+
+--------------------------------------------------------------------------------
+1.0  ->  2.0     (X-wing-1.0.py -> x-wing-2.0.py; 1.0 no longer on disk)
+--------------------------------------------------------------------------------
+  - REMOVED (per the 2.0 docstring): the re-entry loop, the --exit-cross-percent
+    second-buy logic, and the 1.0 SIGUSR1/--prewarm arming path. No re-entry now:
+    when the protective sell fully fills, the run is done.
+  - Two run modes: STANDALONE (its own single ibapi client for data+orders;
+    SIGUSR1 = manual fire) or DRIVEN (the clerk injects ONE shared client and fans
+    ticks into update_quote(); trade-mole calls on_buy_signal() — x-wing opens no
+    socket of its own).
+  - Behaviours in the 2.0 line (all inherited unchanged by 2.1):
+      * Entry reference = the HIGHER of (ask, trigger-print, last); the 4% entry
+        pad widens to 6% when the ask is detectably stale vs the trigger print
+        (added 2026-07-22, after the DAIC stale-ask miss).
+      * Entry-fill timeout lowered 30s -> 10s (2026-07-22); on timeout the resting
+        BUY is CANCELLED, never left working.
+      * Realizable exit reference is the BID (a wide/phantom ask cannot inflate the
+        yield or the protective stop).
+
+--------------------------------------------------------------------------------
+2.0  ->  2.1     (x-wing-2.1.py)                                        [CURRENT]
+--------------------------------------------------------------------------------
+  - ADDED the IBKR Price Management Algo on the BUY ENTRY ONLY:
+    Order.usePriceMgmtAlgo = True, gated by the module constant
+    ENTRY_USE_PRICE_MGMT_ALGO (set it False to fall straight back to 2.0
+    behaviour). Implemented as an opt-in `use_price_mgmt_algo` argument on
+    limit_order(); place_entry() is the ONLY caller that passes True.
+      WHY: the marketable pre-market BUY LMT (ref*1.04, or *1.06 on a stale ask)
+      can be more aggressive than IBKR's pre-trade price-cap check and get
+      rejected — either as a silent "Inactive" with no error reason
+      (rejected-orders-findings.txt: CLIK, OFAL) or as error 202 "limit price too
+      aggressive". PMA makes IBKR CAP the price to the allowed band and WORK the
+      order instead of rejecting it.
+  - UNCHANGED: the entry-pricing math (4% / 6% stale / 30% cap), the ratchet
+    ladder, every timeout, the reject/dead-status handling, and the public API the
+    clerk imports (build_driven, run_trade, on_buy_signal(last_ask, trigger_print),
+    setup_logging, LOG_DIR, parse_hhmm, make_contract, route_tick_price).
+  - The protective SELL STP LMT and the exit/flatten SELL LMTs DELIBERATELY do NOT
+    set the flag (PMA on stop orders is undocumented/unverified).
+  - Note: usePriceMgmtAlgo is a standalone Order boolean, NOT an algoStrategy —
+    no algoParams/TagValue. Present in ibapi 9.81 and wire-gated by
+    MIN_SERVER_VER_PRICE_MGMT_ALGO = 151 (modern Gateway is far past that).
+  - STATUS: local verification passes (the placed entry carries the flag; stop /
+    exit orders do not; pricing constants intact). Live effectiveness against the
+    pre-market reject is still to be confirmed on the paper GW (4002).
+
+
+================================================================================
+trade-mole  —  trade-frequency surge detector (produces x-wing's buy-signal)
+================================================================================
+--------------------------------------------------------------------------------
+4.1  ->  2.1     (trade_mole_4.1.py -> trade-mole-2.1.py; 4.1 no longer on disk)
+--------------------------------------------------------------------------------
+  - Refactor of v4.1 into the clerk-aware trio — renumbered 4.x -> 2.1 to line up
+    with x-wing-2.x / clerk-1.x.
+  - Two run modes: STANDALONE (own ibapi socket, records the full dataset + CSV,
+    exactly like v4.1) or DRIVEN (the clerk injects ONE shared client; runs purely
+    as a tick processor). When the (swappable) trigger fires it records the row,
+    STOPS recording (stop_at_trigger), and calls buy_signal_callback(last_ask).
+  - The ITI_baseline machinery and ALL of its derived columns are PRESERVED —
+    collecting that dataset is the strategic point. The temporary composite surge
+    rule is isolated behind the single IBKRSurgeApp.should_fire() method so it can
+    be swapped for an ITI_baseline rule without touching the rest of the pipeline.
+  - Inherited from v4.1 (metrics M1–M8, all from existing tick callbacks, no new
+    IBKR subscriptions): aggressor classification, order-flow imbalance,
+    dollar-volume rate, NBBO drift / mid-velocity, spread compression, trade-size
+    distribution, quote-update frequency, and trade-cluster burstiness.
+  - NEW in v2.1 (metrics M9): trade-SIZE surge vs the orchestrator-supplied
+    per-trade-size baseline — size_ratio_{w}s, buy_size_ratio_{w}s,
+    signed_size_ratio_{w}s, large_trade_count_{w}s, large_trade_volume_frac_{w}s,
+    plus cross-window size momentum. All derived inside the existing single
+    trade-log scan (zero added latency, no new subscriptions).
+
+
+================================================================================
+clerk  —  warm ibapi client pool + orch-trigger listener (runs the duos)
+================================================================================
+Current: clerk-1.1.py (clerk-1.0.py superseded; not on disk).
+  - Holds a pool of pre-connected clients (ids 1000..1029). On an orch-trigger
+    {ticker, lastDailyClose, itiBaseline, tradeSizeBaseline} it picks a FREE warm
+    client and runs a trade-mole + x-wing duo on that ONE shared socket, then
+    RESETS it (cancelMktData + clear state) and returns it to the pool WITHOUT
+    dropping the socket.
+  - Reads clerk-trigger-conditions.txt ONCE at startup: per-ET-window mole lifeTime
+    + finbert_gate on/off (missing/malformed -> built-ins 02:30 / gate on).
+  - Deferred (closed-market) duos are persisted to clerk_state/pending_duos.json
+    and replayed / re-armed on restart; a reconnection watchdog re-warms the pool
+    after the daily Gateway restart.
+  - Loads its duo scripts BY FILENAME via _load_module (clerk-1.1.py): currently
+    "trade-mole-2.1.py" and "x-wing-2.1.py" — this loader line is the single edit
+    needed to point the live chain at a new x-wing / trade-mole version.
+  A precise 1.0 -> 1.1 changelog is not recorded in-repo (1.0 is gone); the entry
+  above describes the current 1.1 architecture.
+
+
+================================================================================
+Operating rules (cross-cutting)
+================================================================================
+  - Run exactly ONE connector variant + ONE orchestrator + the clerk; never two
+    orchestrators (double-arm).
+  - clientIds are a limited Gateway resource: clerk pre-claims 1000–1029,
+    dailyStats 77, daily-board 20000. Saturation shows up as handshake timeouts.
+  - Bulk historical-data jobs go on the idle paper GW (4002); the live GW (4001)
+    drops them under contention.

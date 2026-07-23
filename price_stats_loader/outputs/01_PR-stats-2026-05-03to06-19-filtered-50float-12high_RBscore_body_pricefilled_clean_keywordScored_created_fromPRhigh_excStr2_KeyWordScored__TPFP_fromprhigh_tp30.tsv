@@ -1,0 +1,7 @@
+level	positive	sentiment_score	nocoref_neutral_filter	nocoref_confidence_weighted	nocoref_net_score	nocoref_top_k	nocoref_positional
+0.5	101/725	102/753	47/343	91/705	32/140	159/1511	48/291
+0.6	89/603	88/644	23/105	44/259	12/46	149/1348	15/114
+0.7	71/478	67/508	7/33	13/51	3/15	132/1114	6/32
+0.8	43/282	39/288	2/11	1/8	1/7	69/593	0/11
+0.9	11/87	7/65	0/2	0/2	0/2	8/76	0/2
+0.95	0/0	0/0	0/0	0/0	0/0	0/0	0/0

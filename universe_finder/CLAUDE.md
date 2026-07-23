@@ -126,6 +126,42 @@ baseline (shares/trade) for RTH and ETH from the *same* TRADES bars (via
 output gets two extra columns. Writes to a DISTINCT stem so it never collides
 with the old pipeline's output: `data/stocks_universe_YYYY-MM-DD.tsv`.
 
+## Step 3 lookback = LAST COMPLETE SESSION ONLY (since 2026-07-15)
+
+`--past-days-lookback` defaults to **1**: ITI and trade size describe the
+single most recent complete session, not a multi-day average. Changed after
+the SOBR 2026-07-14 case: the old 3-day mean of per-day ITIs (only 3 samples,
+so `iqr_filtered_mean` falls back to a plain mean) let one dead pre-surge day
+dominate — SOBR's ETH ITI read 1425.9 s = mean(4275.0, 1.8, 0.9) while the
+stock was actually trading sub-second. Three coupled semantics in
+`trade_frequency_and_size.addOn.py`:
+
+- `past_trading_days()` starts at **today when now ≥ 20:00 ET** (after-hours
+  session over → today is complete), else yesterday. The 20:30 cron therefore
+  captures the just-finished session — zero-day lag instead of one.
+- It is **holiday-aware** via `pandas_market_calendars` (NYSE calendar,
+  weekday-walk fallback if the import fails). Essential at lookback=1: a
+  holiday in the window would otherwise blank the whole universe into 44444s.
+- `compute_session_volumes(bars, days)` now takes the same `days` filter as
+  `compute_session_itis`, so trade size covers exactly the lookback sessions
+  (it previously aggregated every fetched bar, including the +4-calendar-day
+  request buffer and today's partial session).
+- **Zero-trade sessions are censored real values, not imputation fodder**:
+  when the fetch returned bars but a session had no trades,
+  `compute_session_itis` records the full session length (RTH 23,400 s /
+  ETH 34,200 s) instead of dropping the day (which used to cascade into
+  NaN → 44444 → HGB-imputed). Zero trades is a genuine observation — "gap ≥
+  whole session" — and the scale stays continuous (1 trade scores the same).
+  Dead-session rows therefore carry `ITI_impute_flag=ok` and join the
+  imputer's training set; only true fetch failures (no bars at all) still
+  produce 44444 → imputed. Trade *size* for a dead session remains
+  44444 → imputed (no trades = nothing to measure), so ITI=real + size=imputed
+  is a legitimate flag combination. Verified 2026-07-15 on ATCX (dead ETH →
+  34200.0 real) and BLIV (fetch fine, zero trades all day → 23400/34200 both).
+
+The first file built with these semantics is `stocks_universe_2026-07-16.tsv`
+(the 2026-07-15 cron ran before the changes landed).
+
 ## Cron entry (since 2026-07-07: paper Gateway + reduced Step 3 pressure)
 
 ```

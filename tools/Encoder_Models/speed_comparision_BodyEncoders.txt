@@ -1,0 +1,27 @@
+The full run finished successfully — everything is done and verified.
+
+  Output: price_stats_loader/outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_11EncBodyScored.tsv — 3306 rows × 213 columns (the original 143 pass through byte-identical, plus
+  70 new {Model}_Body_* columns). Every row has a body score from every model — no empty cells. Total scoring time was just under 3 hours.
+
+  Per-model rate on the 200-word cleaned bodies (ms/row):
+
+  ┌───────────────┬────────┬─────┬───────────────┬────────┐
+  │     Model     │ ms/row │     │     Model     │ ms/row │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ LouMcD-SDict  │ 0.1    │     │ Trading-Hero  │ 120    │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ FLANG-BERT    │ 46     │     │ ModernBERT    │ 584    │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ distilroberta │ 58     │     │ DeBERTa       │ 934    │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ finbert-tone  │ 108    │     │ FLANG-ELECTRA │ 1026   │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ RoBERTa       │ 115    │     │               │        │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ FinMarBa      │ 115    │     │               │        │
+  ├───────────────┼────────┼─────┼───────────────┼────────┤
+  │ FinancialBERT │ 120    │     │               │        │
+  └───────────────┴────────┴─────┴───────────────┴────────┘
+
+  Worth noting for any future live use: at body length, the three FP32/256-token models are far beyond the 150 ms headline budget — the INT8 models stay in the 46–120 ms range.
+

@@ -5,7 +5,7 @@ duos in-process on ONE shared ibapi connection each.
 
 Why this exists
 ---------------
-trade-mole-2.1 (surge detector) and x-wing-2.0 (trailing-stop trader) used to
+trade-mole-2.1 (surge detector) and x-wing-2.1 (trailing-stop trader) used to
 open their own ibapi connections. The clerk keeps a pool of warm, pre-connected
 clients (clientIds 1000..1000+N-1) and, on an orch-trigger, runs BOTH scripts on
 ONE of those shared sockets:
@@ -124,7 +124,7 @@ def _load_module(mod_name: str, filename: str):
     return mod
 
 
-xwing = _load_module("xwing2", "x-wing-2.0.py")
+xwing = _load_module("xwing2", "x-wing-2.1.py")
 trademole = _load_module("trademole2", "trade-mole-2.1.py")
 
 
@@ -425,6 +425,12 @@ class DuoSession:
         self._defer_target = None    # target datetime (ET) we are deferring to
         self._sentiment_ok = threading.Event()
         self._sentiment_bypassed = False  # buy-signal fired with finbert_gate off
+        # Set once the resolved contract (conId/minTick) has been applied to
+        # x-wing. reqMktData rides a bare STK/SMART/USD contract and no longer
+        # blocks on contract resolution; the entry order waits on THIS instead,
+        # so it never prices/places against a null contract or the default
+        # min_tick (0.01). See _begin_collection / _resolve_contract_async.
+        self._contract_ready = threading.Event()
         self._handlers = []          # logging handlers to detach on finish
         self.output_path = trademole.driven_output_path(MOLE_OUTPUT_DIR, self.symbol)
 
@@ -448,6 +454,8 @@ class DuoSession:
             surge_max_price_drop_pct=trademole.DEFAULT_SURGE_MAX_PRICE_DROP_PCT,
             baseline_avg_trade_size=self.trade_size_baseline,
             large_trade_mult=trademole.DEFAULT_LARGE_TRADE_MULT,
+            pretrade_staleness_fire=trademole.PRETRADE_STALENESS_FIRE,
+            pretrade_staleness_threshold=trademole.PRETRADE_STALENESS_THRESHOLD,
             logger=self.mole_log,
         )
         self.mole.stop_at_trigger = True
@@ -547,22 +555,28 @@ class DuoSession:
                              self.symbol, self.client.client_id)
                 return False
 
-        # resolve contract (+ minTick) once on the shared client
+        # Fire contract resolution but DO NOT block on it. Market data does not
+        # need a qualified contract -- IBKR resolves a bare STK/SMART/USD contract
+        # server-side and streams the same quote -- so subscribe immediately and
+        # resolve the conId/minTick in the background (_resolve_contract_async).
+        # This takes the ~hundreds-of-ms reqContractDetails round-trip off the
+        # reqMktData critical path (the Ask price is what prices the entry). Only
+        # the LATER entry order needs the resolved contract; it waits on
+        # self._contract_ready.
         self.client.contract_evt.clear()
         self.client._contract_details = None
         self.client.reqContractDetails(CD_REQ_ID, xwing.make_contract(self.symbol))
-        if not self.client.contract_evt.wait(timeout=15) or \
-                self.client._contract_details is None:
-            logger.error("[%s] contract resolution failed on client %d",
-                         self.symbol, self.client.client_id)
-            return False
-        cd = self.client._contract_details
-        self.xwing.set_contract_details(cd)
 
-        # one market-data line feeds BOTH (mole's generic ticks superset)
+        # one market-data line feeds BOTH (mole's generic ticks superset) -- on the
+        # bare contract, so the Ask starts flowing now instead of ~560 ms later.
         self.client.reqMarketDataType(1)
-        self.client.reqMktData(MKT_REQ_ID, cd.contract,
+        self.client.reqMktData(MKT_REQ_ID, xwing.make_contract(self.symbol),
                                trademole.GENERIC_TICKS, False, False, [])
+
+        # Apply the resolved contract to x-wing off the hot path; the entry order
+        # gates on self._contract_ready so we never trade an unresolved contract.
+        threading.Thread(target=self._resolve_contract_async, daemon=True,
+                         name=f"resolve-{self.symbol}").start()
 
         # Watch lifetime is resolved against the ET clock NOW (collection start,
         # which for deferred overnight duos is 04:00 ET, not trigger arrival).
@@ -586,11 +600,32 @@ class DuoSession:
         return True
 
     # ------------------------------------------------------------------ #
-    def on_buy_signal(self, last_ask):
+    def _resolve_contract_async(self):
+        """Background contract resolver, run off the reqMktData hot path. Waits
+        for the reqContractDetails reply fired in _begin_collection, applies the
+        resolved contract (+ minTick) to x-wing so the entry order uses the exact
+        conId, then signals self._contract_ready. On failure (timeout, or a
+        contractDetailsEnd with no contractDetails -> unknown symbol) it aborts
+        the duo, preserving the old inline guarantee that we never trade on an
+        unresolved contract -- just deferred off the hot path."""
+        if self.client.contract_evt.wait(timeout=15) and \
+                self.client._contract_details is not None:
+            self.xwing.set_contract_details(self.client._contract_details)
+            self._contract_ready.set()
+        else:
+            logger.error("[%s] contract resolution failed on client %d — "
+                         "aborting duo (no order placed)",
+                         self.symbol, self.client.client_id)
+            self.finish("contract_unresolved")
+
+    # ------------------------------------------------------------------ #
+    def on_buy_signal(self, last_ask, trigger_print=None):
         """Called by trade-mole on the ibapi thread when the surge fires.
         Cancels the watch window, evaluates finbert_gate at THIS instant, and
         spawns a sentinel thread that either waits for the Sentiment gate or
-        (gate off) hands off to x-wing immediately."""
+        (gate off) hands off to x-wing immediately. `trigger_print` is the surge
+        trade's print, threaded through to x-wing so the entry is priced off the
+        higher of it and the (often stale) ask."""
         res = self.clerk.conditions.at(datetime.now(tz=trademole.ET))
         with self._lock:
             if self._buy_fired or self._finished:
@@ -603,14 +638,14 @@ class DuoSession:
             if self._watch_timer is not None:
                 self._watch_timer.cancel()
         if res.finbert_gate:
-            logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — awaiting sentiment gate",
-                        self.symbol, last_ask, self.client.client_id)
+            logger.info("[%s] BUY-SIGNAL (last_ask=%s print=%s) on client %d — awaiting sentiment gate",
+                        self.symbol, last_ask, trigger_print, self.client.client_id)
         else:
-            logger.info("[%s] BUY-SIGNAL (last_ask=%s) on client %d — finbert_gate "
+            logger.info("[%s] BUY-SIGNAL (last_ask=%s print=%s) on client %d — finbert_gate "
                         "OFF (window %s): bypassing sentiment gate",
-                        self.symbol, last_ask, self.client.client_id, res.window)
+                        self.symbol, last_ask, trigger_print, self.client.client_id, res.window)
         t = threading.Thread(target=self._await_sentiment_and_launch,
-                             args=(last_ask, res.finbert_gate),
+                             args=(last_ask, trigger_print, res.finbert_gate),
                              name=f"sentiment-gate-{self.symbol}", daemon=True)
         t.start()
 
@@ -630,7 +665,7 @@ class DuoSession:
             logger.error("[%s] writing trade-mole output failed: %s",
                          self.symbol, e, exc_info=True)
 
-    def _await_sentiment_and_launch(self, last_ask, gate_on):
+    def _await_sentiment_and_launch(self, last_ask, trigger_print, gate_on):
         """Sentinel thread: waits for the Sentiment gate then launches x-wing,
         or aborts the trade on timeout. With gate_on=False (finbert_gate off at
         the surge instant) the wait is skipped and x-wing launches immediately."""
@@ -654,7 +689,17 @@ class DuoSession:
                 return
             logger.info("[%s] launching x-wing without sentiment gate (last_ask=%s)",
                         self.symbol, last_ask)
-        self.xwing.on_buy_signal(last_ask)
+        # The contract resolves in parallel with market data; the entry MUST NOT
+        # price/place before it lands (else null contract / default min_tick). By
+        # surge+sentiment time it is essentially always set, so this returns at
+        # once; it only bites if resolution is still pending or has failed.
+        if self._finished or not self._contract_ready.wait(timeout=15):
+            if not self._finished:
+                logger.error("[%s] contract not resolved at launch — aborting trade",
+                             self.symbol)
+                self.finish("contract_unresolved")
+            return
+        self.xwing.on_buy_signal(last_ask, trigger_print)
         t = threading.Thread(target=xwing.run_trade,
                              args=(self.xwing, time.time()),
                              name=f"xwing-{self.symbol}", daemon=True)

@@ -176,29 +176,6 @@ Sentences are ordered as: headline sentences → summary sentences → content s
 
 Character positions (`char_start`, `char_end`) reset for each field (they're relative to each field's text, not the entire document).
 
-## Usage
-
-### Basic Usage
-```bash
-# Process a single JSON file
-python3 SentenceSplitter.py --input FEED_28-jan-2026_cleaned_pronouns.json
-
-# Process from different directory
-python3 SentenceSplitter.py --input /path/to/news_feed.json
-```
-
-### Requirements
-1. Python 3.7+
-2. spaCy with English model installed:
-   ```bash
-   pip install spacy
-   python -m spacy download en_core_web_sm
-   ```
-
-### Output
-- Console output with processing progress
-- Output JSON file in same directory as input: `{input}_sentences.json`
-
 ## Error Handling and Validation
 
 ### Input File Validation
@@ -244,40 +221,6 @@ python3 SentenceSplitter.py --input /path/to/news_feed.json
 - `ensure_ascii=False` in JSON output preserves special characters
 - Handles international text properly without escaping
 
-## Testing Scenarios
-
-### Test Case 1: All Fields Present
-**Input**: JSON with headline, summary, and content
-**Expected**:
-- All three fields processed
-- Sentences grouped by source
-- Metadata shows 0 missing fields
-
-### Test Case 2: Subset of Fields
-**Input**: JSON with only headline and summary
-**Expected**:
-- Only headline and summary processed
-- Content field in missing_fields
-- Source breakdown shows 0 for content
-
-### Test Case 3: Single Field
-**Input**: JSON with only headline
-**Expected**:
-- Only headline processed
-- Summary and content in missing_fields
-- Total_sentences = 1 (assuming headline is single sentence)
-
-### Test Case 4: Empty Fields
-**Input**: JSON with null or empty string values
-**Expected**:
-- Empty fields skipped with warning
-- Only non-empty fields processed
-- Output matches fields with content
-
-### Test Case 5: Output Naming
-**Input**: `my_news_feed.json`
-**Expected Output File**: `my_news_feed_sentences.json`
-
 ## Performance Characteristics
 
 - **Concurrency Benefit**: Processing 3 fields in parallel typically 1.5-2x faster than sequential
@@ -285,31 +228,3 @@ python3 SentenceSplitter.py --input /path/to/news_feed.json
 - **Sentence Count**: Typical news articles produce 5-20 sentences
 - **Processing Time**: Usually completes in < 1 second for typical articles
 
-## Future Enhancements
-
-Potential improvements (not currently implemented):
-- Batch processing multiple JSON files
-- Configurable field priority ordering
-- Custom sentence filtering rules
-- Support for additional text fields
-- Direct integration with NER processing pipeline
-- Streaming output for very large files
-
-## Troubleshooting
-
-### "spaCy model not found"
-```bash
-python -m spacy download en_core_web_sm
-```
-
-### "Input file not found"
-Verify file path and ensure it exists in the specified location
-
-### "No sentences extracted"
-Check that input JSON contains valid text in at least one field
-
-### "Invalid JSON file"
-Verify JSON syntax and formatting; use a JSON validator
-
-### "Field is empty"
-This is a warning; processing continues with other fields

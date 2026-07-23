@@ -1,0 +1,132 @@
+python3 correlate_dailyhigh.py --input ../PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv --columns positive negative neutral sentiment_score nocoref_neutral_filter nocoref_confidence_weighted nocoref_net_score nocoref_top_k nocoref_positional Headline-RBscore --output ./PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored_correlations.tsv
+
+##### Will output a matrix of "True positive"/"False positive" for different thresold of the sentiment score metrics.  
+python3 false_positive_count.py \
+--columns-name positive nocoref_neutral_filter model_proba_PLUS_kw_mult_nb model_proba model_proba_hl kw_mult_nb_log Headline-RBscore \
+--input /home/tom/Documents/ibkr_scripts/N2/scripts/price_stats_loader/outputs/02_PRstats_2026-06-20-2026-07-09_unfiltered_fromPRhigh_excStr2_RBscored_scoredFromPRmodel_comboScore.tsv \
+--true-positive-threshold 30
+
+##### Unified all-column fromPR_High(%) predictor report (auto-detects every usable
+##### column incl. the 11 encoder blocks and FineClass/BroadClass; threshold 30).
+##### CAUTION: this TSV = training corpus (05-03..06-19, keyword-scored) + 594
+##### post-06-20 rows (NOT keyword-scored), so kw_*/model_proba AUCs are in-sample.
+/home/tom/venv/bin/python analyze_frompr_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv
+
+##### Same, restricted to the honest out-of-sample block (rows w/o model_proba):
+/home/tom/venv/bin/python analyze_frompr_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv \
+--subset-null model_proba --report-suffix _OOSonly
+
+##### TP/FP matrix for the 14 encoder/FinBERT single columns (--invert = anti-signal
+##### columns fire on value <= 1-level; both are [0,1] probabilities).
+/home/tom/venv/bin/python false_positive_count.py \
+--input ../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv \
+--columns-name FinMarBa_indecisive positive FLANG-BERT_positive \
+FLANG-ELECTRA_sentiment_score Trading-Hero_sentiment_score DeBERTa_positive \
+sentiment_score ModernBERT_positive nocoref_neutral_filter \
+distilroberta_sentiment_score finbert-tone_sentiment_score \
+RoBERTa_sentiment_score LouMcD-SDict_sentiment_score FinancialBERT_negative \
+--true-positive-threshold 30 \
+--levels 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 0.95 \
+--invert FinMarBa_indecisive FinancialBERT_negative
+
+##### Per-BroadClass predictability of the 14 encoder/FinBERT columns (which
+##### classes are hard to score; which encoder wins which class; per-class TP/FP).
+/home/tom/venv/bin/python class_conditional_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv
+
+##### 2026-07-20: score the 594 previously-unscored rows. Pass 1 = canonical ge15
+##### BODY model (combo on). Pass 2 = HEADLINE twin (combo auto-disabled by the
+##### interlock); its output columns must be renamed with the _hl suffix and
+##### merged fill-only-empty, so the existing OOF combo values are preserved.
+cd /home/tom/Documents/ibkr_scripts/N2/scripts/tools/keyword
+/home/tom/venv/bin/python keyword_scorer-2.py --text-col Body \
+--input <...>/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv \
+--target-col "fromPR_High(%)" --threshold 15 --out <scratch>/pass1_body.tsv
+HL=model_trained_on_PR-stats-2026-05-03to06-19/classify_fromPRhigh_ge15_excStr2_headline
+/home/tom/venv/bin/python keyword_scorer-2.py --text-col Headline \
+--input <...>/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed.tsv \
+--keywords $HL/binary_keyword_impact_all_terms.csv \
+--pipeline $HL/tfidf_fitted_pipeline.joblib \
+--reference $HL/scorer_reference.json \
+--target-col "fromPR_High(%)" --threshold 15 --out <scratch>/pass2_headline.tsv
+##### merged result: outputs/PRstats_..._Classed_kwScored.tsv
+
+##### HONEST out-of-sample ranking (the keyword model's unseen block). Use the
+##### DATE subset -- --subset-null model_proba no longer works once all rows are scored.
+##### NOTE: this subset is the leakage correction for the KEYWORD family ONLY.
+##### The 11 encoders + FinBERT are externally trained -> judge them on ALL rows.
+/home/tom/venv/bin/python analyze_frompr_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored.tsv \
+--subset-date-from 2026-06-20 --report-suffix _OOSonly
+
+##### 2026-07-21: does a condition IMPROVE a gate that already fired? Reports
+##### precision with/without + Newcombe CI on the difference, split by period.
+/home/tom/venv/bin/python conditional_value.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored.tsv \
+--gate "model_proba_PLUS_kw_mult_nb>=0.6" --gate "positive>=0.8" --gate "positive>=0.6" \
+--condition "FinMarBa_indecisive<=0.1"
+
+
+##### ============ BODY vs HEADLINE, the 11 encoders (2026-07-20) ============
+##### VERDICT: the HEADLINE wins (9 channel pairs to 1 at Bonferroni, 38 ties);
+##### no body column is a tradeable trigger; body costs 10x inference time
+##### (3205 ms vs 319 ms per PR). Report: report-Body-vs-Headline-11encoders.md.
+##### Two findings carried into the headline report: FinancialBERT/LouMcD-SDict
+##### are dead ON HEADLINES only (they work on bodies), and Earnings is the one
+##### class where the body beats the headline.
+
+##### STEP 1 - merge the 70 `<enc>_Body_<chan>` columns onto the canonical
+##### kw-scored TSV. One-way merge: canonical wins every shared column (the body
+##### file branched off BEFORE kw scoring, so its 28 keyword columns are stale
+##### and it has no BroadClass). Output = ..._kwScored_BodyEnc.tsv, 215 cols.
+/home/tom/venv/bin/python merge_body_encoder_cols.py
+
+##### STEP 2 - paired head-vs-body AUC (48 channel pairs x 2 thresholds) with a
+##### PAIRED bootstrap CI on the difference + Bonferroni column, plus the
+##### "does body add on top of headline" OOF-logistic synergy test.
+##### NOTE: orientation is A PRIORI from channel semantics, never fitted -- see
+##### the module docstring for why max(a,1-a) is a winner's curse here.
+/home/tom/venv/bin/python head_vs_body.py --n-boot 2000
+
+##### STEP 3 - body trigger matrix. Use LouMcD's sentiment_score, NOT its raw
+##### `_negative` count: counts exceed SCALE_DETECT_MAX=1.5 and would be
+##### misread as 0-100 percentages, producing garbage cutoffs.
+/home/tom/venv/bin/python false_positive_count.py \
+--input ../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored_BodyEnc.tsv \
+--columns-name FinMarBa_Body_indecisive FLANG-BERT_Body_negative \
+Trading-Hero_Body_sentiment_score FLANG-ELECTRA_Body_positive \
+DeBERTa_Body_sentiment_score ModernBERT_Body_positive \
+distilroberta_Body_sentiment_score finbert-tone_Body_sentiment_score \
+RoBERTa_Body_sentiment_score FinancialBERT_Body_sentiment_score \
+LouMcD-SDict_Body_sentiment_score \
+--true-positive-threshold 30 \
+--levels 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 0.95 \
+--invert FinMarBa_Body_indecisive FLANG-BERT_Body_negative
+
+##### STEP 4 - per-class on body columns. --report-suffix is REQUIRED here: the
+##### report path is derived from the target alone, so without it this silently
+##### overwrites the headline run's fromprhigh_class_conditional_report.md.
+/home/tom/venv/bin/python class_conditional_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored_BodyEnc.tsv \
+--columns FinMarBa_Body_indecisive FLANG-BERT_Body_negative \
+Trading-Hero_Body_sentiment_score FLANG-ELECTRA_Body_positive \
+DeBERTa_Body_sentiment_score ModernBERT_Body_positive \
+distilroberta_Body_sentiment_score finbert-tone_Body_sentiment_score \
+RoBERTa_Body_sentiment_score FinancialBERT_Body_sentiment_score \
+LouMcD-SDict_Body_sentiment_score \
+--triggers "FinMarBa_Body_indecisive<=0.1" "Trading-Hero_Body_sentiment_score>=0.95" \
+"FinancialBERT_Body_sentiment_score>=0.95" "ModernBERT_Body_positive>=0.95" \
+--report-suffix _body
+
+##### STEP 5 - full auto-detect ranking on the merged file (139 numeric / 28
+##### categorical; no script changes needed -- _elapsed_ms is already blocked
+##### and the 11 _Body_label columns are picked up as categoricals).
+/home/tom/venv/bin/python analyze_frompr_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored_BodyEnc.tsv
+/home/tom/venv/bin/python analyze_frompr_predictors.py \
+../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored_BodyEnc.tsv \
+--subset-date-from 2026-06-20 --report-suffix _OOSonly
+
+

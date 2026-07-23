@@ -1,0 +1,160 @@
+FinMarBa_headliner.py — Developer Implementation Guide
+========================================================
+Scope: how to stand up the script, how to read the "indecisive" value out of
+its output, and how to pre-warm the model so inference stays under the
+<150 ms per-headline budget (see Encoder_Models/CLAUDE.md).
+
+Model: baptle/FinBERT_market_based (ONNX, INT8-quantized)
+Logit order (LABEL_ORDER): ["negative", "indecisive", "positive"]
+  NOTE: the checkpoint's own config.json id2label is junk numerics
+  (0.0/1.0/2.0) — do not trust it. The order above was verified against the
+  model-card widget examples and is hardcoded in the script.
+
+
+1. PREREQUISITES
+-----------------
+Always run with the project venv, never system python3:
+
+  /home/tom/venv/bin/python
+
+Required packages (already in the venv on this machine; on a fresh clone):
+
+  pip install --break-system-packages numpy transformers optimum[onnxruntime]
+
+
+2. ONE-TIME MODEL EXPORT
+-------------------------
+Before any inference call, the ONNX INT8 model must exist on disk. Run this
+once per machine / per fresh clone:
+
+  /home/tom/venv/bin/python FinMarBa_headliner.py --export
+
+What this does (ONNXExporter.export(), 3 steps):
+  1. Downloads baptle/FinBERT_market_based from HuggingFace and exports it to
+     ONNX FP32 (ORTModelForSequenceClassification.from_pretrained(..., export=True)).
+  2. Quantizes the FP32 graph to INT8 with onnxruntime.quantization.quantize_dynamic.
+  3. Copies the tokenizer + config files alongside the quantized model.
+
+Output lands in:
+
+  Encoder_Models/finmarba_onnx/
+
+This directory is a gitignored build artifact — never force-add it. If it's
+missing, every scoring call raises FileNotFoundError telling you to re-run
+--export.
+
+After exporting, verify the fresh model still matches the validated
+reference behavior before trusting it in the pipeline:
+
+  /home/tom/venv/bin/python verify_headliners.py --model FinMarBa
+
+
+3. SCORING A HEADLINE
+----------------------
+Two ways to invoke it once the model is exported:
+
+CLI, ad hoc:
+
+  /home/tom/venv/bin/python FinMarBa_headliner.py --headline "Apple reports record quarterly earnings"
+  /home/tom/venv/bin/python FinMarBa_headliner.py --file ./headline-example.txt   # scores first non-empty line
+
+Library, from inside another N2 process (this is the path the live pipeline
+uses — never shell out per headline):
+
+  from FinMarBa_headliner import score_headline
+
+  result = score_headline("Apple reports record quarterly earnings")
+
+`result` is a dict:
+
+  {
+      "headline":        "Apple reports record quarterly earnings",
+      "positive":        0.49,
+      "indecisive":      0.30,
+      "negative":        0.21,
+      "sentiment_score": 0.28,     # positive - negative
+      "label":           "positive",  # argmax of the 3 classes
+      "elapsed_ms":      42.1,        # tokenize + forward wall time
+  }
+
+
+4. READING THE "indecisive" VALUE
+-----------------------------------
+"indecisive" is FinMarBa's middle class — the model's own neutral/uncertain
+bucket (not the same axis as "neutral" in the other headliners; it's this
+checkpoint's specific third logit, trained on headlines whose next-day market
+reaction was ambiguous). It is always present in the returned dict as a
+plain float probability (0.0–1.0, softmax-normalized alongside positive and
+negative so all three sum to 1.0).
+
+To get just that number:
+
+  from FinMarBa_headliner import score_headline
+
+  result = score_headline(headline_text)
+  indecisive_score = result["indecisive"]
+
+If you're consuming the CLI's JSON output instead (e.g. piping into another
+tool), it's the "indecisive" key at the top level:
+
+  /home/tom/venv/bin/python FinMarBa_headliner.py --headline "..." | python -c \
+      "import json,sys; print(json.load(sys.stdin)['indecisive'])"
+
+Do NOT rely on `result["label"]` to detect indecisiveness — label is just
+the argmax of the three classes, so a headline can be indecisive-dominant
+without necessarily winning the argmax if positive or negative is close.
+If your calling code needs an "is this headline ambiguous" signal, compare
+`result["indecisive"]` against a chosen threshold directly, rather than
+checking `label == "indecisive"`.
+
+
+5. PRE-WARMING THE MODEL FOR SPEED
+-------------------------------------
+Why it matters: the first call to score_headline() lazily calls load_model(),
+which downloads nothing (export already happened) but does pay the cost of:
+  - ORTModelForSequenceClassification.from_pretrained() — spins up the ONNX
+    Runtime session (graph load + INT8 kernel init)
+  - AutoTokenizer.from_pretrained() — loads vocab + tokenizer config
+
+That one-time cost is much larger than the ~12 ms warm inference time and
+will blow the <150 ms per-headline budget on the very first request if it
+happens inline with scoring.
+
+Fix: call load_model() explicitly, once, at process startup — before the
+scoring loop / request handler starts taking real headlines:
+
+  from FinMarBa_headliner import load_model, score_headline
+
+  def main():
+      load_model()          # pre-warm: pays session/tokenizer init cost once, up front
+      # ... rest of process startup (connect to feed, etc.) ...
+
+      for headline in incoming_headlines():
+          result = score_headline(headline)   # now runs at steady-state ~12 ms
+          ...
+
+Notes on load_model():
+  - It's idempotent — calling it more than once with the same model_dir is a
+    no-op (checked via the module-level _inferencer / _model_dir singleton),
+    so it's safe to call defensively from multiple places.
+  - score_headline() also calls it internally if you skip the explicit
+    pre-warm — but then the cost lands on your first real headline instead
+    of at startup, which is what you want to avoid.
+  - If you need a non-default model_dir (e.g. testing a re-export in a
+    parallel directory), pass it explicitly and consistently to both
+    load_model() and score_headline(): mismatched model_dir args force a
+    reload since the singleton check is `_model_dir == model_dir`.
+
+Recommended startup pattern for any long-running consumer (matches how the
+other headliners in this directory are pre-warmed):
+
+  import time
+  from FinMarBa_headliner import load_model
+
+  t0 = time.perf_counter()
+  load_model()
+  logger.info(f"FinMarBa pre-warmed in {(time.perf_counter() - t0) * 1000:.0f} ms")
+
+Expect this to log roughly in the hundreds of ms (session + tokenizer init);
+every score_headline() call after that should land close to the ~12 ms warm
+figure recorded in Encoder_Models/CLAUDE.md.

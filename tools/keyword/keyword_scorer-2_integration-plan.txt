@@ -1,0 +1,282 @@
+================================================================================
+Developer's Guide — integrating keyword_scorer-2.py into Orchestrator5.0.py
+================================================================================
+Audience: the session/developer performing the Orchestrator5.0.py refactor.
+Written 2026-07-15 against Orchestrator5.0.py (1076 lines) and
+keyword_scorer-2.py (675 lines) as they exist today.
+
+GOAL: on every PR the orchestrator receives, compute ONE number —
+`model_proba_PLUS_kw_mult_nb` (the frozen logistic combo of model_proba +
+kw_mult_nb, trained on the 05-03→06-19 corpus, selected 2026-07-13/14) — record
+it in the daily TSV, and (strategy decision, see §6) optionally use it as the
+trade trigger at threshold >= 0.6. No other scorer output is consumed by O5.
+
+
+--------------------------------------------------------------------------------
+1. THE SCORER — what it is and how to call it
+--------------------------------------------------------------------------------
+keyword_scorer-2.py (in scripts/tools/keyword/) is the LIVE scoring entry point.
+It replaced the deleted combo_scorer.py and supersedes keyword_scorer.py (which
+still exists but defaults to the WRONG old ge20 model — do not import it).
+
+Module API (designed exactly for the orchestrator): load a KeywordScorer once at
+startup, then call scorer.score_text(body_text, headline=headline) per PR. It
+returns a dict of all scores; the orchestrator reads ONLY
+res["model_proba_PLUS_kw_mult_nb"].
+
+  * get_default_scorer() already wires EVERYTHING: the ge15 model artifacts,
+    prevalence pinned to 0.185, and the frozen combo JSON. You do NOT need to
+    pass any paths or parameters. (Reference table of what it encodes is in §8.)
+  * Verified byte-exact against the backtest columns (max diff 1.7e-06 = TSV
+    rounding) and benchmarked at ~3-4 ms per PR steady state, ~1 s one-time load.
+  * Do NOT try to compute the combo without the other metrics: they come free
+    (the extra kw_* methods cost ~0.35 ms total from shared token counts;
+    benchmarked — the "score only what I need" optimization does not exist and
+    is not needed). Just ignore the other keys.
+  * Do NOT invoke the CLI once per PR: every invocation reloads the joblib
+    pipeline and keyword table (~1 s), versus ~4 ms with the in-process object.
+  * Preprocessing is built in and mirrors the backtests: HTML tag/entity
+    stripping for raw O5 bodies, wire-boilerplate removal, lowercasing,
+    tokenization. Feed it the raw one-lined Body string (see §3) — do not
+    pre-clean.
+
+IMPORT GOTCHA — the filename contains a hyphen, so `import keyword_scorer-2`
+is a SyntaxError. Use the same importlib idiom O5 already uses for
+FinBERT-headliner.py and RTPR_connector3_Firehose.py (top of Orchestrator5.0.py):
+
+    _kw_spec = _ilu.spec_from_file_location(
+        "keyword_scorer_2",
+        str(SCRIPTS_DIR / "tools" / "keyword" / "keyword_scorer-2.py"),
+    )
+    kw2 = _ilu.module_from_spec(_kw_spec)
+    _kw_spec.loader.exec_module(kw2)
+
+No sys.modules registration is needed (unlike the connector3 import — there is
+no dataclass-annotation trick here). keyword_scorer-2.py inserts its own dir
+into sys.path at exec time, so its internal `from keyword_finder import ...`
+resolves by itself. Run everything with /home/tom/venv/bin/python (O5 already
+does).
+
+
+--------------------------------------------------------------------------------
+2. STARTUP — load, pre-warm, self-check (in main(), before the feed connects)
+--------------------------------------------------------------------------------
+Follow the existing pattern of load_model() / body-worker pre-warm in main():
+
+    logger.info("Pre-loading keyword/combo scorer...")
+    _kw_scorer = kw2.get_default_scorer()          # ~1 s; prints its load line
+    smoke = _kw_scorer.score_text("startup self-check", headline="")
+    if "model_proba_PLUS_kw_mult_nb" not in smoke:
+        raise RuntimeError("combo score missing — DEFAULT_COMBO_MODEL JSON not "
+                           "found/loaded; refusing to start")
+    logger.info("Keyword/combo scorer ready.")
+
+Why the hard assert: if the combo weights JSON is ever moved/renamed, load()
+only PRINTS a note ("combo model not found -> combo score disabled") and every
+score_text() dict silently lacks the combo key. A trading process must fail at
+startup, not trade on None. The smoke call also pre-warms sklearn so the first
+real PR doesn't pay first-call overhead.
+
+Startup console must show (verify visually on first run):
+    KeywordScorer: ... | prevalence=0.185 | pipeline=yes | combo=yes | percentile-ref=yes
+
+
+--------------------------------------------------------------------------------
+3. WHAT TEXT TO SCORE — critical for live == backtest
+--------------------------------------------------------------------------------
+Score EXACTLY the string that goes into the TSV `Body` cell:
+
+    body_cell = c3.clean_inline_text(news_dict.get('body_raw') or '')
+    res = _kw_scorer.score_text(body_cell, headline=news_dict['Headline'])
+
+Rationale: all backtests and the walk-forward ground truth were computed by
+scoring the TSV Body column, which O5 builds as clean_inline_text(body_raw)
+(see _collect_and_log, the 'Body' key). Scoring the same string guarantees the
+live number equals what a backtest of that same TSV would produce. Do NOT score
+news_dict['article_body'] (the connector-cleaned multiline text the FinBERT
+body pipeline uses) — near-identical but not guaranteed byte-identical.
+
+Notes:
+  * The headline argument affects ONLY the boilerplate_category output, never
+    the combo value. Pass it anyway (costs nothing, and boilerplate_category is
+    a useful optional veto — see §6).
+  * Empty body: score it anyway (returns combo ≈ 0.024, no crash). Recording
+    that number keeps the TSV consistent with offline rescoring.
+  * Score ONCE PER ARTICLE, not per fan-out ticker — the combo is text-only and
+    identical for both tickers of a 2-ticker article. Share the future across
+    the fan-out exactly like f_finbert / f_body.
+
+
+--------------------------------------------------------------------------------
+4. WHERE TO HOOK IN O5's THREADING MODEL
+--------------------------------------------------------------------------------
+O5's reception handler _on_row_built runs on the single feed-reader thread and
+must stay lean (its own docstring: "only dict/string filters and non-blocking
+executor submits"). Follow the established pattern:
+
+  a) New dedicated executor next to the existing ones (module level):
+
+         _kw_executor = ThreadPoolExecutor(max_workers=1,
+                                           thread_name_prefix='kwscore')
+
+     ONE worker on purpose: at ~4 ms/PR a single thread absorbs the worst
+     observed burst (~15 PRs/s → ~60 ms of queue) with zero risk, and it
+     sidesteps any question of KeywordScorer/sklearn thread-safety (scoring is
+     read-only and likely safe, but with 1 worker you don't need to prove it).
+
+  b) In _on_row_built, right where f_finbert/f_body are submitted (after dedup
+     and the NW4 filters):
+
+         f_kw = _kw_executor.submit(_score_keywords, news_dict)
+
+     where _score_keywords is a small wrapper that builds body_cell per §3,
+     calls score_text, stamps a completion time (c3.format_millis_time(
+     c3.now_fixed()), same clock as every other stamp), rounds the combo to 6
+     decimals (float(round(v, 6)) — matches backtest TSV precision), and NEVER
+     raises (log + return {'model_proba_PLUS_kw_mult_nb': None, ...} on any
+     exception, mirroring analyze_finbert's error containment).
+
+  c) Pass f_kw into _collect_and_log alongside f_finbert/f_body/f_arm and
+     resolve it there with a short timeout (e.g. 30 s, generous):
+
+         kw_val = f_kw.result(timeout=30)   # in its own try/except like the others
+
+     Resolve it BEFORE the body-pipeline future (combo finishes in ms; the body
+     pipeline can take up to 180 s and must stay last).
+
+Do NOT score synchronously inside _on_row_built (blocks reception during
+bursts) and do NOT put it on _finbert_executor / _body_executor (those pools
+are sized for their own latency budgets).
+
+
+--------------------------------------------------------------------------------
+5. TSV CHANGES
+--------------------------------------------------------------------------------
+Add to _TSV_COLUMNS (suggested position: after 'ClerkSentiment', before the
+nocoref block — trade-decision columns grouped together):
+
+    'model_proba_PLUS_kw_mult_nb', 'KwScoreCompletedAt',
+
+  * The column name must be EXACTLY `model_proba_PLUS_kw_mult_nb` — every
+    backtest file, TP/FP matrix and analysis doc uses this name; downstream
+    tooling (false_positive_count.py, the stats scripts) matches on it.
+  * KwScoreCompletedAt (time-only, fixed UTC-4 clock) gives the latency audit
+    trail, consistent with FinBERTCompletedAt / NoCorefCompletedAt.
+  * Header rotation: _append_to_tsv auto-rotates a same-day file whose header
+    doesn't match (renames to *_rotated.tsv) — deploying mid-day is safe by
+    design, the old rows just land in the rotated file.
+
+
+--------------------------------------------------------------------------------
+6. USING THE SCORE FOR TRADING (strategy wiring — decide at integration time)
+--------------------------------------------------------------------------------
+Evidence (walk-forward 06-20→07-09, dedup, base rate 12.1% for fromPR_High>=30):
+combo >= 0.6 → ~4.6 fires/day, 28% precision on >=30% movers, TP median peak
++68%. Full analysis + recommended rules:
+  price_stats_loader/statsByClaude/14-july-2026_keywordsScores_and_FinBERTscores_BestThresholds.md
+
+Current O5 trade gate: STEP-1a arms every in-universe ticker immediately at
+reception; STEP-1b sends "OK"/"BAD" based solely on headline FinBERT
+positive >= SENTIMENT_POSITIVE_MIN (0.8) — see evaluate_sentiment() and step 3
+of _collect_and_log.
+
+Integration options (pick one; the recommended-rules doc favors (b)):
+  (a) RECORD-ONLY first: add the TSV column, change no gating. Zero risk;
+      gives live data to validate the trigger before it controls money.
+  (b) Combo as the trigger, sentiment as confirmation: STEP-1b sends "OK" iff
+      combo >= COMBO_TRIGGER_MIN (new constant, 0.6) — resolve f_kw before
+      _send_sentiment in _collect_and_log (adds only ms; the arm reply wait
+      already dominates). The FinBERT positive >= 0.8 test then becomes a
+      sizing/conviction signal, not a blocker (per the July-14 analysis:
+      sentiment alone is a weak 1.5-1.8x lift — too weak to trigger, too
+      unstable above 0.5/0.6 thresholds to trust as a hard gate).
+  (c) AND-stack (combo AND sentiment both required): fewer, higher-precision
+      fires (walk-forward: 39% precision but only ~1.4 fires/day) — valid but
+      cuts opportunity sharply.
+
+Optional cheap vetoes (footnotes, both in the July-14 doc):
+  * boilerplate_category != "" (lawfirm/compliance/earnings/conference — PR
+    types the model never saw): skip or force "BAD".
+  * res["kw_mult_nb_log"] < 0.5: vetoes ~21% of the stream at cost of ~4% of
+    winners. (This is the ONLY other key worth even glancing at; still
+    optional.)
+
+Whatever is chosen: put the threshold in the constants block at the top of
+Orchestrator5.0.py (like SENTIMENT_POSITIVE_MIN), and ALWAYS write the raw
+score to the TSV regardless of gating outcome.
+
+
+--------------------------------------------------------------------------------
+7. FAILURE MODES & GUARDRAILS (checklist)
+--------------------------------------------------------------------------------
+[ ] Scorer exception / timeout → row gets None in the combo column, pipeline
+    keeps running (mirror the FinBERT error containment; never crash
+    _collect_and_log or the reception thread).
+[ ] Combo JSON missing at startup → hard RuntimeError (the §2 self-check).
+    The JSON lives OUTSIDE the scorer's dir, in a data-output folder:
+      price_stats_loader/outputs/PR-stats-2026-05-03to06-19-filtered-50float-
+      12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh_
+      excStr2_scoredFromPRmodel_comboScore_model.json
+    Do not move/rename it (or, if hardening is desired, copy it byte-identical
+    next to the model dir and point get_default_scorer's DEFAULT_COMBO_MODEL
+    there — a keyword_scorer-2.py edit, out of scope for the O5 refactor).
+[ ] Do not touch/regenerate any model artifact (binary_keyword_impact_all_terms
+    .csv, tfidf_fitted_pipeline.joblib, scorer_reference.json, the combo JSON).
+    Everything is frozen; the whole point is that live == backtest.
+[ ] Do not import keyword_scorer.py (old ge20 defaults) or copy its
+    get_default_scorer pattern from memory — only keyword_scorer-2.py.
+[ ] score_text returns numpy float64s — cast float() before json/TSV if
+    anything downstream is picky (csv.DictWriter itself is fine).
+[ ] Run only ONE O5 instance (unchanged rule; the scorer adds no new
+    constraint).
+
+
+--------------------------------------------------------------------------------
+8. REFERENCE — model identity and explicit parameters
+--------------------------------------------------------------------------------
+Model: ge15 canonical, dir
+  tools/keyword/model_trained_on_PR-stats-2026-05-03to06-19/SELECTED-MODEL_classify_fromPRhigh_ge15_excStr2/
+
+get_default_scorer() encodes exactly this (listed for audit only — do not pass
+these by hand):
+
+  ┌────────────────┬────────────────────────────────────────────────────────────┐
+  │   parameter    │                          value                             │
+  ├────────────────┼────────────────────────────────────────────────────────────┤
+  │ keywords       │ [<ge15 dir>/binary_keyword_impact_all_terms.csv]           │
+  │ pipeline_path  │ <ge15 dir>/tfidf_fitted_pipeline.joblib                    │
+  │ reference_path │ <ge15 dir>/scorer_reference.json                           │
+  │ prevalence     │ 0.185 — PINNED; anchors kw_mult_nb; this exact value is    │
+  │                │ what reproduces the backtest columns byte-for-byte         │
+  │ combo_model    │ the comboScore_model.json in §7 (features: model_proba +   │
+  │                │ kw_mult_nb; weights frozen 2026-07-12)                     │
+  └────────────────┴────────────────────────────────────────────────────────────┘
+
+Combo math (for audit): sigmoid(w0 + Σ w_i·(x_i − mu_i)/sd_i) over standardized
+[model_proba, kw_mult_nb]; all constants from the JSON; nothing recomputed.
+
+
+--------------------------------------------------------------------------------
+9. VERIFICATION PLAN (the integrating session must run all of these)
+--------------------------------------------------------------------------------
+1. Startup check: console shows the KeywordScorer load line with
+   prevalence=0.185 | pipeline=yes | combo=yes, and the §2 self-check passes.
+2. Known-value spot check: feed a few Body/Headline pairs from
+   price_stats_loader/outputs/02_PRstats_2026-06-20-2026-07-09_unfiltered_
+   fromPRhigh_excStr2_RBscored_scoredFromPRmodel_comboScore_ge30ge40_dedup.tsv
+   through the integrated _score_keywords path; the combo values must match the
+   file's model_proba_PLUS_kw_mult_nb column to <= 1e-5 (expect ~1e-6).
+3. End-to-end replay check (the decisive one): after O5 has produced a live
+   tables/news_output_YYYY_MM_DD.tsv with the new column, rescore that same
+   file offline:
+     /home/tom/venv/bin/python keyword_scorer-2.py \
+         --input tables/news_output_YYYY_MM_DD.tsv --text-col Body
+   and diff the CLI's model_proba_PLUS_kw_mult_nb column against the
+   live-recorded one: must be equal at 6 decimals on every row. Any mismatch
+   means the live path is not scoring the Body-cell string (§3 violated).
+4. Latency: KwScoreCompletedAt − OrchTime should be tens of ms in bursts,
+   single-digit ms when idle. If it ever approaches the clerk arm wait (20 s),
+   something is wrong.
+5. Gating (only if §6 option b/c chosen): synthetic PR with a known
+   high-combo body → clerk receives the expected OK/BAD on the paper Gateway
+   (clerk on --port 4002), never test against 4001 (live).

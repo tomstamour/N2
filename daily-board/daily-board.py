@@ -4,19 +4,23 @@ daily-board.py — live terminal board for post-PR price action.
 
 Imports the latest news_output_*.tsv produced by orchestrator3 and shows it as a
 scrollable, auto-refreshing table in the terminal (curses TUI — works great over
-SSH, no browser needed). Two columns are added immediately after Symbol:
+SSH, no browser needed). Four columns are added immediately after Symbol:
 
-    PostPRhigh($)  — the highest traded price for the symbol AFTER its ArrivalTime,
-                     up to right now (all hours, incl. pre/post-market).
-    PostPRhigh(%)  — the run-up from the arrival price to that high:
-                     (High - ArrivalPrice) / ArrivalPrice * 100.
+    PostPRhigh(%)  — the run-up from the arrival price to the post-PR high:
+                     (High - ArrivalPrice) / ArrivalPrice * 100  (always >= 0).
+    PostPRlow(%)   — the drop from the arrival price to the post-PR low:
+                     (Low - ArrivalPrice) / ArrivalPrice * 100  (always <= 0).
+    PostPRnow(%)   — the current return from the arrival price:
+                     (Now - ArrivalPrice) / ArrivalPrice * 100  (either sign).
+    Surge          — the local market time when the trade-mole detected a price/volume surge,
+                     or "None" if no surge was detected.
 
 Data sourcing (chosen to respect IBKR pacing while refreshing every 30s):
   * ONE historical backfill per symbol at startup  → high & price since ArrivalTime.
   * Then a live streaming market-data subscription per symbol keeps a running max.
   * No tick-by-tick data is used (reqMktData top-of-book/last is an approximation).
 
-The "Tickers" column (present in newer files) is never displayed.
+The following columns are not displayed: "Tickers", "ID", "ArrivalDate", "Body", "Author".
 
 Controls inside the board:
     Up / Down        scroll one row
@@ -31,7 +35,9 @@ Run with the project's venv (has ib_insync):
 """
 
 import argparse
+import csv
 import curses
+import glob
 import locale
 import logging
 import math
@@ -58,6 +64,10 @@ DEFAULT_INPUT_DIR = os.path.normpath(
     os.path.join(_SCRIPT_DIR, '..', 'orchestrator3', 'outputs')
 )
 INPUT_GLOB_PREFIX = 'news_output_'
+MOLE_OUTPUT_DIR = os.path.normpath(
+    os.path.join(_SCRIPT_DIR, '..', 'x-wing-mole', 'mole-outputs')
+)
+NO_SURGE_LABEL = 'No Surge'
 
 IB_HOST = '127.0.0.1'
 IB_PORT = 4001
@@ -80,13 +90,17 @@ LOG_DIR = os.path.join(_SCRIPT_DIR, 'logs')
 ET = ZoneInfo('America/New_York')
 
 # Column layout
-NEW_COLS = ['PostPRhigh($)', 'PostPRhigh(%)']
-NUM_FROZEN = 3                # Symbol + the two new columns stay pinned left
-HIDDEN_COLS = {'Tickers'}     # never displayed
+# Four columns inserted right after Symbol: three PostPR percentages + Surge time.
+# Symbol + PostPRhigh(%) stay pinned left.
+DOLLAR_COLS = {'PostPRhigh($)', 'PostPRlow($)', 'PostPRnow($)'}
+PCT_COLS = {'PostPRhigh(%)', 'PostPRlow(%)', 'PostPRnow(%)'}
+NEW_COLS = ['PostPRhigh(%)', 'PostPRlow(%)', 'PostPRnow(%)', 'Surge']
+NUM_FROZEN = 2                # Symbol + PostPRhigh(%) stay pinned left
+HIDDEN_COLS = {'Tickers', 'ID', 'ArrivalDate', 'Body', 'Author'}  # never displayed
 NUMERIC_RIGHT = set(NEW_COLS) | {
     'Float', 'positive', 'negative', 'neutral', 'sentiment_score', 'Trades/sec',
 }
-WIDTH_CAPS = {'Headline': 60, 'Author': 16, 'ID': 11, 'ArrivalTime': 19}
+WIDTH_CAPS = {'Headline': 60, 'ArrivalTime': 19, 'Surge': 14}
 DEFAULT_WIDTH_CAP = 22
 
 LOG_PATH = os.path.join(LOG_DIR, 'daily-board.log')
@@ -178,6 +192,75 @@ def parse_arrival_utc(arrival_str: str, arrival_date: str = ''):
 
 
 # --------------------------------------------------------------------------- #
+# Surge detection lookup
+# --------------------------------------------------------------------------- #
+
+def find_surge_time(symbol, arrival_et, directory=MOLE_OUTPUT_DIR):
+    """Search mole-outputs for this symbol's trade-mole file closest to
+    arrival_et (an aware ET datetime) and return the surge-detection time
+    string, or None if no surge was ever flagged / no file found.
+
+    Robust to filename variations: matches files with the symbol and date
+    regardless of prefixes, suffixes, or separator styles (: vs -).
+    """
+    date_str = arrival_et.strftime('%Y-%m-%d')
+    # Flexible glob: match files containing both symbol and date
+    pattern = os.path.join(directory, f"*{symbol}*{date_str}*.csv")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+
+    # Try to extract timestamp from each candidate
+    scored = []
+    for path in candidates:
+        basename = os.path.basename(path)
+        # Find where the date string ends in the filename, then look for time after it
+        date_idx = basename.find(date_str)
+        if date_idx == -1:
+            continue
+        # Look for time pattern HH-MM-SS or HH:MM:SS after the date
+        after_date = basename[date_idx + len(date_str):]
+        time_match = re.search(r'(\d{2})[:-](\d{2})[:-](\d{2})', after_date)
+        if not time_match:
+            continue
+        try:
+            fdt = datetime.strptime(
+                f"{date_str} {time_match.group(1)}-{time_match.group(2)}-{time_match.group(3)}",
+                '%Y-%m-%d %H-%M-%S'
+            ).replace(tzinfo=ET)
+        except ValueError:
+            continue
+        diff = abs((fdt - arrival_et).total_seconds())
+        scored.append((diff, -os.path.getmtime(path), path))
+
+    if not scored:
+        return None
+    scored.sort()
+    return _read_surge_time(scored[0][2])
+
+
+def _read_surge_time(path):
+    """Read a trade-mole-table CSV and return the surge-detection time from
+    the first TRADE row with surge_detected=True, NO_SURGE_LABEL if the file
+    was read but no such row exists, or None only on a read/parse failure.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames:
+                return None
+            if 'surge_detected' in reader.fieldnames:
+                for row in reader:
+                    if row.get('event_type') == 'TRADE' and \
+                            str(row.get('surge_detected', '')).strip().lower() == 'true':
+                        return row.get('Time') or row.get('local_arrival_iso')
+            return NO_SURGE_LABEL
+    except Exception as exc:  # noqa: BLE001
+        log.warning("surge lookup failed for %s — %s", path, exc)
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # IBKR data layer
 # --------------------------------------------------------------------------- #
 
@@ -189,10 +272,23 @@ class DataManager:
         self.file_label = file_label
         self.refresh = refresh
 
-        # Display column order: Symbol, the two new columns, then the rest
-        # (minus Symbol itself and any hidden columns).
+        # Display column order: Symbol, computed columns, Headline, then positioned
+        # and remaining columns (minus Symbol itself and any hidden columns).
         rest = [c for c in columns if c not in HIDDEN_COLS and c != 'Symbol']
-        self.display_cols = ['Symbol'] + NEW_COLS + rest
+
+        # Position specific columns right after Headline
+        positioned_after_headline = ['positive', 'FMB_indecisive', 'model_proba_PLUS_kw_mult_nb']
+        to_reposition = [c for c in positioned_after_headline if c in rest]
+        remaining = [c for c in rest if c not in to_reposition]
+
+        # Find Headline and insert positioned columns after it
+        if 'Headline' in remaining:
+            headline_idx = remaining.index('Headline')
+            rest_reordered = remaining[:headline_idx+1] + to_reposition + remaining[headline_idx+1:]
+        else:
+            rest_reordered = remaining + to_reposition
+
+        self.display_cols = ['Symbol'] + NEW_COLS + rest_reordered
 
         # Per-row state.  Each entry mirrors a source row plus computed fields.
         self.rows = rows
@@ -200,7 +296,12 @@ class DataManager:
         self.contracts = {}               # symbol -> qualified Contract
         self.arrival_price = [None] * len(rows)   # price ~at ArrivalTime, per row
         self.backfill_high = [None] * len(rows)   # high arrival->startup, per row
+        self.backfill_low = [None] * len(rows)    # low  arrival->startup, per row
+        self.backfill_last = [None] * len(rows)   # last close at startup (now fallback)
+        self.surge_time = [None] * len(rows)      # surge detection time per row (positive cache)
         self.live_max = {}                # symbol -> running max since startup
+        self.live_min = {}                # symbol -> running min since startup
+        self.live_last = {}               # symbol -> most recent live price
 
         self.last_update_str = '--:--:--'
         self.last_write_str = '--:--:--'
@@ -322,6 +423,9 @@ class DataManager:
             if not later:
                 continue
             self.backfill_high[i] = round(max(b.high for b in later), 4)
+            self.backfill_low[i] = round(min(b.low for b in later), 4)
+            # Newest bar's close ~ latest price until live ticks take over.
+            self.backfill_last[i] = round(later[-1].close, 4)
             # Containing (oldest) bar's open ~ price just before the PR spike.
             self.arrival_price[i] = round(later[0].open, 4)
 
@@ -354,6 +458,32 @@ class DataManager:
             cur = self.live_max.get(sym)
             if cur is None or price > cur:
                 self.live_max[sym] = price
+            curmin = self.live_min.get(sym)
+            if curmin is None or price < curmin:
+                self.live_min[sym] = price
+            self.live_last[sym] = price
+
+    # -- surge lookup ------------------------------------------------------
+
+    def _lookup_surge(self, i, row):
+        """Look up surge-detection time for row i, cached only for genuine timestamps."""
+        if self.surge_time[i]:
+            return self.surge_time[i]
+        symbol = str(row.get('Symbol', '')).strip().upper()
+        arrival_raw = str(row.get('ArrivalTime', '')).strip()
+        if not symbol or not arrival_raw:
+            return None
+        try:
+            arrival_et = parse_arrival_utc(
+                arrival_raw, str(row.get('ArrivalDate', '')).strip()
+            ).astimezone(ET)
+        except Exception:  # noqa: BLE001
+            return None
+        found = find_surge_time(symbol, arrival_et)
+        # Only cache genuine timestamps, not NO_SURGE_LABEL (re-check every refresh)
+        if found and found != NO_SURGE_LABEL:
+            self.surge_time[i] = found
+        return found
 
     # -- snapshot ----------------------------------------------------------
 
@@ -366,21 +496,35 @@ class DataManager:
         for i, row in enumerate(self.rows):
             sym = str(row.get('Symbol', '')).strip().upper()
             live = self.live_max.get(sym)
+            live_lo = self.live_min.get(sym)
+            live_now = self.live_last.get(sym)
 
             highs = [h for h in (self.backfill_high[i], live) if h is not None]
             high = max(highs) if highs else None
+
+            lows = [l for l in (self.backfill_low[i], live_lo) if l is not None]
+            low = min(lows) if lows else None
+
+            # Current price: prefer the latest live tick, else the last bar close.
+            now_price = live_now if live_now is not None else self.backfill_last[i]
 
             arrival = self.arrival_price[i]
             if arrival is None and live is not None:
                 # backfill missing → lock the first live price as the reference
                 arrival = self.arrival_price[i] = live
 
-            pct = None
-            if high is not None and arrival not in (None, 0):
-                pct = (high - arrival) / arrival * 100.0
+            def _pct(v):
+                if v is None or arrival in (None, 0):
+                    return None
+                return (v - arrival) / arrival * 100.0
 
             row['PostPRhigh($)'] = high
-            row['PostPRhigh(%)'] = pct
+            row['PostPRhigh(%)'] = _pct(high)
+            row['PostPRlow($)'] = low
+            row['PostPRlow(%)'] = _pct(low)
+            row['PostPRnow($)'] = now_price
+            row['PostPRnow(%)'] = _pct(now_price)
+            row['Surge'] = self._lookup_surge(i, row) or '-'
 
         self.last_update_str = datetime.now(ET).strftime('%H:%M:%S')
         self.widths = self._compute_widths(self.rows)
@@ -414,9 +558,9 @@ class DataManager:
 
 def _fmt_cell(col, row):
     val = row.get(col)
-    if col == 'PostPRhigh($)':
+    if col in DOLLAR_COLS:
         return '—' if val is None else f"{val:.2f}"
-    if col == 'PostPRhigh(%)':
+    if col in PCT_COLS:
         return '—' if val is None else f"{val:+.1f}%"
     if val is None:
         return ''
@@ -431,7 +575,7 @@ def _fmt_cell_tsv(col, row):
     stays machine-readable and re-importable.
     """
     val = row.get(col)
-    if col in ('PostPRhigh($)', 'PostPRhigh(%)'):
+    if col in DOLLAR_COLS or col in PCT_COLS:
         return '' if val is None else f"{val:.2f}"
     if val is None:
         return ''
@@ -526,14 +670,14 @@ def _safe_addstr(win, y, x, text, attr=0):
 
 
 def _cell_attr(col, row):
-    if col == 'PostPRhigh(%)':
+    if col in PCT_COLS:
         v = row.get(col)
         if v is not None:
             if v > 0:
                 return curses.color_pair(C_GREEN) | curses.A_BOLD
             if v < 0:
                 return curses.color_pair(C_RED)
-    if col == 'PostPRhigh($)':
+    if col in DOLLAR_COLS:
         return curses.A_BOLD
     return 0
 

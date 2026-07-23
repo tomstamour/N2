@@ -1,0 +1,103 @@
+RTPR REST API — historical backfill feasibility notes
+=====================================================
+Written 2026-07-17. Companion doc to RTPR_API_Documentation.txt (which is dated
+2026-05-09 and is now partly STALE — see below).
+
+QUESTION EVALUATED
+------------------
+Can we use the RTPR REST API to fetch historical PRs (e.g. all of May) while the
+O5 / RTPR_connector3 firehose keeps running — and would a one-month REST backfill
+slow the firehose stream?
+
+ANSWER: Yes it's feasible, and no it will not slow the firehose.
+
+
+1. THE LOCAL DOC IS STALE — LIVE API HAS ~365-DAY HISTORY
+---------------------------------------------------------
+RTPR_API_Documentation.txt says "articles are available for the last 24 hours".
+That is no longer true. The live spec at https://api.rtpr.io/openapi.json
+(checked 2026-07-17) and our own price_stats_loader/rtpr_body_fill.py
+("the RTPR REST API, which now serves ~a year of history") confirm the API has
+grown a real history store.
+
+                        | Local doc (2026-05-09) | Live openapi.json (2026-07-17)
+    --------------------+------------------------+-------------------------------
+    Retention           | "last 24 hours"        | "Articles are retained 365 days"
+    limit max           | 100                    | 500
+    Pagination          | none                   | next_token cursor
+
+    GET /articles/{ticker}?limit=<=500&next_token=<cursor>
+      response envelope : { count, articles[], next_token }   (next_token null = end)
+      article object    : { ticker, exchange, title, author, created, article_body }
+                          -> NOTE: no `id`, no co-`tickers` array (both are WS-only).
+
+So May PRs ARE reachable via REST today.
+
+
+2. WHY THE FIREHOSE IS UNAFFECTED
+---------------------------------
+a) Different endpoints / servers. RTPR_connector3_Firehose.py only ever opens
+   wss://ws.rtpr.io (verified: zero REST calls in the connector). Backfill hits
+   https://api.rtpr.io. Separate subsystems.
+b) Different rate budgets. WebSocket = 1 concurrent connection per key +
+   "unlimited incoming"; REST = 60 requests/min. REST polling does not consume
+   the WS connection, and the firehose is server-PUSH, so it is not gated by how
+   fast we poll REST.
+c) Client isolation. The backfill is its own OS process (a one-off CLI). It
+   cannot touch the connector's asyncio loop. The ONLY way REST work could hurt
+   the firehose would be a blocking requests.get loop running INSIDE the
+   connector's event loop — which we deliberately do not do. The connector and
+   O5 can keep running normally during a backfill.
+
+
+3. RATE-LIMIT MATH FOR ONE MONTH
+--------------------------------
+REST cap is 60 req/min. We throttle to THROTTLE_SEC = 1.05 s between calls
+(~57 req/min, the same value rtpr_body_fill.py uses). At limit=500 per page, a
+low-PR-count small cap returns all its history in ONE page (next_token = null),
+i.e. one request per ticker. A universe of a few hundred such names is a few
+hundred requests -> a few minutes, and it never touches the firehose's path.
+High-volume names page more (we follow next_token), but small caps dominate the
+universe so this stays well under an hour.
+
+
+4. HOW THE BACKFILL WORKS (rtpr_hist_backfill.py)
+-------------------------------------------------
+- Scope: per-ticker over a ticker list (--universe <TSV Symbol col> or
+  --tickers-file). This is where deep history is known-good.
+- No date-range param exists on /articles*; the month window is filtered
+  CLIENT-SIDE on each article's `created`. For each ticker we page newest->oldest
+  via next_token and stop once a page's oldest article drops below the window
+  start (or the cursor is exhausted).
+- Missing id: derived as sha1(sortedGroupTickers + created + normTitle)[:16],
+  one shared id per PR (like O5's shared connector id across a PR's fan-out rows).
+- Missing co-tickers: reconstructed by grouping fetched articles on
+  (normalized title, created-to-the-second); the group's ticker set becomes the
+  `Tickers` cell. LIMITATION: a PR's second ticker is only recovered if it is
+  also in the supplied list.
+- Output matches O5 _TSV_COLUMNS (Orchestrator5.1.py, 24 cols). Article-derived
+  cells are filled: Symbol, Tickers, ID, ArrivalDate, Created, ArrivalTime,
+  Headline, Body, Author, Exchange. Baseline/score cells (Float, MktCap,
+  LastDailyClose, itiBaseline, tradeSizeBaseline, FinBERT scores, ClerkSentiment,
+  model_proba_PLUS_kw_mult_nb, *CompletedAt) are LEFT BLANK — filled offline by
+  the same add-ons the nightly master already runs.
+- Fidelity: time/text helpers (FIXED_TZ UTC-4, format_millis_*, clean_inline_text,
+  strip_rtpr_suffix) are byte-for-byte copies of the connector, so
+  Body = clean_inline_text(RAW article_body) reproduces the live Body cell and an
+  offline keyword_scorer-2.py --text-col Body rescore matches the live combo.
+
+CAVEATS TO KEEP IN MIND
+- REST `article_body` is assumed identical to the firehose `body_raw`; verify on
+  an overlapping PR if byte-exactness matters.
+- next_token cursor depth on the per-ticker endpoint is not contractually
+  documented; validated empirically (see verification step 1). For a very
+  high-volume ticker the cursor could in principle stop before reaching May —
+  small caps do not hit this.
+- Baselines, if ever joined, would come from the CURRENT universe TSV, not
+  point-in-time May membership.
+
+Usage:
+  /home/tom/venv/bin/python rtpr_hist_backfill.py \
+      --universe ../universe_finder/data/stocks_universe_2026-07-07.tsv \
+      --start 2026-05-01 --end 2026-05-31 \
+      --output outputs/rtpr_backfill_2026-05.tsv

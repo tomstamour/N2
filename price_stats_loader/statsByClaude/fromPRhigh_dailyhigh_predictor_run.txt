@@ -1,0 +1,131 @@
+# input: PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh_excStr2_scoredFromPRmodel.tsv
+# rows: 2719 total -> dropped 37 null-target, 0 outliers (>500%), 0 duplicate PRs -> 2682 kept
+# fromPR_High(%) on kept rows: median=4.92  mean=12.42  max=455.65
+
+# Correlation vs log1p(fromPR_High(%))  (ranked by |Spearman|)
+feature                             n   pearson  spearman
+---------------------------------------------------------
+model_proba_pctl                 2682     0.487     0.471
+model_proba                      2682     0.525     0.471
+model_proba_pctl_hl              2682     0.417     0.396
+model_proba_hl                   2682     0.445     0.396
+kw_mult_nb_pctl_hl               2682     0.400     0.373
+kw_mult_nb_hl                    2682     0.430     0.372
+kw_mult_nb_log_pctl_hl           2682     0.400     0.372
+kw_mult_nb_log_hl                2682     0.429     0.372
+kw_add_first_pctl_hl             2682     0.375     0.357
+kw_add_first_hl                  2682     0.383     0.357
+kw_mult_nb                       2682     0.326     0.356
+kw_mult_nb_pctl                  2682     0.367     0.356
+kw_add_log_pctl_hl               2682     0.374     0.355
+kw_add_log_hl                    2682     0.381     0.355
+kw_add_first_pctl                2682     0.367     0.354
+kw_add_first                     2682     0.379     0.354
+kw_mult_nb_log_pctl              2682     0.363     0.353
+kw_add_lin_pctl_hl               2682     0.372     0.353
+kw_add_lin_hl                    2682     0.378     0.353
+kw_mult_nb_log                   2682     0.305     0.352
+kw_add_log                       2682     0.373     0.352
+kw_add_log_pctl                  2682     0.363     0.352
+kw_add_lin_pctl                  2682     0.335     0.326
+kw_add_lin                       2682     0.338     0.326
+body_sentiment                    100     0.266     0.251
+Headline-RBscore                 2682     0.204     0.190
+LastDailyClose                   2680    -0.073    -0.180
+n_kw_hits                        2682     0.185     0.171
+Float                            2682    -0.150    -0.159
+positive                         2606     0.157     0.156
+sentiment_score                  2682     0.148     0.152
+nocoref_positional               2641     0.146     0.135
+nocoref_confidence_weighted      2641     0.146     0.134
+negative                         2682    -0.083    -0.132
+nocoref_neutral_filter           2641     0.145     0.131
+nocoref_net_score                2641     0.151     0.130
+nocoref_recommended               913     0.139     0.119
+nocoref_top_k                    2641     0.121     0.112
+n_kw_hits_hl                     2682     0.111     0.110
+neutral                          2682    -0.116    -0.108
+tradeSizeBaseline                 554    -0.133    -0.079
+MktCap                             98    -0.094    -0.071
+itiBaseline                       554    -0.058    -0.067
+Trades/sec                        165     0.230     0.044
+body_duration_ms                  126     0.036     0.035
+
+# Median fromPR_High(%) by categorical group (min group 15)
+
+[label]
+          count   mean  median
+label                         
+positive   1952  14.03    5.26
+neutral     562   7.89    3.84
+negative     92  10.04    3.01
+
+[Trigger]
+                               count   mean  median
+Trigger                                            
+NO:Trades/sec                     85   8.27    5.63
+YES                              754  13.95    5.22
+NO:sentiment_score              1214  10.41    4.35
+NO:sentiment_score,Trades/sec     75   8.89    4.17
+
+[Exchange]
+               count   mean  median
+Exchange                           
+NYSE AMERICAN    185  18.98    6.08
+NASDAQ          2152  12.77    5.11
+NYSE American     69   8.72    4.02
+NYSE             275   6.20    3.23
+
+[Author]
+                count   mean  median
+Author                              
+Globe Newswire   1427  13.36    5.54
+Newsfile Corp      98  10.60    5.16
+ACCESSWIRE        263  13.64    4.97
+PR Newswire       423  13.70    4.64
+Business Wire     471   8.09    3.45
+
+[Sentiment]
+           count   mean  median
+Sentiment                      
+OK           348  17.34    6.22
+BAD          206  13.27    4.62
+
+[ClerkSentiment]
+                        count   mean  median
+ClerkSentiment                              
+sentiment_ignored          15  35.43   17.49
+sentiment_ack             335  16.63    6.13
+sentiment_bad_released    201  13.02    4.55
+
+[boilerplate_category]
+                      count   mean  median
+boilerplate_category                      
+compliance              121  16.20    7.59
+earnings                504   8.98    4.47
+conference              229  12.90    4.22
+lawfirm                 226   8.88    3.94
+
+# Gradient-boosted model on log1p(fromPR_High(%))
+features: Float, LastDailyClose, positive, negative, neutral, sentiment_score, nocoref_net_score, nocoref_positional, nocoref_confidence_weighted, Headline-RBscore, model_proba, kw_add_lin, kw_mult_nb_log, n_kw_hits, model_proba_hl
+5-fold CV R^2: mean=0.294  folds=[0.198, 0.264, 0.294, 0.387, 0.325]
+
+feature                        perm_importance       std
+--------------------------------------------------------
+model_proba                             0.9315    0.0222
+model_proba_hl                          0.1265    0.0053
+kw_mult_nb_log                          0.1156    0.0049
+kw_add_lin                              0.0713    0.0046
+LastDailyClose                          0.0647    0.0023
+Float                                   0.0608    0.0012
+nocoref_positional                      0.0489    0.0027
+nocoref_net_score                       0.0463    0.0021
+n_kw_hits                               0.0427    0.0026
+negative                                0.0366    0.0012
+nocoref_confidence_weighted             0.0350    0.0024
+positive                                0.0315    0.0019
+neutral                                 0.0283    0.0013
+Headline-RBscore                        0.0179    0.0011
+sentiment_score                         0.0148    0.0011
+
+wrote cleaned dataset to: PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh_excStr2_scoredFromPRmodel_clean.tsv

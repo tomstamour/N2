@@ -74,7 +74,8 @@ UNIVERSE_DATA_DIR = str(SCRIPTS_DIR / 'universe_finder' / 'data')
 NW4_EXCLUDED_STRINGS_FILE  = str(SCRIPTS_DIR / 'newswatcher3' / 'excluded_strings.txt')
 # Orchestrator-level excluded strings (arm-block): a matching headline is still
 # written to the TSV but is NOT armed at the clerk (kept clerk-side gate).
-ORCH_EXCLUDED_STRINGS_FILE = str(SCRIPTS_DIR / 'orchestrator3' / 'excluded_strings-2.txt')
+# Local to this script's directory so O5 is self-contained (no orchestrator3 dep).
+ORCH_EXCLUDED_STRINGS_FILE = str(Path(__file__).resolve().parent / 'excluded_strings-2.txt')
 MAX_TICKERS_PER_ARTICLE    = 2   # NW4 count filter: drop articles naming > 2 tickers
 # ─────────────────────────────────────────────────────────────────────────────
 

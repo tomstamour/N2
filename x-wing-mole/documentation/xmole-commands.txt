@@ -23,6 +23,7 @@ path/to/venv/bin/python trade-mole-2.1.py --symbol JWEL --clientID 1112 \
 
 
 ### 3. X-WING — standalone (own connection; capital/account/limits/etc. hard-coded in script)
-path/to/venv/bin/python x-wing-2.0.py --symbol YYGH --last-close-price 0.15
+#   2.1 is the LIVE driven version (adds Price Management Algo on the BUY entry); 2.0 kept on disk.
+path/to/venv/bin/python x-wing-2.1.py --symbol YYGH --last-close-price 0.15
 #   then FIRE the entry (manual buy-signal):
-pkill -USR1 -f "x-wing-2.0.py --symbol JWEL"
+pkill -USR1 -f "x-wing-2.1.py --symbol JWEL"

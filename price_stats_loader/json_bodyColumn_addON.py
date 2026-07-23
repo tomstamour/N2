@@ -71,6 +71,17 @@ def load_index(source_dir, index_file, rebuild):
         return build_index(source_dir, index_file)
 
 
+def collapse_and_truncate(text, n_words):
+    """Collapse all whitespace runs in `text` to single spaces (so it stays in
+    one TSV cell) and return the first `n_words` words. Returns '' if empty."""
+    # Collapse all newlines/tabs/whitespace runs so the body stays in one cell.
+    text = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if not text:
+        return ''
+    words = text.split(' ')
+    return ' '.join(words[:n_words])
+
+
 def extract_body(json_path, n_words):
     """Return the first n_words words of the JSON's article_body, with all
     whitespace collapsed to single spaces. Returns '' on read/parse error."""
@@ -82,13 +93,7 @@ def extract_body(json_path, n_words):
         return ''
     if not isinstance(data, dict):
         return ''
-    text = data.get('article_body') or ''
-    # Collapse all newlines/tabs/whitespace runs so the body stays in one cell.
-    text = re.sub(r'\s+', ' ', str(text)).strip()
-    if not text:
-        return ''
-    words = text.split(' ')
-    return ' '.join(words[:n_words])
+    return collapse_and_truncate(data.get('article_body'), n_words)
 
 
 def main():

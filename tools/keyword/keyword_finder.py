@@ -647,7 +647,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", default=DEFAULT_INPUT)
-    ap.add_argument("--outdir", default="outputs")
+    ap.add_argument("--outdir", default="model_trained_on_PR-stats-2026-05-03to06-19")
     ap.add_argument("--text-col", default="body")
     ap.add_argument("--target-col", default="DailyHigh(%)")
     ap.add_argument("--id-col", default="ID")

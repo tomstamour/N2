@@ -1,0 +1,1 @@
+v4-smoothed-yield_vs-stopLimits.tsv was not bad but often resulted in -10 to -15% yields loss on FP.

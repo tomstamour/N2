@@ -1,0 +1,1340 @@
+#!/usr/bin/env python
+"""
+x-wing-2.1.py - yield-laddered trailing-stop trader for IBKR (ibapi).
+
+Trades ONE symbol (long side). Two run modes:
+
+  * STANDALONE (``python x-wing-2.1.py --symbol ...``): opens its own ibapi
+    connection (a single client doing BOTH market data and orders), waits for
+    the in-process buy-signal helper to fire the entry, then manages the
+    protective stop until the position is closed.
+
+  * DRIVEN (imported by clerk-1.0.py): the clerk injects ONE shared ibapi
+    client. x-wing does NOT subscribe to market data itself — the clerk fans
+    the shared tick stream into ``ctl.update_quote(...)`` and the trade-mole
+    detector calls ``ctl.on_buy_signal(last_ask)`` to fire the entry.
+
+Design:
+  1. On buy-signal, place a BUY LMT for floor(CAPITAL / entry) shares. The
+     entry price is the ask (max-limit-entry-percent-price=0) handed over by
+     trade-mole, capped at last_close * (1 + max-cap-entry-percent/100).
+  2. As it (partially) fills, arm a protective SELL STP LMT for the filled qty.
+  3. Every loop tick, sample the L1 mid, compute yield vs the frozen original
+     average fill, look up the limits table (banded) -> Trigger(%)/Limit(%) and
+     REPLACE (never cancel) the resting protective order with the ratcheted
+     aux/lmt. The stop only moves UP.
+  4. Synthetic trigger: when mid <= aux, REPLACE the order into a SELL LMT at
+     the held table limit to force the exit (ETH-safe). If it gaps below, it
+     rests; do not end the script.
+  5. When the protective sell fully fills, the position is closed: signal done
+     and stop. NO re-entry (removed in 2.0).
+
+New in 2.1: the BUY entry LMT carries usePriceMgmtAlgo=True (IBKR Price Management
+Algo). When the marketable +4% (or +6% stale) pre-market limit is more aggressive
+than IBKR's price-cap check, the algo CAPS the submitted price to the allowed band
+and works the order (re-pricing up toward our limit) instead of rejecting it —
+avoiding the silent "Inactive" / 202 "limit price too aggressive" entry loss (see
+rejected-orders-findings.txt). Entry only: the protective SELL STP LMT and the
+exit/flatten LMTs are unchanged.
+
+Removed vs 1.0: re-entry loop, --exit-cross-percent second-buy logic, the
+SIGUSR1/--prewarm arming path. Never uses reqTickByTickData (3-request cap) or
+reqGlobalCancel (would nuke other instances' orders on the shared account).
+"""
+
+import argparse
+import csv
+import logging
+import math
+import os
+import signal
+import sys
+import threading
+import time
+from datetime import datetime, time as dtime
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - fallback if tzdata missing
+    ET = None
+
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: pandas not found. Install with: pip install pandas")
+    sys.exit(1)
+
+try:
+    from ibapi.client import EClient
+    from ibapi.wrapper import EWrapper
+    from ibapi.contract import Contract
+    from ibapi.order import Order
+except ImportError:
+    print("Error: ibapi module not found. Install with: pip install ibapi")
+    sys.exit(1)
+
+logger = logging.getLogger("x-wing")
+
+# --------------------------------------------------------------------------- #
+# Centralized per-user config (scripts/config/n2_config_file.txt). x-wing runs
+# both standalone and imported by clerk-1.1.py via spec_from_file_location, so
+# __file__ is always the real path and these resolve relative to the repo.
+# --------------------------------------------------------------------------- #
+import importlib.util as _ilu
+_HERE = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _HERE.parent
+_spec = _ilu.spec_from_file_location("n2_config", _SCRIPTS_DIR / "config" / "n2_config.py")
+n2_config = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(n2_config)
+_CFG = n2_config.load_config()
+
+# --------------------------------------------------------------------------- #
+# Configuration (NOT received from the clerk).
+# These are the x-wing-side defaults the clerk does NOT override. Only `symbol`
+# (ticker) and `last_close_price` (lastDailyClose) come from the orch-trigger.
+# Per-user values (ACCOUNT, host, port) come from the central config above; the
+# rest are edited here. Standalone --flags fall back to these same values.
+# --------------------------------------------------------------------------- #
+CAPITAL                       = 5.00            # dollar budget per trade
+ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
+INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v5-smoothed-yield_vs-stopLimits.tsv")
+LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
+PRICE_ACTION_TABLE_DIR        = str(_HERE / "xwing_tables")  # xwing-table_<symbol>_<date>_<time>.tsv
+LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal
+MAX_LIMIT_ENTRY_PERCENT_PRICE = 5.0             # entry = ref * (1 + pct/100)
+# Stale-ask entry pricing (added 2026-07-22). The entry reference is priced off the
+# HIGHER of (ask, trigger-print, last) — not the ask alone — because the ask in the
+# opening market-data snapshot is often stale when the surge fired within a few
+# seconds of subscribing (see the 227-run analysis: staleness only occurs when
+# arm->surge < 5s, and concentrates in the bsln_over_prev_trd_gap rule). DAIC
+# 2026-07-22: ask 1.39 was already 2.8% below a 1.43 print, so ask*1.04=1.45 never
+# went marketable (real ask was 1.47) and filled 9.8s later on the reversal at a loss.
+# When the ask is detectably stale (more than STALE_QUOTE_THRESHOLD_PCT below the
+# trigger print) the pad widens to STALE_QUOTE_ENTRY_PERCENT_PRICE: on the 14 stale
+# runs with price tables, max(ask,print)*1.04 rescued 5/14 vs 11/14 at *1.06. Runs
+# with a healthy ask (193 of 210) keep ref=ask and the 4% pad and are unaffected.
+STALE_QUOTE_ENTRY_PERCENT_PRICE = 6.0           # pad used when the ask is stale
+STALE_QUOTE_THRESHOLD_PCT       = 1.0           # ask < print*(1-pct/100) => stale
+MAX_CAP_ENTRY_PERCENT         = 30.0            # cap = last_close * (1 + pct/100)
+# IBKR Price Management Algo on the BUY entry only (added in 2.1). The marketable
+# pre-market BUY LMT (ref * 1.04, or * 1.06 on a stale ask) can be more aggressive
+# than IBKR's pre-trade price-cap check and get rejected — as a silent "Inactive"
+# with no error reason (rejected-orders-findings.txt: CLIK/OFAL) or error 202
+# "limit price too aggressive". usePriceMgmtAlgo=True makes IBKR CAP the price to
+# the allowed band and work the order instead of rejecting it. Set to False to
+# disable (falls back to 2.0 behaviour). Scoped to the entry; the protective STP
+# LMT / exit LMTs never set it.
+ENTRY_USE_PRICE_MGMT_ALGO     = True
+# Connection defaults — used by STANDALONE mode only; in driven mode the clerk
+# owns the shared connection. Host/port come from the central config.
+DEFAULT_PORT                  = n2_config.get_int(_CFG, "IBKR_GATEWAY_PORT", 4001)
+DEFAULT_HOST                  = n2_config.get(_CFG, "IBKR_GATEWAY_HOST", "127.0.0.1")
+DEFAULT_CLIENT_ID_BASE        = 10000
+
+# STANDALONE market-data request id (driven mode uses the clerk's reqId)
+MKT_DATA_REQ_ID = 1
+
+# ibapi tick types we care about
+TICK_BID, TICK_ASK, TICK_LAST, TICK_CLOSE = 1, 2, 4, 9
+DELAYED_BID, DELAYED_ASK, DELAYED_LAST, DELAYED_CLOSE = 66, 67, 68, 75
+UNSET_DOUBLE = 1.7976931348623157e+308
+
+# error codes that indicate an order modification was rejected (-> cancel+new fallback)
+MODIFY_REJECT_CODES = {103, 104, 105, 106, 110, 161, 201, 202, 10147, 10148}
+
+# hard rejections of a new (unfilled) BUY entry/re-entry order -> stop the run
+ENTRY_REJECT_CODES = {110, 200, 201, 203}
+
+# order statuses that mean the (unfilled) entry is dead / not working -> stop the run.
+# IBKR can deactivate an entry with only this status and NO error() callback (seen
+# 2026-07-10 JZXN: marketable BUY LMT -> "Inactive" @ +110ms, no code), so relying on
+# ENTRY_REJECT_CODES alone leaves the duo idling in ENTRY_PENDING for the whole session.
+ENTRY_DEAD_STATUSES = {"Inactive", "Cancelled", "ApiCancelled"}
+
+# backstop: abort if the entry is still unfilled this many seconds after placement
+# (covers silent non-fills where IBKR sends neither an error nor a terminal status).
+# 0 disables the timeout. Lowered 30->10 on 2026-07-22: slow fills are almost all
+# reversal fills (of 27 entries that took >1s, only 3 made money; every fill past
+# 15s lost bar one). 10s clears the deep-tail losers without cutting normal entries;
+# the pricing fix above already removes most slow fills at the source. See analysis.
+ENTRY_FILL_TIMEOUT_SEC = 10
+
+# On timeout we CANCEL the resting entry (never leave it working) and wait this many
+# seconds for the broker to confirm the outcome: a clean cancel (-> entry_inactive) or
+# a late fill (-> pos>0, protective ladder arms). This is only a backstop so the run
+# can't hang if the broker reports neither.
+ENTRY_CANCEL_CONFIRM_SEC = 5
+
+
+# --------------------------------------------------------------------------- #
+# Argument parsing
+# --------------------------------------------------------------------------- #
+MAX_LIFETIME_SEC = 12 * 60 * 60  # 12 hours
+
+
+def parse_lifetime(s: str) -> int:
+    """hh:mm:ss or mm:ss -> total seconds (>0, capped at 12 hours)."""
+    try:
+        parts = s.split(":")
+        if len(parts) == 3:
+            hh, mm, ss = parts
+            total = int(hh) * 3600 + int(mm) * 60 + int(ss)
+        elif len(parts) == 2:
+            mm, ss = parts
+            total = int(mm) * 60 + int(ss)
+        else:
+            raise ValueError
+        if total <= 0:
+            raise ValueError
+        if total > MAX_LIFETIME_SEC:
+            raise argparse.ArgumentTypeError(
+                f"--lifetime must be <= 12 hours ({MAX_LIFETIME_SEC}s), got {total}s")
+        return total
+    except argparse.ArgumentTypeError:
+        raise
+    except Exception:
+        raise argparse.ArgumentTypeError(
+            f"--lifetime must be hh:mm:ss or mm:ss with a positive value, got {s!r}")
+
+
+def parse_hhmm(s: str) -> dtime:
+    """HH:MM (24h, ET) -> datetime.time."""
+    try:
+        hh, mm = s.split(":")
+        return dtime(int(hh), int(mm))
+    except Exception:
+        raise argparse.ArgumentTypeError(
+            f"--session-end must be HH:MM (24h ET), got {s!r}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """STANDALONE-mode CLI. Defaults come from the hard-coded config block at
+    the top of the file; in driven mode the clerk builds the config directly
+    via build_config() and does not use this parser."""
+    p = argparse.ArgumentParser(
+        description="x-wing-2.1: yield-laddered trailing-stop trader (IBKR/ibapi).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # --- clerk-supplied inputs ---
+    p.add_argument("--symbol", required=True, help="Stock ticker, e.g. AAPL")
+    p.add_argument("--last-close-price", dest="last_close_price", type=float, default=None,
+                   help="Previous session close (lastDailyClose). With "
+                        "--max-cap-entry-percent forms the entry-limit cap.")
+    # --- x-wing-side config (defaults from the hard-coded block) ---
+    p.add_argument("--capital", type=float, default=CAPITAL,
+                   help="Dollar budget; shares = floor(capital / entry-limit-price)")
+    p.add_argument("--Entry-limit-price", dest="entry_limit_price", default=None,
+                   type=float, help="Fixed buy LMT fallback if no ask/last/close.")
+    p.add_argument("--max-limit-entry-percent-price", dest="max_limit_entry_percent_price",
+                   type=float, default=MAX_LIMIT_ENTRY_PERCENT_PRICE,
+                   help="Buy LMT = ask * (1 + pct/100), priced off the ask handed over "
+                        "by trade-mole (falls back ask->last->close).")
+    p.add_argument("--max-cap-entry-percent", dest="max_cap_entry_percent", type=float,
+                   default=MAX_CAP_ENTRY_PERCENT,
+                   help="Entry-limit cap = last-close-price * (1 + pct/100).")
+    p.add_argument("--account", default=ACCOUNT,
+                   help="IBKR account ID (set on every order).")
+    p.add_argument("--input-limits-table", dest="limits_table", default=INPUT_LIMITS_TABLE,
+                   help="TSV with columns: 'Yield (%%)', 'Trigger(%%)', 'Limit(%%)'")
+    p.add_argument("--log-dir", dest="log_dir", default=LOG_DIR, help="Log directory")
+    p.add_argument("--price-action-table", dest="price_action_table",
+                   default=PRICE_ACTION_TABLE_DIR,
+                   help="Output TSV path (file) or directory. "
+                        "Auto-name: xwing-table_<symbol>_<date>_<time>.tsv")
+    p.add_argument("--lifetime", type=parse_lifetime, default=parse_lifetime(LIFETIME),
+                   help="Run duration hh:mm:ss or mm:ss (max 12h); on expiry "
+                        "flatten @ bid and exit")
+    p.add_argument("--session-end", dest="session_end", type=parse_hhmm, default=None,
+                   help="ET session-close HH:MM; flatten @ bid and exit at/after it")
+    p.add_argument("--client-id-base", dest="client_id_base", type=int,
+                   default=DEFAULT_CLIENT_ID_BASE,
+                   help="STANDALONE single-client id (driven mode ignores this).")
+    p.add_argument("--host", default=DEFAULT_HOST, help="TWS/Gateway host")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT,
+                   help="IBKR port (4001 live GW / 4002 paper GW / 7497 paper TWS)")
+    p.add_argument("--market-data-type", dest="market_data_type", type=int, default=1,
+                   choices=[1, 2, 3, 4],
+                   help="1=real-time, 2=frozen, 3=delayed, 4=delayed-frozen")
+    p.add_argument("--loop-interval", dest="loop_interval", type=float, default=1.0,
+                   help="Control-loop / price-sample interval in seconds")
+    p.add_argument("--entry-fill-timeout", dest="entry_fill_timeout", type=float,
+                   default=ENTRY_FILL_TIMEOUT_SEC,
+                   help="Abort if the entry is still unfilled this many seconds after "
+                        "placement (0 disables). Also aborts immediately if IBKR marks "
+                        "the entry Inactive/Cancelled.")
+    p.add_argument("--loglevel", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p
+
+
+def build_config(symbol, last_close_price, **overrides):
+    """Build an args-like config namespace for DRIVEN mode (clerk). Mirrors the
+    hard-coded block; `symbol` and `last_close_price` come from the orch-trigger.
+    Any field can be overridden via kwargs (dest names)."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(
+        symbol=symbol,
+        last_close_price=last_close_price,
+        capital=CAPITAL,
+        entry_limit_price=None,
+        max_limit_entry_percent_price=MAX_LIMIT_ENTRY_PERCENT_PRICE,
+        max_cap_entry_percent=MAX_CAP_ENTRY_PERCENT,
+        account=ACCOUNT,
+        limits_table=INPUT_LIMITS_TABLE,
+        log_dir=LOG_DIR,
+        price_action_table=PRICE_ACTION_TABLE_DIR,
+        lifetime=parse_lifetime(LIFETIME),
+        session_end=None,
+        client_id_base=DEFAULT_CLIENT_ID_BASE,
+        host=DEFAULT_HOST,
+        port=DEFAULT_PORT,
+        market_data_type=1,
+        loop_interval=1.0,
+        entry_fill_timeout=ENTRY_FILL_TIMEOUT_SEC,
+        loglevel="INFO",
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+def setup_logging(log_dir: str, symbol: str, level: str,
+                  name: str = "x-wing", console: bool = True) -> logging.Logger:
+    """Create/configure a logger writing to xwing_<symbol>_<date>_<time>.log.
+
+    Standalone mode uses the module logger ("x-wing"). Driven mode (clerk)
+    passes a unique `name` per duo (e.g. "xwing.JWEL.1003") so concurrent duos
+    each get their own file; with console=False it relies on the clerk's root
+    console handler. Returns the logger; the FileHandler is attached so the
+    caller can detach it on teardown."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / f"xwing_{symbol}_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+    lg = logging.getLogger(name)
+    lg.setLevel(getattr(logging, level))
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s",
+                            datefmt="%H:%M:%S")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+    lg.addHandler(fh)
+    if console and not any(isinstance(h, logging.StreamHandler)
+                           and not isinstance(h, logging.FileHandler)
+                           for h in lg.handlers):
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        ch.setLevel(getattr(logging, level))
+        lg.addHandler(ch)
+    lg.info("Log file: %s", log_path.resolve())
+    return lg
+
+
+# --------------------------------------------------------------------------- #
+# Limits table
+# --------------------------------------------------------------------------- #
+class LimitsTable:
+    """Yield -> (Trigger%, Limit%) banded lookup. Ignores any illustrative
+    auxPrice($)/lmtPrice($) columns; recomputes from the live midpoint."""
+
+    def __init__(self, path: str, log: logging.Logger = None):
+        self._log = log or logger
+        df = pd.read_csv(path, sep="\t")
+        df.columns = [c.strip() for c in df.columns]
+        # tolerate minor header variations
+        ycol = self._find(df, ["Yield (%)", "Yield(%)", "Yield"])
+        tcol = self._find(df, ["Trigger(%)", "Trigger (%)", "Trigger"])
+        lcol = self._find(df, ["Limit(%)", "Limit (%)", "Limit"])
+        rows = df[[ycol, tcol, lcol]].dropna().astype(float)
+        rows = rows.sort_values(ycol).reset_index(drop=True)
+        if rows.empty:
+            raise ValueError(f"No usable rows in limits table {path!r}")
+        self.yields = rows[ycol].tolist()
+        self.triggers = rows[tcol].tolist()
+        self.limits = rows[lcol].tolist()
+        self._log.info("Loaded limits table %s (%d rows, yields %.0f..%.0f%%)",
+                       path, len(self.yields), self.yields[0], self.yields[-1])
+
+    @staticmethod
+    def _find(df, candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        raise ValueError(f"limits table missing a column among {candidates}; "
+                         f"found {list(df.columns)}")
+
+    def lookup(self, yield_pct: float):
+        """Highest row whose Yield (%) <= yield_pct; floor at the first row."""
+        idx = 0
+        for i, y in enumerate(self.yields):
+            if y <= yield_pct:
+                idx = i
+            else:
+                break
+        return self.yields[idx], self.triggers[idx], self.limits[idx]
+
+
+def round_to_tick(price: float, tick: float) -> float:
+    if tick is None or tick <= 0:
+        tick = 0.01
+    # SEC Rule 612: US NMS stocks priced >= $1.00 must be in $0.01 increments;
+    # sub-penny ($0.0001) is allowed only below $1.00. contractDetails.minTick is
+    # the finest band, so enforce the penny floor at/above $1.00.
+    if price >= 1.0 and tick < 0.01:
+        tick = 0.01
+    return round(round(price / tick) * tick, 6)
+
+
+# --------------------------------------------------------------------------- #
+# Price-action table writer
+# --------------------------------------------------------------------------- #
+PA_COLUMNS = [
+    "timestamp", "symbol", "phase", "bid", "ask", "mid", "orig_avg_fill",
+    "filled_qty", "position", "yield_pct", "row_yield_threshold", "trigger_pct",
+    "limit_pct", "aux_price", "lmt_price", "protective_order_id",
+    "protective_status", "event",
+]
+
+
+class PriceActionWriter:
+    def __init__(self, path_arg, symbol, log_dir, log: logging.Logger = None):
+        self._log = log or logger
+        if not path_arg:
+            path_arg = log_dir
+        p = Path(path_arg)
+        if p.suffix.lower() == ".tsv":
+            self.path = p
+        else:  # treat as a directory -> auto-name
+            now = datetime.now()
+            fname = f"xwing-table_{symbol}_{now:%Y-%m-%d_%H-%M-%S}.tsv"
+            self.path = p / fname
+        # The file (path + timestamp) is resolved now so it stays aligned with the
+        # session-start naming, but it is NOT opened until the first write() — this
+        # avoids leaving empty, header-only files for sessions that never trade.
+        self._lock = threading.Lock()
+        self._fh = None
+        self._w = None
+
+    def _ensure_open(self):
+        """Open the file and write the header on first use. Caller holds _lock."""
+        if self._fh is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        new = not self.path.exists()
+        self._fh = open(self.path, "a", newline="", encoding="utf-8")
+        self._w = csv.DictWriter(self._fh, fieldnames=PA_COLUMNS, delimiter="\t",
+                                 extrasaction="ignore")
+        if new:
+            self._w.writeheader()
+            self._fh.flush()
+        self._log.info("Price-action table: %s", self.path.resolve())
+
+    def write(self, row: dict):
+        with self._lock:
+            self._ensure_open()
+            self._w.writerow(row)
+            self._fh.flush()
+
+    def close(self):
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# IB clients
+# --------------------------------------------------------------------------- #
+def route_tick_price(ctl, tickType, price):
+    """Map an ibapi tickPrice into a controller quote update. Shared by the
+    standalone XWingClient and the clerk's SharedIBClient fan-out so both modes
+    feed x-wing quotes identically."""
+    if price is None or price <= 0 or price == UNSET_DOUBLE:
+        return
+    if tickType in (TICK_BID, DELAYED_BID):
+        ctl.update_quote(bid=price)
+    elif tickType in (TICK_ASK, DELAYED_ASK):
+        ctl.update_quote(ask=price)
+    elif tickType in (TICK_LAST, DELAYED_LAST):
+        ctl.update_quote(last=price)
+    elif tickType in (TICK_CLOSE, DELAYED_CLOSE):
+        ctl.update_quote(close=price)
+
+
+class XWingClient(EWrapper, EClient):
+    """STANDALONE single-client: handles BOTH order placement/fills/contract
+    resolution AND streaming L1 market data on one ibapi connection. (In driven
+    mode the clerk's SharedIBClient plays this role and this class is unused.)"""
+
+    def __init__(self, controller):
+        EClient.__init__(self, self)
+        self.ctl = controller
+        self.connected_evt = threading.Event()
+        self.contract_evt = threading.Event()
+
+    # ---- connection / ids ----
+    def nextValidId(self, orderId: int):
+        self.ctl.set_next_order_id(orderId)
+        if not self.connected_evt.is_set():
+            self.ctl.log.info("XWingClient connected; nextValidId=%d", orderId)
+            self.connected_evt.set()
+
+    def contractDetails(self, reqId: int, contractDetails):
+        self.ctl.set_contract_details(contractDetails)
+        self.contract_evt.set()
+
+    def contractDetailsEnd(self, reqId: int):
+        self.contract_evt.set()
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        info = {2104, 2106, 2107, 2108, 2109, 2119, 2158, 2100, 2150, 399,
+                10167, 10197}
+        msg = f"IB msg reqId={reqId} code={errorCode}: {errorString}"
+        if errorCode in info:
+            self.ctl.log.info(msg)
+        else:
+            self.ctl.log.warning(msg)
+        self.ctl.on_order_error(reqId, errorCode, errorString)
+
+    # ---- order callbacks ----
+    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
+                    permId, parentId, lastFillPrice, clientId, whyHeld,
+                    mktCapPrice=0.0):
+        self.ctl.on_order_status(orderId, status, float(filled),
+                                 float(avgFillPrice), float(lastFillPrice))
+
+    def openOrder(self, orderId, contract, order, orderState):
+        self.ctl.log.debug("openOrder %d %s %s qty=%s status=%s", orderId,
+                           order.action, order.orderType, order.totalQuantity,
+                           orderState.status)
+
+    def execDetails(self, reqId, contract, execution):
+        self.ctl.log.info("exec %s %s %s @ %.4f (orderId=%d)", execution.side,
+                          execution.shares, contract.symbol, execution.price,
+                          execution.orderId)
+
+    # ---- market data ----
+    def tickPrice(self, reqId, tickType, price, attrib):
+        route_tick_price(self.ctl, tickType, price)
+
+
+# --------------------------------------------------------------------------- #
+# Controller / state machine
+# --------------------------------------------------------------------------- #
+PHASE_INIT = "INIT"
+PHASE_ARMED = "ARMED"
+PHASE_ENTRY_PENDING = "ENTRY_PENDING"
+PHASE_ENTRY_PARTIAL = "ENTRY_PARTIAL"
+PHASE_LONG_MONITOR = "LONG_MONITOR"
+PHASE_EXITING = "EXITING"
+PHASE_FLATTEN = "FLATTEN"
+PHASE_SHUTDOWN = "SHUTDOWN"
+PHASE_ENTRY_FAILED = "ENTRY_FAILED"   # entry deactivated/rejected/timed-out, never filled
+
+
+class XWingController:
+    def __init__(self, args, table: LimitsTable, pa_writer: PriceActionWriter,
+                 log: logging.Logger = None, driven: bool = False,
+                 id_alloc=None, on_done=None):
+        self.args = args
+        self.symbol = args.symbol.upper()
+        self.table = table
+        self.pa = pa_writer
+        self.log = log or logger
+
+        # driven (clerk) vs standalone wiring
+        self.driven = driven
+        self._id_alloc = id_alloc        # callable -> next order id (driven mode)
+        self.on_done = on_done           # callback(reason) when the trade closes
+        self.done_reason = None          # set when the trade closes / aborts
+
+        self.lock = threading.RLock()
+        self.wake = threading.Event()      # interruptible sleep for the main loop
+        self.stop_evt = threading.Event()  # set on signal / lifetime / session end / done
+
+        # In driven mode order_client is the shared client; there is no separate
+        # data client (the clerk fans the tick stream into update_quote()).
+        self.order_client = None
+        self.data_client = None
+
+        # contract
+        self.contract = None
+        self.min_tick = 0.01
+
+        # quotes
+        self.bid = self.ask = self.last = self.close = None
+        # surge print handed over by trade-mole at the buy-signal (the price the
+        # stock actually just traded at). Anchors the entry reference alongside the
+        # ask so a stale opening-snapshot ask can't underprice the entry; None in
+        # standalone mode, where no print is available.
+        self.trigger_print = None
+
+        # order-id allocation (standalone counter; driven uses _id_alloc)
+        self.next_order_id = None
+
+        # order bookkeeping: orderId -> dict
+        self.orders = {}
+        self.entry_shares = 0
+        self.active_buy_id = None
+        self.entry_ts = None            # time.time() when the entry order was placed
+        self.entry_failed = None        # terminal event str once the entry is deemed dead
+        self._entry_abort_pending = False  # timeout fired: cancel sent, awaiting resolution
+        self._entry_cancel_ts = None    # time.time() when the timeout cancel was sent
+        self.protective_id = None
+        self.original_avg_fill = None   # frozen after first full entry fill
+        self.running_entry_avg = None
+        self.position = 0.0
+        self.phase = PHASE_INIT
+
+        # protective order's last sent state (to skip redundant replaces)
+        self._prot_sent = None  # (otype, aux, lmt, qty)
+        self.exiting = False    # protective order has been converted to exit LMT
+        self.terminating = False
+
+        # ratchet state (stop holds when price falls, only moves UP) - per cycle
+        self.high_water = None       # peak bid (realizable price) since position opened
+        self._aux_floor = None       # highest aux ever computed this cycle
+        self._lmt_floor = None       # highest lmt ever computed this cycle
+
+    # ---------------------- connection helpers ----------------------
+    def set_next_order_id(self, oid):
+        with self.lock:
+            if self.next_order_id is None or oid > self.next_order_id:
+                self.next_order_id = oid
+
+    def _alloc_id(self):
+        # Driven mode: the shared client owns a single monotonic id stream.
+        if self._id_alloc is not None:
+            return self._id_alloc()
+        with self.lock:
+            oid = self.next_order_id
+            self.next_order_id += 1
+            return oid
+
+    def set_contract_details(self, cd):
+        with self.lock:
+            self.contract = cd.contract
+            try:
+                if cd.minTick and cd.minTick > 0:
+                    self.min_tick = cd.minTick
+            except Exception:
+                pass
+            self.log.info("Contract resolved: %s conId=%s primaryExch=%s minTick=%s",
+                          self.contract.symbol, self.contract.conId,
+                          self.contract.primaryExchange, self.min_tick)
+
+    # ---------------------- market data ----------------------
+    def update_quote(self, bid=None, ask=None, last=None, close=None):
+        with self.lock:
+            if bid is not None:
+                self.bid = bid
+            if ask is not None:
+                self.ask = ask
+            if last is not None:
+                self.last = last
+            if close is not None:
+                self.close = close
+
+    def current_mid(self):
+        """BID/ASK midpoint; fall back to last, then close."""
+        with self.lock:
+            if self.bid and self.ask and self.bid > 0 and self.ask > 0:
+                return (self.bid + self.ask) / 2.0
+            if self.last and self.last > 0:
+                return self.last
+            if self.close and self.close > 0:
+                return self.close
+            return None
+
+    def current_exit_ref(self):
+        """Realizable SELL reference = the bid (where a marketable SELL fills),
+        falling back to last, then close. Drives yield_pct and the protective stop
+        so a wide/phantom ask can't inflate either. The `mid` column still reports
+        the true (bid+ask)/2 for transparency. Note: deliberately does NOT fall back
+        to current_mid() (which would reintroduce the ask)."""
+        with self.lock:
+            if self.bid and self.bid > 0:
+                return self.bid
+            if self.last and self.last > 0:
+                return self.last
+            if self.close and self.close > 0:
+                return self.close
+            return None
+
+    def _flatten_price(self):
+        """Marketable SELL price used only to FLATTEN on shutdown: the current
+        bid (a SELL LMT at the bid crosses the spread and fills). Falls back
+        bid -> mid -> last -> close."""
+        with self.lock:
+            if self.bid and self.bid > 0:
+                return self.bid
+            return self.current_mid()  # current_mid already does mid->last->close
+
+    # ---------------------- order construction ----------------------
+    def _base_order(self, action, qty, otype):
+        o = Order()
+        o.action = action
+        o.orderType = otype
+        o.totalQuantity = int(qty)
+        o.tif = "GTC"
+        o.outsideRth = True
+        o.transmit = True
+        o.eTradeOnly = False     # default True in ibapi 9.81 -> would reject
+        o.firmQuoteOnly = False
+        if self.args.account:
+            o.account = self.args.account
+        return o
+
+    def limit_order(self, action, qty, lmt, use_price_mgmt_algo=False):
+        o = self._base_order(action, qty, "LMT")
+        o.lmtPrice = round_to_tick(lmt, self.min_tick)
+        # Price Management Algo: entry-only (place_entry passes True). IBKR caps an
+        # over-aggressive limit to the allowed band and works it instead of rejecting.
+        if use_price_mgmt_algo:
+            o.usePriceMgmtAlgo = True
+        return o
+
+    def stp_lmt_order(self, action, qty, aux, lmt):
+        o = self._base_order(action, qty, "STP LMT")
+        o.auxPrice = round_to_tick(aux, self.min_tick)
+        o.lmtPrice = round_to_tick(lmt, self.min_tick)
+        return o
+
+    # ---------------------- placing ----------------------
+    def compute_entry_limit_price(self):
+        """Determine the BUY LMT price for the initial entry, evaluated now.
+
+        If --max-limit-entry-percent-price is set, price off the HIGHER of the
+        live ask, the trigger print (the price the stock just traded at) and the
+        last trade — falling back to close only if none of those exist: ref *
+        (1 + pad/100), then lower to the cap = last_close_price * (1 +
+        max_cap_entry_percent/100) when both cap args are given. The pad widens
+        to STALE_QUOTE_ENTRY_PERCENT_PRICE when the ask is detectably stale (more
+        than STALE_QUOTE_THRESHOLD_PCT below the trigger print) so the entry stays
+        marketable off a stale opening-snapshot ask. Otherwise use the fixed
+        --Entry-limit-price. Returns None when no price can be determined."""
+        with self.lock:
+            a = self.args
+            if a.max_limit_entry_percent_price is not None:
+                # Reference = the highest of ask / trigger-print / last; close is
+                # only a last resort (it's yesterday's close, not today's tape).
+                cands = []
+                if self.ask and self.ask > 0:
+                    cands.append(("ask", self.ask))
+                if self.trigger_print and self.trigger_print > 0:
+                    cands.append(("print", self.trigger_print))
+                if self.last and self.last > 0:
+                    cands.append(("last", self.last))
+                if cands:
+                    src, ref = max(cands, key=lambda c: c[1])
+                elif self.close and self.close > 0:
+                    src, ref = "close", self.close
+                else:
+                    src = ref = None
+                if ref is None:
+                    if a.entry_limit_price is not None:
+                        self.log.warning("No ask/print/last/close at entry; using fixed "
+                                         "--Entry-limit-price %.4f", a.entry_limit_price)
+                        return round_to_tick(a.entry_limit_price, self.min_tick)
+                    self.log.error("No ask/print/last/close and no --Entry-limit-price; "
+                                   "cannot price entry")
+                    return None
+                # Widen the pad only when the ask is DETECTABLY stale: present, but
+                # more than STALE_QUOTE_THRESHOLD_PCT below the trigger print.
+                pad = a.max_limit_entry_percent_price
+                stale = (self.ask and self.ask > 0
+                         and self.trigger_print and self.trigger_print > 0
+                         and self.ask < self.trigger_print
+                         * (1 - STALE_QUOTE_THRESHOLD_PCT / 100.0))
+                if stale:
+                    pad = max(STALE_QUOTE_ENTRY_PERCENT_PRICE,
+                              a.max_limit_entry_percent_price)
+                price = ref * (1 + pad / 100.0)
+                if a.last_close_price is not None and a.max_cap_entry_percent is not None:
+                    cap = a.last_close_price * (1 + a.max_cap_entry_percent / 100.0)
+                    if price > cap:
+                        self.log.info("Entry %.4f capped to %.4f (last_close %.4f + %.1f%%)",
+                                      price, cap, a.last_close_price, a.max_cap_entry_percent)
+                        price = cap
+                price = round_to_tick(price, self.min_tick)
+                self.log.info("Entry price: %s=%.4f * (1+%.2f%%) -> %.4f%s", src, ref,
+                              pad, price,
+                              (" [STALE ask=%.4f vs print=%.4f]"
+                               % (self.ask, self.trigger_print)) if stale else "")
+                return price
+            if a.entry_limit_price is not None:
+                return round_to_tick(a.entry_limit_price, self.min_tick)
+            return None
+
+    def on_buy_signal(self, last_ask=None, trigger_print=None):
+        """The buy-signal entry point. In driven mode trade-mole calls this with
+        the last Ask price AND the trigger print (the price the surge trade just
+        executed at) it saw at the moment of trigger; in standalone the SIGUSR1
+        helper calls it with None. Seeds the ask and the trigger print so the
+        entry is priced off the higher of them (the ask alone is often stale in
+        the opening snapshot). Idempotent: a second call after the entry is placed
+        is ignored."""
+        with self.lock:
+            if self.active_buy_id is not None or self.stop_evt.is_set():
+                self.log.info("on_buy_signal ignored (already armed/stopping)")
+                return
+            if last_ask is not None and last_ask > 0:
+                self.ask = last_ask
+                self.log.info("Buy-signal: using last_ask=%.4f from trade-mole", last_ask)
+            if trigger_print is not None and trigger_print > 0:
+                self.trigger_print = trigger_print
+                self.log.info("Buy-signal: trigger_print=%.4f from trade-mole", trigger_print)
+        self.place_entry()
+
+    def place_entry(self):
+        with self.lock:
+            price = self.compute_entry_limit_price()
+            if price is None or price <= 0:
+                self.log.error("Cannot determine entry limit price; aborting entry")
+                self.stop_evt.set()
+                self.wake.set()
+                return
+            shares = int(math.floor(self.args.capital / price))
+            if shares < 1:
+                self.log.error("capital %.2f / entry %.4f < 1 share; nothing to do",
+                               self.args.capital, price)
+                self.stop_evt.set()
+                self.wake.set()
+                return
+            self.entry_shares = shares
+            oid = self._alloc_id()
+            self.active_buy_id = oid
+            self.orders[oid] = dict(action="BUY", otype="LMT", status="Submitted",
+                                    filled=0.0, avg=0.0, role="entry")
+            order = self.limit_order("BUY", shares, price,
+                                     use_price_mgmt_algo=ENTRY_USE_PRICE_MGMT_ALGO)
+            self.log.info("ENTRY: BUY LMT %d %s @ %.4f (orderId=%d)", shares,
+                          self.symbol, order.lmtPrice, oid)
+            self.order_client.placeOrder(oid, self.contract, order)
+            self.entry_ts = time.time()
+            self.phase = PHASE_ENTRY_PENDING
+
+    def _signal_done(self, reason):
+        """Position closed (or unrecoverable): record the reason and end the
+        control loop. The actual on_done callback (clerk teardown) is fired by
+        the control-loop runner AFTER the loop exits, off the ibapi thread."""
+        with self.lock:
+            if self.done_reason is None:
+                self.done_reason = reason
+        self.log.info("x-wing done: %s", reason)
+        self.stop_evt.set()
+        self.wake.set()
+
+    def compute_protective_levels(self, px):
+        """Single source of truth for the protective STP LMT levels.
+
+        `px` is the realizable price (the bid; see current_exit_ref). Tracks a
+        high-water bid and RATCHETS the result: aux/lmt only ever move UP and HOLD
+        when price falls, so the resting STP LMT behaves like a true native
+        stop-limit (it actually triggers when price drops to aux) instead of
+        floating down with the price. Returns (row_yield, trig%, lim%, aux, lmt)."""
+        with self.lock:
+            ref = self.original_avg_fill or self.running_entry_avg or px
+            self.high_water = max(self.high_water or px, px)
+            hw = self.high_water
+            ypct = (hw - ref) / ref * 100.0 if ref else 0.0
+            ythr, trig, lim = self.table.lookup(ypct)
+            aux = round_to_tick(hw * (1 - trig / 100.0), self.min_tick)
+            lmt = round_to_tick(hw * (1 - lim / 100.0), self.min_tick)
+            # ratchet: the stop only moves UP; it holds when price falls
+            if self._aux_floor is not None:
+                aux = max(aux, self._aux_floor)
+            if self._lmt_floor is not None:
+                lmt = max(lmt, self._lmt_floor)
+            lmt = min(lmt, aux)          # keep limit at/below trigger (boundary safety)
+            self._aux_floor, self._lmt_floor = aux, lmt
+            return ythr, trig, lim, aux, lmt
+
+    def arm_or_replace_protective(self, mid, *, aux=None, lmt=None,
+                                  force_exit=False, exit_lmt=None, reason=""):
+        """Place/replace the single resting protective SELL order (same orderId
+        => modify, never cancel). When force_exit, convert it to a SELL LMT to
+        force the exit: at the held table limit (exit_lmt, a synthetic stop
+        trigger) or, when none is given, the bid used to flatten on shutdown
+        (see _flatten_price)."""
+        with self.lock:
+            qty = int(round(self.position))
+            if qty <= 0:
+                return
+            if force_exit:
+                px = exit_lmt if exit_lmt is not None else (self._flatten_price() or mid)
+                otype, aux, lmt = "LMT", None, round_to_tick(px, self.min_tick)
+            else:
+                if aux is None or lmt is None:
+                    _, _, _, aux, lmt = self.compute_protective_levels(mid)
+                otype = "STP LMT"
+
+            sent = (otype, aux, lmt, qty)
+            if sent == self._prot_sent and not force_exit:
+                return  # nothing changed; skip redundant replace
+
+            if self.protective_id is None:
+                self.protective_id = self._alloc_id()
+            oid = self.protective_id
+
+            if otype == "LMT":
+                order = self.limit_order("SELL", qty, lmt)
+            else:
+                order = self.stp_lmt_order("SELL", qty, aux, lmt)
+
+            self.orders.setdefault(oid, dict(action="SELL", filled=0.0, avg=0.0,
+                                             role="protective"))
+            self.orders[oid].update(otype=otype, status="WorkingMod")
+            self._prot_sent = sent
+            self.order_client.placeOrder(oid, self.contract, order)
+            verb = "EXIT->LMT@bid" if force_exit else "replace"
+            self.log.info("STOP %s id=%d SELL %s qty=%d aux=%s lmt=%s %s", verb, oid,
+                          otype, qty, aux, lmt, f"({reason})" if reason else "")
+
+    # ---------------------- callbacks ----------------------
+    def on_order_status(self, orderId, status, filled, avg, last_fill):
+        with self.lock:
+            o = self.orders.get(orderId)
+            if o is None:
+                return
+            prev_filled = o.get("filled", 0.0)
+            o["status"] = status
+            o["filled"] = filled
+            o["avg"] = avg
+            newly = filled - prev_filled
+
+            if o["action"] == "BUY":
+                if newly > 0:
+                    self.position += newly
+                    self.running_entry_avg = avg or self.running_entry_avg
+                if orderId == self.active_buy_id and o.get("role") == "entry":
+                    if status == "Filled" and self.original_avg_fill is None:
+                        self.original_avg_fill = avg
+                        self.log.info("Entry FILLED: %d sh, original avg fill %.4f",
+                                      int(filled), avg)
+                    elif (filled <= 0 and self.entry_failed is None
+                          and not self.terminating
+                          and status in ENTRY_DEAD_STATUSES):
+                        # IBKR deactivated/cancelled the unfilled entry (often with NO
+                        # error() callback - see JZXN 2026-07-10). Flag it; the control
+                        # loop stamps a terminal row and tears the duo down, freeing the
+                        # pooled clerk client instead of idling in ENTRY_PENDING.
+                        self.entry_failed = "entry_inactive"
+                        if self.done_reason is None:
+                            self.done_reason = "entry_inactive"
+                        self.log.warning("Entry order %d %s with no fill -> aborting run",
+                                         orderId, status)
+                        self.wake.set()
+                if newly > 0:
+                    self.exiting = False
+                    self.wake.set()  # arm/replace protective ASAP
+                self.log.info("BUY status id=%d %s filled=%.0f avg=%.4f", orderId,
+                              status, filled, avg)
+
+            elif o["action"] == "SELL":
+                if newly > 0:
+                    self.position -= newly
+                    self.log.info("STOP fill id=%d %s sold=%.0f @ %.4f pos=%.0f",
+                                  orderId, status, newly, last_fill or avg,
+                                  self.position)
+                if status == "Filled" and orderId == self.protective_id:
+                    # Protective SELL STP LMT fully filled -> position closed.
+                    # NO re-entry (removed in 2.0): we are done.
+                    self._prot_sent = None
+                    self.exiting = False
+                    self.log.info("Protective filled; position closed (no re-entry)")
+                    self.wake.set()
+                    if not self.terminating:
+                        self._signal_done("stop_filled")
+
+    def on_order_error(self, reqId, code, msg):
+        with self.lock:
+            rec = self.orders.get(reqId)
+            if (rec and rec.get("role") == "entry"
+                    and rec.get("filled", 0.0) <= 0
+                    and code in ENTRY_REJECT_CODES):
+                self.log.error("Entry order %d rejected (code %d): %s; aborting run",
+                               reqId, code, msg)
+                rec["status"] = "Rejected"
+                self.stop_evt.set()
+                self.wake.set()  # interrupt the 1 Hz control-loop sleep so it exits promptly
+                return
+            if reqId == self.protective_id and self.exiting and code in MODIFY_REJECT_CODES:
+                # documented fallback: type-change modify rejected -> cancel+new
+                self.log.warning("Protective modify rejected (code %d); cancel+new exit",
+                                 code)
+                try:
+                    self.order_client.cancelOrder(self.protective_id)
+                except Exception:
+                    pass
+                # reuse the held stop-limit price so the fallback matches the
+                # triggered exit; fall back to the flatten bid if unset
+                px = self._lmt_floor if self._lmt_floor is not None else self._flatten_price()
+                qty = int(round(self.position))
+                if qty > 0 and px:
+                    oid = self._alloc_id()
+                    self.protective_id = oid
+                    self.orders[oid] = dict(action="SELL", otype="LMT",
+                                            status="Submitted", filled=0.0, avg=0.0,
+                                            role="protective")
+                    self.order_client.placeOrder(oid, self.contract,
+                                                 self.limit_order("SELL", qty, px))
+                    self._prot_sent = ("LMT", None, round_to_tick(px, self.min_tick), qty)
+
+    # ---------------------- session helpers ----------------------
+    def now_et(self):
+        return datetime.now(ET) if ET else datetime.now()
+
+    def is_rth(self):
+        n = self.now_et()
+        if n.weekday() >= 5:
+            return False
+        return dtime(9, 30) <= n.time() < dtime(16, 0)
+
+    def session_label(self):
+        return "RTH" if self.is_rth() else "ETH"
+
+    def session_end_reached(self):
+        if self.args.session_end is None:
+            return False
+        return self.now_et().time() >= self.args.session_end
+
+
+# --------------------------------------------------------------------------- #
+# Main control loop
+# --------------------------------------------------------------------------- #
+def control_loop(ctl: XWingController, start_ts: float):
+    a = ctl.args
+    while not ctl.stop_evt.is_set():
+        ctl.wake.clear()
+        mid = ctl.current_mid()
+        exit_ref = ctl.current_exit_ref()   # bid-based realizable price (yield + stop basis)
+
+        with ctl.lock:
+            bid, ask = ctl.bid, ctl.ask
+            pos = int(round(ctl.position))
+            ref = ctl.original_avg_fill or ctl.running_entry_avg
+            ypct = ((exit_ref - ref) / ref * 100.0) if (exit_ref and ref) else None
+            event = ""
+
+            # entry never established: IBKR-deactivated (on_order_status set entry_failed)
+            # or still unfilled past the timeout backstop. On timeout we CANCEL the resting
+            # BUY (never leave it working -> silent stop-less fills) and let on_order_status
+            # resolve it: a clean cancel becomes entry_inactive (terminal row + teardown);
+            # a late fill lands as pos>0 and the protective block below arms the ladder. Only
+            # if the broker confirms neither within ENTRY_CANCEL_CONFIRM_SEC do we force-abort.
+            if (ctl.entry_failed is None and ctl.active_buy_id is not None and pos <= 0
+                    and ctl.entry_ts is not None and a.entry_fill_timeout
+                    and (time.time() - ctl.entry_ts) >= a.entry_fill_timeout):
+                if not ctl._entry_abort_pending:
+                    ctl._entry_abort_pending = True
+                    ctl._entry_cancel_ts = time.time()
+                    ctl.order_client.cancelOrder(ctl.active_buy_id)
+                    ctl.log.warning("Entry %s unfilled after %.0fs -> cancelling resting BUY",
+                                    ctl.active_buy_id, a.entry_fill_timeout)
+                elif (time.time() - ctl._entry_cancel_ts) >= ENTRY_CANCEL_CONFIRM_SEC:
+                    ctl.entry_failed = "entry_timeout"
+                    if ctl.done_reason is None:
+                        ctl.done_reason = "entry_timeout"
+                    ctl.log.warning("Entry %s cancel unconfirmed after %.0fs -> aborting run",
+                                    ctl.active_buy_id, ENTRY_CANCEL_CONFIRM_SEC)
+            if ctl.entry_failed and pos <= 0:
+                event = ctl.entry_failed
+                ctl.phase = PHASE_ENTRY_FAILED
+
+            # protective management while long
+            row_thr = trig = lim = aux = lmt = None
+            if pos > 0 and exit_ref is not None:
+                if ctl.exiting:
+                    # leave the resting exit LMT untouched (spec step 5); show held levels
+                    row_thr, trig, lim = ctl.table.lookup(ypct if ypct is not None else 0.0)
+                    aux, lmt = ctl._aux_floor, ctl._lmt_floor
+                else:
+                    row_thr, trig, lim, aux, lmt = ctl.compute_protective_levels(exit_ref)
+                    if exit_ref <= aux:
+                        # synthetic stop trigger: place the SELL limit at the held
+                        # table limit (true stop-limit; rests if it gaps below - step 5)
+                        ctl.arm_or_replace_protective(exit_ref, force_exit=True, exit_lmt=lmt,
+                                                      reason="synthetic-trigger")
+                        ctl.exiting = True
+                        ctl.phase = PHASE_EXITING
+                        event = "stop_triggered"
+                    else:
+                        ctl.arm_or_replace_protective(exit_ref, aux=aux, lmt=lmt, reason="trail")
+                        ctl.phase = (PHASE_LONG_MONITOR if ctl.original_avg_fill
+                                     else PHASE_ENTRY_PARTIAL)
+
+            prot = ctl.orders.get(ctl.protective_id, {})
+            row = dict(
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                symbol=ctl.symbol, phase=ctl.phase,
+                bid=_f(bid), ask=_f(ask), mid=_f(mid),
+                orig_avg_fill=_f(ctl.original_avg_fill), filled_qty=pos,
+                position=pos, yield_pct=_f(ypct, 2),
+                row_yield_threshold=_f(row_thr, 1), trigger_pct=_f(trig, 2),
+                limit_pct=_f(lim, 2), aux_price=_f(aux), lmt_price=_f(lmt),
+                protective_order_id=ctl.protective_id,
+                protective_status=prot.get("status", ""), event=event,
+            )
+
+        ctl.pa.write(row)
+        if mid is not None:
+            ctl.log.info("%s %s | mid=%s yld=%s | %s | STOP aux=%s lmt=%s | pos=%d @avg%s",
+                         ctl.session_label(), ctl.symbol, _f(mid),
+                         (f"{ypct:+.2f}%" if ypct is not None else "n/a"),
+                         (f"row({row_thr:.0f}%) {trig}/{lim}" if row_thr is not None else "no-pos"),
+                         _f(aux), _f(lmt), pos, _f(ctl.original_avg_fill))
+        else:
+            ctl.log.warning("%s %s | NO market data yet", ctl.session_label(), ctl.symbol)
+
+        # termination conditions
+        if ctl.entry_failed is not None:
+            # entry deactivated/rejected/timed-out without ever filling; the terminal
+            # row was just written above. Stop so the clerk recycles the client.
+            ctl.stop_evt.set()
+            break
+        if a.lifetime is not None and (time.time() - start_ts) >= a.lifetime:
+            ctl.log.info("Lifetime %ds reached -> shutdown", a.lifetime)
+            if ctl.done_reason is None:
+                ctl.done_reason = "lifetime"
+            ctl.stop_evt.set()
+            break
+        if ctl.session_end_reached():
+            ctl.log.info("Session-end %s ET reached -> shutdown", a.session_end)
+            if ctl.done_reason is None:
+                ctl.done_reason = "session_end"
+            ctl.stop_evt.set()
+            break
+
+        ctl.wake.wait(timeout=a.loop_interval)
+
+
+def _f(v, nd=4):
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.{nd}f}"
+    except Exception:
+        return str(v)
+
+
+# --------------------------------------------------------------------------- #
+# Shutdown
+# --------------------------------------------------------------------------- #
+def shutdown(ctl: XWingController):
+    """Flatten any open position and finalize the price-action table.
+
+    In DRIVEN mode the shared ibapi socket belongs to the clerk, so this never
+    disconnects it (the clerk cancels market data and recycles the client). In
+    STANDALONE mode it cancels market data and disconnects the single client."""
+    with ctl.lock:
+        ctl.terminating = True
+        ctl.phase = PHASE_FLATTEN
+        pos = int(round(ctl.position))
+        mid = ctl.current_mid()
+    if pos > 0 and mid is not None:
+        ctl.log.info("FLATTEN: closing %d sh with marketable SELL LMT @ bid", pos)
+        ctl.arm_or_replace_protective(mid, force_exit=True, reason="flatten")
+        # best-effort wait for the close to fill
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with ctl.lock:
+                if int(round(ctl.position)) <= 0:
+                    break
+            time.sleep(0.25)
+        with ctl.lock:
+            left = int(round(ctl.position))
+        if left > 0:
+            ctl.log.warning("FLATTEN incomplete: %d sh still open; SELL LMT left "
+                            "resting at the broker", left)
+
+    with ctl.lock:
+        ctl.phase = PHASE_SHUTDOWN
+    # NOTE: deliberately NO reqGlobalCancel (would hit other instances).
+    if ctl.driven:
+        # The clerk owns the socket; just finalize our local artifacts.
+        ctl.pa.close()
+        return
+    for client, name in ((ctl.data_client, "data"), (ctl.order_client, "order")):
+        try:
+            if client and client.isConnected():
+                if name == "data" and ctl.contract is not None:
+                    try:
+                        client.cancelMktData(MKT_DATA_REQ_ID)
+                    except Exception:
+                        pass
+                client.disconnect()
+                ctl.log.info("%s client disconnected", name)
+        except Exception as e:
+            ctl.log.error("Error disconnecting %s client: %s", name, e)
+    ctl.pa.close()
+
+
+def run_trade(ctl: XWingController, start_ts: float):
+    """Run the control loop to completion, flatten/finalize, then fire on_done.
+    Shared by standalone main() and the clerk's driven session. on_done runs
+    here (off the ibapi callback thread) exactly once."""
+    try:
+        control_loop(ctl, start_ts=start_ts)
+    finally:
+        shutdown(ctl)
+        if ctl.on_done is not None:
+            try:
+                ctl.on_done(ctl.done_reason or "stopped")
+            except Exception as e:
+                ctl.log.error("on_done callback raised: %s", e, exc_info=True)
+
+
+def build_driven(symbol, last_close_price, shared_client, *, log, on_done,
+                 id_alloc, **cfg_overrides):
+    """DRIVEN-mode factory used by clerk-1.0.py. Builds a controller bound to an
+    already-connected shared ibapi client. The clerk is responsible for:
+      1. resolving the contract and calling ctl.set_contract_details(cd),
+      2. feeding ticks via ctl.update_quote(...) (fan-out from the shared client),
+      3. calling ctl.on_buy_signal(last_ask) when trade-mole triggers, then
+      4. running run_trade(ctl, start_ts=now) in a thread.
+    The shared client owns the socket; shutdown() will NOT disconnect it."""
+    cfg = build_config(symbol, last_close_price, **cfg_overrides)
+    table = LimitsTable(cfg.limits_table, log=log)
+    pa = PriceActionWriter(cfg.price_action_table, cfg.symbol, cfg.log_dir, log=log)
+    ctl = XWingController(cfg, table, pa, log=log, driven=True,
+                          id_alloc=id_alloc, on_done=on_done)
+    ctl.order_client = shared_client     # placeOrder / cancelOrder target
+    ctl.data_client = None               # clerk cancels market data, not x-wing
+    ctl.phase = PHASE_ARMED
+    return ctl
+
+
+# --------------------------------------------------------------------------- #
+# Wiring
+# --------------------------------------------------------------------------- #
+def make_contract(symbol):
+    c = Contract()
+    c.symbol = symbol
+    c.secType = "STK"
+    c.exchange = "SMART"
+    c.currency = "USD"
+    return c
+
+
+def connect_client(client, host, port, client_id, ready_evt, label, log=None,
+                   timeout=15):
+    log = log or logger
+    log.info("Connecting %s client clientId=%d to %s:%d", label, client_id, host, port)
+    client.connect(host, port, client_id)
+    t = threading.Thread(target=client.run, daemon=True, name=f"{label}-run")
+    t.start()
+    if not ready_evt.wait(timeout=timeout):
+        raise RuntimeError(f"{label} client did not connect within {timeout}s")
+    return t
+
+
+def main():
+    """STANDALONE mode: single ibapi client (data + orders). Arms and waits for
+    SIGUSR1 to FIRE the entry (manual stand-in for trade-mole's buy-signal)."""
+    args = build_arg_parser().parse_args()
+    symbol = args.symbol.upper()
+    log = setup_logging(args.log_dir, symbol, args.loglevel)
+
+    if args.port in (4001, 7496):
+        log.warning("PORT %d looks like a LIVE trading port. Real money at risk.",
+                    args.port)
+    if args.account:
+        log.info("Orders will be placed in account %s", args.account)
+
+    # entry-pricing validation: need at least one way to price the entry
+    if args.max_limit_entry_percent_price is None and args.entry_limit_price is None:
+        log.error("No entry price source: pass --max-limit-entry-percent-price "
+                  "(computed off the ask) or --Entry-limit-price (fixed).")
+        sys.exit(2)
+    # the cap requires BOTH last-close-price and max-cap-entry-percent
+    if (args.last_close_price is None) != (args.max_cap_entry_percent is None):
+        log.error("--last-close-price and --max-cap-entry-percent must be given "
+                  "together to enable the entry-limit cap.")
+        sys.exit(2)
+
+    table = LimitsTable(args.limits_table, log=log)
+    pa = PriceActionWriter(args.price_action_table, symbol, args.log_dir, log=log)
+    ctl = XWingController(args, table, pa, log=log, driven=False)
+
+    client = XWingClient(ctl)
+    ctl.order_client = client
+    ctl.data_client = client
+
+    fire_evt = threading.Event()
+
+    def _sig(signum, frame):
+        log.info("Signal %s received -> shutdown", signum)
+        ctl.stop_evt.set()
+        ctl.wake.set()
+        fire_evt.set()  # unblock the arm wait so it sees stop_evt and aborts
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+
+    # SIGUSR1 = manual FIRE (stand-in for trade-mole's buy-signal). Register
+    # before connecting so an early signal isn't lost.
+    if hasattr(signal, "SIGUSR1"):
+        def _fire(signum, frame):
+            log.info("SIGUSR1 received -> FIRE entry (manual)")
+            fire_evt.set()
+        signal.signal(signal.SIGUSR1, _fire)
+
+    try:
+        connect_client(client, args.host, args.port, args.client_id_base,
+                       client.connected_evt, "xwing", log=log)
+
+        # resolve contract (+ minTick)
+        client.contract_evt.clear()
+        client.reqContractDetails(1, make_contract(symbol))
+        if not client.contract_evt.wait(timeout=15) or ctl.contract is None:
+            raise RuntimeError(f"Could not resolve contract for {symbol}")
+
+        client.reqMarketDataType(args.market_data_type)
+        client.reqMktData(MKT_DATA_REQ_ID, ctl.contract, "", False, False, [])
+
+        # wait for a usable price, with a delayed-data fallback
+        log.info("Waiting for first market-data tick...")
+        if not _wait_for_mid(ctl, 10):
+            if args.market_data_type == 1:
+                log.warning("No real-time data; retrying with delayed (type 3)")
+                client.reqMarketDataType(3)
+                _wait_for_mid(ctl, 10)
+        if ctl.current_mid() is None:
+            log.warning("Proceeding without a confirmed quote; entry uses limit only")
+
+        ctl.phase = PHASE_ARMED
+        log.info("ARMED for %s; FIRE with: pkill -USR1 -f 'x-wing-2.1.py --symbol %s' "
+                 "(or SIGINT/SIGTERM to abort).", symbol, symbol)
+        while not fire_evt.is_set() and not ctl.stop_evt.is_set():
+            fire_evt.wait(timeout=0.2)
+
+        if ctl.stop_evt.is_set():
+            log.info("Aborted before firing; no trade placed.")
+        else:
+            ctl.on_buy_signal(None)             # fire entry off the live ask
+            run_trade(ctl, start_ts=time.time())  # loop + flatten + finalize
+    except Exception as e:
+        log.exception("Fatal error: %s", e)
+    finally:
+        if ctl.phase != PHASE_SHUTDOWN:
+            shutdown(ctl)
+        time.sleep(0.5)
+    log.info("x-wing exited.")
+
+
+def _wait_for_mid(ctl, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ctl.current_mid() is not None:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+if __name__ == "__main__":
+    main()

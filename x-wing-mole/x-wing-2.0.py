@@ -91,11 +91,24 @@ _CFG = n2_config.load_config()
 # --------------------------------------------------------------------------- #
 CAPITAL                       = 5.00            # dollar budget per trade
 ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
-INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v4-smoothed-yield_vs-stopLimits.tsv")
+INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v5-smoothed-yield_vs-stopLimits.tsv")
 LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
 PRICE_ACTION_TABLE_DIR        = str(_HERE / "xwing_tables")  # xwing-table_<symbol>_<date>_<time>.tsv
 LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal
-MAX_LIMIT_ENTRY_PERCENT_PRICE = 4.0             # entry = ask * (1 + pct/100)
+MAX_LIMIT_ENTRY_PERCENT_PRICE = 4.0             # entry = ref * (1 + pct/100)
+# Stale-ask entry pricing (added 2026-07-22). The entry reference is priced off the
+# HIGHER of (ask, trigger-print, last) — not the ask alone — because the ask in the
+# opening market-data snapshot is often stale when the surge fired within a few
+# seconds of subscribing (see the 227-run analysis: staleness only occurs when
+# arm->surge < 5s, and concentrates in the bsln_over_prev_trd_gap rule). DAIC
+# 2026-07-22: ask 1.39 was already 2.8% below a 1.43 print, so ask*1.04=1.45 never
+# went marketable (real ask was 1.47) and filled 9.8s later on the reversal at a loss.
+# When the ask is detectably stale (more than STALE_QUOTE_THRESHOLD_PCT below the
+# trigger print) the pad widens to STALE_QUOTE_ENTRY_PERCENT_PRICE: on the 14 stale
+# runs with price tables, max(ask,print)*1.04 rescued 5/14 vs 11/14 at *1.06. Runs
+# with a healthy ask (193 of 210) keep ref=ask and the 4% pad and are unaffected.
+STALE_QUOTE_ENTRY_PERCENT_PRICE = 6.0           # pad used when the ask is stale
+STALE_QUOTE_THRESHOLD_PCT       = 1.0           # ask < print*(1-pct/100) => stale
 MAX_CAP_ENTRY_PERCENT         = 30.0            # cap = last_close * (1 + pct/100)
 # Connection defaults — used by STANDALONE mode only; in driven mode the clerk
 # owns the shared connection. Host/port come from the central config.
@@ -116,6 +129,26 @@ MODIFY_REJECT_CODES = {103, 104, 105, 106, 110, 161, 201, 202, 10147, 10148}
 
 # hard rejections of a new (unfilled) BUY entry/re-entry order -> stop the run
 ENTRY_REJECT_CODES = {110, 200, 201, 203}
+
+# order statuses that mean the (unfilled) entry is dead / not working -> stop the run.
+# IBKR can deactivate an entry with only this status and NO error() callback (seen
+# 2026-07-10 JZXN: marketable BUY LMT -> "Inactive" @ +110ms, no code), so relying on
+# ENTRY_REJECT_CODES alone leaves the duo idling in ENTRY_PENDING for the whole session.
+ENTRY_DEAD_STATUSES = {"Inactive", "Cancelled", "ApiCancelled"}
+
+# backstop: abort if the entry is still unfilled this many seconds after placement
+# (covers silent non-fills where IBKR sends neither an error nor a terminal status).
+# 0 disables the timeout. Lowered 30->10 on 2026-07-22: slow fills are almost all
+# reversal fills (of 27 entries that took >1s, only 3 made money; every fill past
+# 15s lost bar one). 10s clears the deep-tail losers without cutting normal entries;
+# the pricing fix above already removes most slow fills at the source. See analysis.
+ENTRY_FILL_TIMEOUT_SEC = 10
+
+# On timeout we CANCEL the resting entry (never leave it working) and wait this many
+# seconds for the broker to confirm the outcome: a clean cancel (-> entry_inactive) or
+# a late fill (-> pos>0, protective ladder arms). This is only a backstop so the run
+# can't hang if the broker reports neither.
+ENTRY_CANCEL_CONFIRM_SEC = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +242,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="1=real-time, 2=frozen, 3=delayed, 4=delayed-frozen")
     p.add_argument("--loop-interval", dest="loop_interval", type=float, default=1.0,
                    help="Control-loop / price-sample interval in seconds")
+    p.add_argument("--entry-fill-timeout", dest="entry_fill_timeout", type=float,
+                   default=ENTRY_FILL_TIMEOUT_SEC,
+                   help="Abort if the entry is still unfilled this many seconds after "
+                        "placement (0 disables). Also aborts immediately if IBKR marks "
+                        "the entry Inactive/Cancelled.")
     p.add_argument("--loglevel", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -237,6 +275,7 @@ def build_config(symbol, last_close_price, **overrides):
         port=DEFAULT_PORT,
         market_data_type=1,
         loop_interval=1.0,
+        entry_fill_timeout=ENTRY_FILL_TIMEOUT_SEC,
         loglevel="INFO",
     )
     for k, v in overrides.items():
@@ -478,6 +517,7 @@ PHASE_LONG_MONITOR = "LONG_MONITOR"
 PHASE_EXITING = "EXITING"
 PHASE_FLATTEN = "FLATTEN"
 PHASE_SHUTDOWN = "SHUTDOWN"
+PHASE_ENTRY_FAILED = "ENTRY_FAILED"   # entry deactivated/rejected/timed-out, never filled
 
 
 class XWingController:
@@ -511,6 +551,11 @@ class XWingController:
 
         # quotes
         self.bid = self.ask = self.last = self.close = None
+        # surge print handed over by trade-mole at the buy-signal (the price the
+        # stock actually just traded at). Anchors the entry reference alongside the
+        # ask so a stale opening-snapshot ask can't underprice the entry; None in
+        # standalone mode, where no print is available.
+        self.trigger_print = None
 
         # order-id allocation (standalone counter; driven uses _id_alloc)
         self.next_order_id = None
@@ -519,6 +564,10 @@ class XWingController:
         self.orders = {}
         self.entry_shares = 0
         self.active_buy_id = None
+        self.entry_ts = None            # time.time() when the entry order was placed
+        self.entry_failed = None        # terminal event str once the entry is deemed dead
+        self._entry_abort_pending = False  # timeout fired: cancel sent, awaiting resolution
+        self._entry_cancel_ts = None    # time.time() when the timeout cancel was sent
         self.protective_id = None
         self.original_avg_fill = None   # frozen after first full entry fill
         self.running_entry_avg = None
@@ -639,30 +688,52 @@ class XWingController:
     def compute_entry_limit_price(self):
         """Determine the BUY LMT price for the initial entry, evaluated now.
 
-        If --max-limit-entry-percent-price is set, price off the live ask
-        (falling back ask->last->close): ref * (1 + pct/100), then lower to the
-        cap = last_close_price * (1 + max_cap_entry_percent/100) when both cap
-        args are given. Otherwise use the fixed --Entry-limit-price. Returns
-        None when no price can be determined."""
+        If --max-limit-entry-percent-price is set, price off the HIGHER of the
+        live ask, the trigger print (the price the stock just traded at) and the
+        last trade — falling back to close only if none of those exist: ref *
+        (1 + pad/100), then lower to the cap = last_close_price * (1 +
+        max_cap_entry_percent/100) when both cap args are given. The pad widens
+        to STALE_QUOTE_ENTRY_PERCENT_PRICE when the ask is detectably stale (more
+        than STALE_QUOTE_THRESHOLD_PCT below the trigger print) so the entry stays
+        marketable off a stale opening-snapshot ask. Otherwise use the fixed
+        --Entry-limit-price. Returns None when no price can be determined."""
         with self.lock:
             a = self.args
             if a.max_limit_entry_percent_price is not None:
-                ref = src = None
+                # Reference = the highest of ask / trigger-print / last; close is
+                # only a last resort (it's yesterday's close, not today's tape).
+                cands = []
                 if self.ask and self.ask > 0:
-                    ref, src = self.ask, "ask"
-                elif self.last and self.last > 0:
-                    ref, src = self.last, "last"
+                    cands.append(("ask", self.ask))
+                if self.trigger_print and self.trigger_print > 0:
+                    cands.append(("print", self.trigger_print))
+                if self.last and self.last > 0:
+                    cands.append(("last", self.last))
+                if cands:
+                    src, ref = max(cands, key=lambda c: c[1])
                 elif self.close and self.close > 0:
-                    ref, src = self.close, "close"
+                    src, ref = "close", self.close
+                else:
+                    src = ref = None
                 if ref is None:
                     if a.entry_limit_price is not None:
-                        self.log.warning("No ask/last/close at entry; using fixed "
+                        self.log.warning("No ask/print/last/close at entry; using fixed "
                                          "--Entry-limit-price %.4f", a.entry_limit_price)
                         return round_to_tick(a.entry_limit_price, self.min_tick)
-                    self.log.error("No ask/last/close and no --Entry-limit-price; "
+                    self.log.error("No ask/print/last/close and no --Entry-limit-price; "
                                    "cannot price entry")
                     return None
-                price = ref * (1 + a.max_limit_entry_percent_price / 100.0)
+                # Widen the pad only when the ask is DETECTABLY stale: present, but
+                # more than STALE_QUOTE_THRESHOLD_PCT below the trigger print.
+                pad = a.max_limit_entry_percent_price
+                stale = (self.ask and self.ask > 0
+                         and self.trigger_print and self.trigger_print > 0
+                         and self.ask < self.trigger_print
+                         * (1 - STALE_QUOTE_THRESHOLD_PCT / 100.0))
+                if stale:
+                    pad = max(STALE_QUOTE_ENTRY_PERCENT_PRICE,
+                              a.max_limit_entry_percent_price)
+                price = ref * (1 + pad / 100.0)
                 if a.last_close_price is not None and a.max_cap_entry_percent is not None:
                     cap = a.last_close_price * (1 + a.max_cap_entry_percent / 100.0)
                     if price > cap:
@@ -670,19 +741,23 @@ class XWingController:
                                       price, cap, a.last_close_price, a.max_cap_entry_percent)
                         price = cap
                 price = round_to_tick(price, self.min_tick)
-                self.log.info("Entry price: %s=%.4f * (1+%.2f%%) -> %.4f", src, ref,
-                              a.max_limit_entry_percent_price, price)
+                self.log.info("Entry price: %s=%.4f * (1+%.2f%%) -> %.4f%s", src, ref,
+                              pad, price,
+                              (" [STALE ask=%.4f vs print=%.4f]"
+                               % (self.ask, self.trigger_print)) if stale else "")
                 return price
             if a.entry_limit_price is not None:
                 return round_to_tick(a.entry_limit_price, self.min_tick)
             return None
 
-    def on_buy_signal(self, last_ask=None):
+    def on_buy_signal(self, last_ask=None, trigger_print=None):
         """The buy-signal entry point. In driven mode trade-mole calls this with
-        the last Ask price it saw at the moment of trigger; in standalone the
-        SIGUSR1 helper calls it with None. Seeds the ask (so the entry is priced
-        off exactly that ask) and places the BUY LMT entry. Idempotent: a second
-        call after the entry is placed is ignored."""
+        the last Ask price AND the trigger print (the price the surge trade just
+        executed at) it saw at the moment of trigger; in standalone the SIGUSR1
+        helper calls it with None. Seeds the ask and the trigger print so the
+        entry is priced off the higher of them (the ask alone is often stale in
+        the opening snapshot). Idempotent: a second call after the entry is placed
+        is ignored."""
         with self.lock:
             if self.active_buy_id is not None or self.stop_evt.is_set():
                 self.log.info("on_buy_signal ignored (already armed/stopping)")
@@ -690,6 +765,9 @@ class XWingController:
             if last_ask is not None and last_ask > 0:
                 self.ask = last_ask
                 self.log.info("Buy-signal: using last_ask=%.4f from trade-mole", last_ask)
+            if trigger_print is not None and trigger_print > 0:
+                self.trigger_print = trigger_print
+                self.log.info("Buy-signal: trigger_print=%.4f from trade-mole", trigger_print)
         self.place_entry()
 
     def place_entry(self):
@@ -716,6 +794,7 @@ class XWingController:
             self.log.info("ENTRY: BUY LMT %d %s @ %.4f (orderId=%d)", shares,
                           self.symbol, order.lmtPrice, oid)
             self.order_client.placeOrder(oid, self.contract, order)
+            self.entry_ts = time.time()
             self.phase = PHASE_ENTRY_PENDING
 
     def _signal_done(self, reason):
@@ -816,6 +895,19 @@ class XWingController:
                         self.original_avg_fill = avg
                         self.log.info("Entry FILLED: %d sh, original avg fill %.4f",
                                       int(filled), avg)
+                    elif (filled <= 0 and self.entry_failed is None
+                          and not self.terminating
+                          and status in ENTRY_DEAD_STATUSES):
+                        # IBKR deactivated/cancelled the unfilled entry (often with NO
+                        # error() callback - see JZXN 2026-07-10). Flag it; the control
+                        # loop stamps a terminal row and tears the duo down, freeing the
+                        # pooled clerk client instead of idling in ENTRY_PENDING.
+                        self.entry_failed = "entry_inactive"
+                        if self.done_reason is None:
+                            self.done_reason = "entry_inactive"
+                        self.log.warning("Entry order %d %s with no fill -> aborting run",
+                                         orderId, status)
+                        self.wake.set()
                 if newly > 0:
                     self.exiting = False
                     self.wake.set()  # arm/replace protective ASAP
@@ -908,6 +1000,31 @@ def control_loop(ctl: XWingController, start_ts: float):
             ypct = ((exit_ref - ref) / ref * 100.0) if (exit_ref and ref) else None
             event = ""
 
+            # entry never established: IBKR-deactivated (on_order_status set entry_failed)
+            # or still unfilled past the timeout backstop. On timeout we CANCEL the resting
+            # BUY (never leave it working -> silent stop-less fills) and let on_order_status
+            # resolve it: a clean cancel becomes entry_inactive (terminal row + teardown);
+            # a late fill lands as pos>0 and the protective block below arms the ladder. Only
+            # if the broker confirms neither within ENTRY_CANCEL_CONFIRM_SEC do we force-abort.
+            if (ctl.entry_failed is None and ctl.active_buy_id is not None and pos <= 0
+                    and ctl.entry_ts is not None and a.entry_fill_timeout
+                    and (time.time() - ctl.entry_ts) >= a.entry_fill_timeout):
+                if not ctl._entry_abort_pending:
+                    ctl._entry_abort_pending = True
+                    ctl._entry_cancel_ts = time.time()
+                    ctl.order_client.cancelOrder(ctl.active_buy_id)
+                    ctl.log.warning("Entry %s unfilled after %.0fs -> cancelling resting BUY",
+                                    ctl.active_buy_id, a.entry_fill_timeout)
+                elif (time.time() - ctl._entry_cancel_ts) >= ENTRY_CANCEL_CONFIRM_SEC:
+                    ctl.entry_failed = "entry_timeout"
+                    if ctl.done_reason is None:
+                        ctl.done_reason = "entry_timeout"
+                    ctl.log.warning("Entry %s cancel unconfirmed after %.0fs -> aborting run",
+                                    ctl.active_buy_id, ENTRY_CANCEL_CONFIRM_SEC)
+            if ctl.entry_failed and pos <= 0:
+                event = ctl.entry_failed
+                ctl.phase = PHASE_ENTRY_FAILED
+
             # protective management while long
             row_thr = trig = lim = aux = lmt = None
             if pos > 0 and exit_ref is not None:
@@ -954,6 +1071,11 @@ def control_loop(ctl: XWingController, start_ts: float):
             ctl.log.warning("%s %s | NO market data yet", ctl.session_label(), ctl.symbol)
 
         # termination conditions
+        if ctl.entry_failed is not None:
+            # entry deactivated/rejected/timed-out without ever filling; the terminal
+            # row was just written above. Stop so the clerk recycles the client.
+            ctl.stop_evt.set()
+            break
         if a.lifetime is not None and (time.time() - start_ts) >= a.lifetime:
             ctl.log.info("Lifetime %ds reached -> shutdown", a.lifetime)
             if ctl.done_reason is None:

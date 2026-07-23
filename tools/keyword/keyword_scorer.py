@@ -94,7 +94,7 @@ def _strip_html(text: str) -> str:
         text = html.unescape(_TAG_RE.sub(" ", text))
     return text
 
-CANON_DIR = HERE / "outputs" / "classify_ge20_nowire"
+CANON_DIR = HERE / "model_trained_on_PR-stats-2026-05-03to06-19" / "classify_ge20_nowire"
 DEFAULT_KEYWORDS = [str(CANON_DIR / "binary_keyword_impact_all_terms.csv")]
 DEFAULT_PIPELINE = str(CANON_DIR / "tfidf_fitted_pipeline.joblib")
 DEFAULT_REFERENCE = str(CANON_DIR / "scorer_reference.json")
@@ -281,12 +281,17 @@ class KeywordScorer:
         return out
 
     def score_texts(self, texts, explain: bool = False,
-                    already_stripped: bool = False, detail: bool = False):
+                    already_stripped: bool = False, detail: bool = False,
+                    max_words: int | None = None):
         """Returns a scores DataFrame; with detail=True returns
-        (scores, per-row list of (term, count, power, contribution))."""
+        (scores, per-row list of (term, count, power, contribution)).
+        max_words: score only the first N whitespace-separated words of each
+        (stripped) text -- applies to keyword methods AND model_proba."""
         stripped = [t if isinstance(t, str) else "" for t in texts]
         if not already_stripped:
             stripped = [strip_wire_boilerplate(_strip_html(t)) for t in stripped]
+        if max_words:
+            stripped = [" ".join(t.split()[:max_words]) for t in stripped]
         rows = [self._score_counts(self._ngram_counts(t.lower()), explain, detail)
                 for t in stripped]
         df = pd.DataFrame(rows)
@@ -304,8 +309,9 @@ class KeywordScorer:
         return (df, detail_lists) if detail else df
 
     def score_text(self, text: str, headline: str = "",
-                   explain: bool = False) -> dict:
-        out = self.score_texts([text], explain=explain).iloc[0].to_dict()
+                   explain: bool = False, max_words: int | None = None) -> dict:
+        out = self.score_texts([text], explain=explain,
+                               max_words=max_words).iloc[0].to_dict()
         out["boilerplate_category"] = boilerplate_category(
             f"{headline} \n {text}" if headline else text)
         return out
@@ -369,8 +375,10 @@ def run_score(scorer: KeywordScorer, args) -> None:
     bodies = df[text_col].fillna("")
     detect = (df[head_col].fillna("") + " \n " + bodies) if head_col else bodies
     want_detail = args.words_detail == "true"
+    if args.max_words:
+        print(f"scoring only the first {args.max_words} words of each text")
     res = scorer.score_texts(bodies.tolist(), explain=args.explain,
-                             detail=want_detail)
+                             detail=want_detail, max_words=args.max_words)
     scores, detail_lists = res if want_detail else (res, None)
     scores.insert(0, "boilerplate_category", detect.map(boilerplate_category).values)
 
@@ -430,7 +438,8 @@ def run_evaluate(scorer: KeywordScorer, args) -> None:
 
     df = load_and_prepare(Path(args.input), args.text_col, args.target_col,
                           args.id_col, drop_duplicates=True,
-                          strip_boilerplate=True, strip_wire=True)
+                          strip_boilerplate=args.strip_boilerplate,
+                          strip_wire=True)
     y = (df["_target"].to_numpy(dtype=float) >= args.threshold).astype(int)
     idx_tr, idx_te = train_test_split(np.arange(len(y)), test_size=args.test_size,
                                       random_state=args.seed, stratify=y)
@@ -438,7 +447,10 @@ def run_evaluate(scorer: KeywordScorer, args) -> None:
           f"({100 * y.mean():.1f}%), test split n={len(idx_te)} "
           f"(seed={args.seed}, mirrors keyword_finder) ===")
 
-    scores = scorer.score_texts(df["_text"].tolist(), already_stripped=True)
+    if args.max_words:
+        print(f"scoring only the first {args.max_words} words of each text")
+    scores = scorer.score_texts(df["_text"].tolist(), already_stripped=True,
+                                max_words=args.max_words)
     methods = [m for m in METHOD_LABELS if m in scores.columns]
 
     rows = []
@@ -471,6 +483,11 @@ def main() -> None:
     ap.add_argument("--evaluate", action="store_true",
                     help="back-test all methods on the historical file instead "
                          "of scoring; also (re)builds the percentile reference")
+    ap.add_argument("--strip-boilerplate", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="evaluate mode: drop boilerplate-category rows before "
+                         "the split (must match how the model was trained; use "
+                         "--no-strip-boilerplate for models trained on all rows)")
     ap.add_argument("--input", default=DEFAULT_INPUT)
     ap.add_argument("--out", default=None, help="scored TSV path "
                     "(default: <input>_scored.tsv)")
@@ -493,6 +510,12 @@ def main() -> None:
     ap.add_argument("--prevalence", type=float, default=None,
                     help="P(positive) anchor for kw_mult_nb "
                          "(default: from model_performance_summary.csv)")
+    ap.add_argument("--max-words", type=int, default=None,
+                    help="score only the first N whitespace words of the text "
+                         "(after HTML/wire-strip); applies to all methods incl. "
+                         "model_proba, and to --evaluate. Percentile columns "
+                         "only line up if the reference was built with the "
+                         "same --max-words")
     ap.add_argument("--min-doc-freq", type=int, default=0,
                     help="drop keyword-table terms below this document_frequency")
     ap.add_argument("--explain", action="store_true",

@@ -192,6 +192,23 @@ SURGE_ITI_COLLAPSE_MIN_TRADES_5S = 3
 SURGE_FLOW_MIN_DOLLAR_RATE_5S = 10.0
 SURGE_FLOW_MIN_PRICE_RISE_PCT = 0.01
 
+# Rule F — pre-trade start-staleness (added 2026-07-23). Snapshot-only twin of
+# Rule B: fires off the reqMktData snapshot burst BEFORE the first trade prints,
+# on bslnITI_over_pretrade_gap = hist baseline ITI / pretrade_gap, where
+# pretrade_gap = (first-event wall clock) − LAST_TIMESTAMP (tick 45, the last
+# pre-subscribe trade). Distinct from Rule B on purpose: Rule B anchors the gap to
+# the first NEW trade and requires a live print to confirm; Rule F anchors to
+# subscribe/now and acts on the snapshot alone (no post-subscribe confirmation), so
+# it gets its OWN threshold and a gap floor. LAST_TIMESTAMP is whole-second, so the
+# raw pretrade gap can be sub-second and inflate the ratio — PRETRADE_MIN_GAP_SEC
+# clamps the denominator. Skipped when there is no valid ITI baseline (see
+# _has_iti_baseline). Enabled by default; a valid ask must be present to price the
+# entry (there is no trade print). CLI-tunable via --pretrade-staleness-threshold /
+# --no-pretrade-staleness-fire.
+PRETRADE_STALENESS_THRESHOLD = 100.0
+PRETRADE_MIN_GAP_SEC = 1.0
+PRETRADE_STALENESS_FIRE = True
+
 # Trade-size baseline (v2.1). The universe pipeline writes 44444 when the
 # historical trade-size fetch was ATTEMPTED but FAILED (see
 # universe_finder/tradeSizeExplained.txt); treat it as "no baseline".
@@ -339,6 +356,8 @@ class IBKRSurgeApp(EWrapper, EClient):
         surge_quote_window: int = DEFAULT_SURGE_QUOTE_WINDOW,
         baseline_avg_trade_size: Optional[float] = None,
         large_trade_mult: float = DEFAULT_LARGE_TRADE_MULT,
+        pretrade_staleness_fire: bool = PRETRADE_STALENESS_FIRE,
+        pretrade_staleness_threshold: float = PRETRADE_STALENESS_THRESHOLD,
         logger: Optional[logging.Logger] = None,
     ):
         EClient.__init__(self, wrapper=self)
@@ -386,6 +405,11 @@ class IBKRSurgeApp(EWrapper, EClient):
         # Active quote-churn rule thresholds (see should_fire).
         self._surge_min_quote_updates = surge_min_quote_updates
         self._surge_quote_window = surge_quote_window
+
+        # Rule F — pre-trade start-staleness (snapshot-only). Independent of the
+        # Rule B threshold; see _maybe_fire_pretrade / _bslnITI_over_pretrade_gap.
+        self._pretrade_fire = pretrade_staleness_fire
+        self._pretrade_threshold = pretrade_staleness_threshold
 
         # Request IDs
         self.req_id_mkt = 1001
@@ -436,6 +460,12 @@ class IBKRSurgeApp(EWrapper, EClient):
         # is whole-second resolution and this is the local clock vs the exchange
         # clock, so it is a coarse, conservative upper bound on staleness.
         self._subscribe_wall: Optional[float] = None
+        # Wall-clock epoch of the very first tick of ANY kind (quote/size/string/
+        # generic). Rule F anchors its staleness gap here so it can fire off the
+        # snapshot before the first trade sets _subscribe_wall. Kept separate from
+        # _subscribe_wall so the recorded prev_trd_time_gap column (trade path) is
+        # unchanged.
+        self._first_event_wall: Optional[float] = None
         self._prev_trd_time_gap: Optional[float] = None
         self._last_accepted_trade_mono: Optional[float] = None
         self._last_accepted_rt_source: Optional[str] = None
@@ -726,18 +756,30 @@ class IBKRSurgeApp(EWrapper, EClient):
             )
             # Fire the buy-signal exactly once. The trigger row is already in
             # self.records; stop_at_trigger halts all further recording.
-            if not self.triggered:
-                self.triggered = True
-                last_ask = self._last_ask
-                self._log.warning(
-                    f"BUY-SIGNAL {self.symbol}: handing last_ask={last_ask} to x-wing"
-                )
-                cb = self.buy_signal_callback
-                if cb is not None:
-                    try:
-                        cb(last_ask)
-                    except Exception as e:  # never let a downstream error kill the feed
-                        self._log.error(f"buy_signal_callback raised: {e}", exc_info=True)
+            # `price` is the surge trade's print — the price the stock just traded
+            # at. Handed alongside the ask so x-wing can price the entry off the
+            # higher of the two (the opening-snapshot ask is often stale when the
+            # surge fires within a few seconds of subscribing).
+            self._emit_buy_signal(price, self._last_ask, reason, "trade")
+
+    def _emit_buy_signal(self, price, last_ask, reason, source):
+        """Fire the buy-signal exactly once, shared by the trade path and the
+        pre-trade path (Rule F). `price` is the trigger_print handed to x-wing
+        (the trade print on the trade path, the ask on the pre-trade path);
+        x-wing prices the entry off max(last_ask, trigger_print)."""
+        if self.triggered:
+            return
+        self.triggered = True
+        self._log.warning(
+            f"BUY-SIGNAL {self.symbol} (source={source}): handing last_ask={last_ask} "
+            f"trigger_print={price} to x-wing"
+        )
+        cb = self.buy_signal_callback
+        if cb is not None:
+            try:
+                cb(last_ask, price)
+            except Exception as e:  # never let a downstream error kill the feed
+                self._log.error(f"buy_signal_callback raised: {e}", exc_info=True)
 
     def _reconcile_trade_count(self, now_mono: float, new_count: int):
         """
@@ -1022,6 +1064,87 @@ class IBKRSurgeApp(EWrapper, EClient):
             return base / gap
         return None
 
+    def _pretrade_gap(self) -> Optional[float]:
+        """Pre-trade tape-staleness gap = (first-event wall clock) − LAST_TIMESTAMP,
+        floored at PRETRADE_MIN_GAP_SEC. Available before any trade prints. None
+        until both the first tick and LAST_TIMESTAMP (tick 45) have been seen."""
+        if self._first_event_wall is None or self._last_timestamp_at_subscribe is None:
+            return None
+        return max(
+            self._first_event_wall - self._last_timestamp_at_subscribe,
+            PRETRADE_MIN_GAP_SEC,
+        )
+
+    def _bslnITI_over_pretrade_gap(self) -> Optional[float]:
+        """Rule F ratio = hist baseline ITI / pretrade_gap. Snapshot-only twin of
+        bsln_over_prev_trd_gap: anchors the staleness gap to subscribe/now rather
+        than the first new trade. Returns None when there is no valid ITI baseline
+        (missing / <=0 / 44444 sentinel) or the pretrade gap isn't known yet."""
+        if not self._has_iti_baseline:
+            return None
+        gap = self._pretrade_gap()
+        base = self._hist_baseline_avg_iti
+        if gap and gap > 0 and base is not None:
+            return base / gap
+        return None
+
+    def _note_first_event(self, now_wall: float) -> None:
+        """Stamp the wall-clock epoch of the very first tick of any kind, so Rule F
+        can anchor its staleness gap before the first trade sets _subscribe_wall."""
+        if self._first_event_wall is None:
+            self._first_event_wall = now_wall
+
+    def _maybe_fire_pretrade(self, now_mono: float, now_wall: float) -> None:
+        """Rule F — fire off the reqMktData snapshot before the first trade prints.
+        Requires: enabled, not already triggered, a valid ITI baseline, LAST_TIMESTAMP
+        seen, and a usable ask (there is no trade print, so the ask prices the entry).
+        Skips a locked/crossed snapshot. Constant per session once inputs are known,
+        so it fires the instant all preconditions are met."""
+        if not self._pretrade_fire or self.triggered:
+            return
+        ask = self._last_ask
+        if ask is None or ask <= 0:
+            return
+        # Skip a locked/crossed snapshot quote.
+        if self._last_bid is not None and self._last_bid > 0 and ask < self._last_bid:
+            return
+        ratio = self._bslnITI_over_pretrade_gap()
+        if ratio is None or ratio <= self._pretrade_threshold:
+            return
+
+        gap = self._pretrade_gap()
+        reason = (
+            f"bslnITI_over_pretrade_gap={ratio:.2f}>{self._pretrade_threshold:.0f}"
+        )
+        # Anchor downstream price math; there is no trade, so use the ask.
+        if self._start_price is None:
+            self._start_price = ask
+        # Populate the staleness columns so the written CSV explains the fire. These
+        # are only set on the pre-trade branch (no trade ever runs), so the recorded
+        # prev_trd_time_gap semantics on the trade path are unchanged.
+        if self._prev_trd_time_gap is None:
+            self._prev_trd_time_gap = gap
+        if self._subscribe_wall is None:
+            self._subscribe_wall = self._first_event_wall
+        self._log.warning(
+            f"\U0001F680 PRETRADE-SURGE {self.symbol} @ ask=${ask:.4f} "
+            f"| pretrade_gap={gap:.3f}s baselineITI={self._hist_baseline_avg_iti} "
+            f"| {reason}"
+        )
+        self.records.append({
+            "event_type": "PRETRADE_SURGE",
+            "local_arrival_time": now_wall,
+            "local_arrival_iso": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
+            "ask": ask,
+            "bid": self._last_bid,
+            "prev_trd_time_gap": gap,
+            "bsln_over_prev_trd_gap": ratio,
+            "hist_baseline_avg_iti": self._hist_baseline_avg_iti,
+            "surge_detected": True,
+            "surge_reason": reason,
+        })
+        self._emit_buy_signal(ask, ask, reason, "pretrade")
+
     def should_fire(self, w: dict, iti: Optional[float]) -> tuple:
         """
         Price-drop VETO, then OR of five trigger rules — any one alone fires the
@@ -1174,9 +1297,11 @@ class IBKRSurgeApp(EWrapper, EClient):
         if self.triggered and self.stop_at_trigger:
             return
         now_mono = time.perf_counter()
+        now_wall = time.time()
+        self._note_first_event(now_wall)
         rec = {
             "event_type": "TICK_PRICE",
-            "local_arrival_time": time.time(),
+            "local_arrival_time": now_wall,
             "local_arrival_iso": datetime.now().isoformat(timespec="milliseconds"),
             "tick_type": tickType,
             "price": price,
@@ -1197,11 +1322,15 @@ class IBKRSurgeApp(EWrapper, EClient):
         if updated_nbbo:
             self._append_quote_log(now_mono)
         self.records.append(rec)
+        # Rule F — an ask may have just landed; check the snapshot-only trigger.
+        if updated_nbbo:
+            self._maybe_fire_pretrade(now_mono, now_wall)
 
     def tickSize(self, reqId, tickType, size):
         if self.triggered and self.stop_at_trigger:
             return
         now_mono = time.perf_counter()
+        self._note_first_event(time.time())
         sz = float(size) if size else 0.0
         rec = {
             "event_type": "TICK_SIZE",
@@ -1232,6 +1361,7 @@ class IBKRSurgeApp(EWrapper, EClient):
     def tickGeneric(self, reqId, tickType, value):
         if self.triggered and self.stop_at_trigger:
             return
+        self._note_first_event(time.time())
         rec = {
             "event_type": "TICK_GENERIC",
             "local_arrival_time": time.time(),
@@ -1260,6 +1390,7 @@ class IBKRSurgeApp(EWrapper, EClient):
             return
         now_mono = time.perf_counter()
         now_wall = time.time()
+        self._note_first_event(now_wall)
 
         # 48 = RTVolume (tick 233), 77 = RTTradeVolume (tick 375)
         if tickType in (48, 77) and value:
@@ -1298,6 +1429,8 @@ class IBKRSurgeApp(EWrapper, EClient):
                 self._last_timestamp_at_subscribe = float(int(value))
             except (ValueError, TypeError):
                 self._log.debug(f"LAST_TIMESTAMP parse error on {value!r}")
+            # Rule F — LAST_TIMESTAMP just completed the staleness gap; check it.
+            self._maybe_fire_pretrade(now_mono, now_wall)
 
         self.records.append({
             "event_type": "TICK_STRING",
@@ -1458,6 +1591,15 @@ def main():
                         choices=WINDOWS,
                         help="Active rule: rolling window (s) for the quote_updates "
                              "trigger; must be one of the recorded windows.")
+    parser.add_argument("--pretrade-staleness-threshold", type=float,
+                        default=PRETRADE_STALENESS_THRESHOLD,
+                        help="Rule F: fire off the snapshot before the first trade "
+                             "when bslnITI_over_pretrade_gap exceeds this.")
+    parser.add_argument("--no-pretrade-staleness-fire", dest="pretrade_staleness_fire",
+                        action="store_false",
+                        help="Disable Rule F (pre-trade snapshot staleness fire). "
+                             "Enabled by default.")
+    parser.set_defaults(pretrade_staleness_fire=PRETRADE_STALENESS_FIRE)
     parser.add_argument("--keep-recording-after-trigger", action="store_true",
                         help="Do NOT stop recording when the surge/buy-signal fires "
                              "(default: stop at the trigger row). Standalone only.")
@@ -1528,6 +1670,8 @@ def main():
         surge_quote_window=args.surge_quote_window,
         baseline_avg_trade_size=args.baseline_avg_trade_size,
         large_trade_mult=args.large_trade_mult,
+        pretrade_staleness_fire=args.pretrade_staleness_fire,
+        pretrade_staleness_threshold=args.pretrade_staleness_threshold,
     )
     app.stop_at_trigger = not args.keep_recording_after_trigger
     logging.info(f"Connecting to {args.host}:{args.port} ...")

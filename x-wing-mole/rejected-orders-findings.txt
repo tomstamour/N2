@@ -1,0 +1,46 @@
+# Rejected / "Inactive" entry orders — findings (last updated 2026-07-17)
+
+## Summary
+On a buy-signal, x-wing places a marketable BUY LMT (ask * 1.04, outsideRth=True, GTC).
+Rarely, IBKR immediately marks it "Inactive" with filled=0 and NO error() callback / no
+reason code. x-wing's ENTRY_DEAD_STATUSES guard (x-wing-2.0.py:124, handled at :848-860)
+then aborts the run ("entry_inactive") and the clerk returns the client to the pool.
+The order was never live — this is IBKR deactivating it, not our code cancelling it.
+
+## Confirmed occurrences (2 of 1822 x-wing runs)
+- CLIK  2026-07-17 07:00:03  BUY LMT 2  @ 1.9200 (ask 1.85)  -> Inactive @ +215ms
+- OFAL  2026-07-14 08:00:03  BUY LMT 30 @ 0.1633 (ask 0.157) -> Inactive @ +519ms
+- JZXN  2026-07-10 (pre-guard) marketable BUY LMT -> Inactive @ +110ms, no code
+  (the incident referenced by the code comment at x-wing-2.0.py:122)
+
+## Shared fingerprint
+- Marketable BUY LMT priced +4% ABOVE the ask (through the market)
+- Pre-market / ETH session
+- Low-priced small-cap ($1.85, $0.157)
+- Deactivated within ~100-520ms, NO error reason
+- Fired ~3s after a top-of-hour boundary that is also a pre-market session open
+  (07:00:03 and 08:00:03)
+
+## Two candidate root causes (UNCONFIRMED)
+1. Pre-market price cap / precautionary check on a marketable limit set through the
+   market  -> a less-aggressive limit (at the ask, no +4%) might be accepted.
+2. Venue session had only just opened at the top-of-hour boundary and briefly rejected
+   the order  -> the same order resent ~300ms later might be accepted.
+
+## Why the exact reason is unknown
+Every Gateway API log under ~/Jts/settings-live/.../api.999.*.ibgzenc is ENCRYPTED.
+Plaintext reasons require enabling "Create API message log file" in the IB Gateway
+config (Configuration > API > Settings). Until then the exact IBKR reason is not on disk.
+
+## Current handling (no auto-retry)
+x-wing-2.0.py treats Inactive/Cancelled/ApiCancelled on an unfilled entry as terminal:
+- ENTRY_DEAD_STATUSES  (line 124)
+- orderStatus abort     (lines 848-860)  -> entry_failed="entry_inactive"
+- ENTRY_REJECT_CODES    (line 118) + on_order_error (lines 883-894) for coded rejects
+- ENTRY_FILL_TIMEOUT_SEC=30 backstop (lines 959-973)
+A reprice/retry-on-Inactive was considered (delay+resend for cause #2, reprice-to-ask for
+cause #1) but NOT implemented — pending confirmation of the actual reason.
+
+## Next step to confirm
+Enable the plaintext API message log in IB Gateway, then wait for the next Inactive entry
+to capture IBKR's human-readable reason before deciding on a fix.
