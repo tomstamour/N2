@@ -1,0 +1,46 @@
+
+=== 2026-07-28 — O5.2 keyword leg REPLACED: biased-label combo -> corrected-label ge15 body+headline AND ===
+1. GATE CHANGE. Old keyword leg `model_proba_PLUS_kw_mult_nb >= 0.67` (COMBO_TRIGGER_MIN) is GONE.
+   New keyword leg = ge15 BODY model_proba >= KW15_BODY_MIN (0.60) AND ge15 HEADLINE model_proba >=
+   KW15_HEAD_MIN (0.65). Headline leg (FinBERT positive>=0.6 AND FMB indecisive<=0.13) UNCHANGED.
+   Models: tools/keyword/model_trained_on_04-PRstats-2026-05-04to06-18_TRAIN/{classify_fromPRhigh_ge15,
+   classify_fromPRhigh_ge15_headline}/tfidf_fitted_pipeline.joblib — the only keyword models trained on the
+   CORRECTED fromPR_High label (n_train 2117 + n_test 530 = 2647, train pos rate 0.2286). The old model
+   (SELECTED-MODEL_..._ge15_excStr2) learned the pre-2026-07-26 BIASED label.
+2. WHY AND, NOT OR. On the 777-row VAL holdout at target >=30%: body>=0.60 alone 154 fires/40.9%;
+   head>=0.65 alone 134/41.8%; OR 213 fires/35.7% (DILUTES below either); AND 75 fires (9.7% of PRs)/
+   43 TP+32 FP = 57.3%/3.18x lift/30.7% recall. The channels overlap only Jaccard 0.352 (Spearman 0.592)
+   — genuinely different signals, which is why requiring both works. Evidence: price_stats_loader/
+   statsByClaude/July28_SentimentScore_stats_report.md §5.1-5.4.
+   CAVEAT: 0.60/0.65 were read off that same VAL grid -> 57.3% is post-selection and optimistic.
+3. !! FOUND: O5.2 COULD NOT START before this change. keyword_scorer-2's DEFAULT_COMBO_MODEL JSON
+   (price_stats_loader/outputs/PR-stats-...-comboScore_model.json) NO LONGER EXISTS — deleted with the
+   outputs depollution, never tracked (outputs/ is gitignored). get_default_scorer() then reports
+   "combo=no" and main()'s hard-fail guard ("combo score missing -> refusing to start") fired. The guard
+   worked exactly as designed. This change removes the combo dependency entirely, so it also clears that
+   startup blocker. Do NOT try to restore the old leg without refitting the combo JSON.
+4. TEXT PREP. New helper _kw15_prep = strip_wire_boilerplate(kw2._strip_html(t)) then optional word cap.
+   Pipelines loaded straight from joblib, NOT via KeywordScorer — score_texts() also runs the n-gram/
+   keyword machinery for kw_* methods we would compute and discard twice per PR on the trade path.
+5. !! THE 400-WORD BODY CAP IS MANDATORY (KW15_BODY_MAX_WORDS). Corpus bodies are capped at 400 words
+   UPSTREAM, so the models only ever saw the first 400. Measured on 777 VAL rows: NO cap -> max |dProba|
+   0.212 and 49 FIRE-DECISION FLIPS (154->165 fires). Cap ORDER vs stripping is immaterial (max |d| 0.014,
+   0 flips), so capping after the strip is safe. Headlines are never capped.
+6. TSV 30 -> 31 cols: model_proba_PLUS_kw_mult_nb REMOVED, kw15_body_proba + kw15_head_proba added before
+   KwScoreCompletedAt. First O5 schema change that DROPS a column. Header-rotation guard makes it safe
+   mid-day. daily-board.py:280 updated to position both new columns (old name kept in the list so older
+   TSVs still render — absent entries are filtered). historicalNewsFetch/rtpr_hist_backfill.py deliberately
+   NOT touched: it is pinned to the FROZEN Orchestrator5.1 24-col schema and writes empty score cells.
+7. !! ClerkSentiment 'Keyword' MEANS A DIFFERENT RULE before/after 2026-07-28. Label vocabulary unchanged
+   (Keyword / FinBERT_FMB / Keyword_FinBERT_FMB / BAD) so nothing downstream breaks, but historical TSVs
+   must not be pooled with new ones on that label.
+8. VERIFIED (all pass): (1) prep parity — live prep reproduces walkforward_eval to 0 decision flips;
+   (2) the leg fires 75x with 43 TP at >=30% on VAL, routed through the real _evaluate_trigger;
+   (3) 11-case gate truth table — exact boundaries fire (>= not >), 1-tick-under does not, every None
+   combination kills only the keyword leg; (4) latency 1.84 ms/PR for BOTH models (was ~4 ms for the old
+   single scorer) vs the 10 s KW_SCORE_WAIT_SEC ceiling; (5) old-vs-new on 496 real live-logged PRs:
+   old fired 39 (7.9%), new fires 49 (9.9%), only 13 in common, 26 dropped / 36 gained, Jaccard 0.173 —
+   this is a substantially different rule, not a tightening; (6) startup smoke returns valid probabilities.
+9. NOT DONE: no retraining, no change to the FinBERT/FinMarBa leg, keyword_scorer-2.py and the frozen
+   canonical artifacts untouched, 5.0/5.1 frozen. Still owed: forward validation of 0.60/0.65 on live data
+   to size the post-selection bias in (2).

@@ -98,6 +98,29 @@ trade-mole  —  trade-frequency surge detector (produces x-wing's buy-signal)
     plus cross-window size momentum. All derived inside the existing single
     trade-log scan (zero added latency, no new subscriptions).
 
+--------------------------------------------------------------------------------
+2026-07-30  2.1 -> 2.2  (trade-mole-2.2.py; 2.1 kept on disk. Same day, BOTH
+            clerks' _load_module lines switched to 2.2 — live on next clerk
+            restart)
+--------------------------------------------------------------------------------
+  Precision re-calibration on the 07-09..07-30 labeled window (2.1 fired on
+  23/30 neg there). Zero structural change; report =
+  mole-outputs/surge-predictor-analysis-2026-07-30.md, re-runnable via
+  analyze_trade_mole/analyze_surge_predictors_v3.py (OR-level replay).
+  - Thresholds: Rule C 100 -> 1550; Rule A dollar gate 2.0 -> 60.0;
+    Rule D max ITI 0.3 -> 0.28; Rule E price rise 0.01 -> 0.012.
+    B unchanged (CVKD 20777 > pos SLND 13657 — not separable).
+  - NEW Rule F veto: a pretrade fire is suppressed unless (no trade printed
+    yet) AND (pretrade gap <= 1.25s) AND (ratio <= 5000). Vetoed fire writes
+    one PRETRADE_VETO row and disables the pretrade path for the session; the
+    trade-path rules keep watching. FFAI exposed that F could fire after
+    prints on a falling tape (F bypasses the price-drop veto). Kill-switch:
+    --no-pretrade-veto (reverts to 2.1 fire behaviour).
+  - Verified on the labeled window: pos 21/21 kept (16 trade-path + 5
+    pretrade), neg fires 23/30 -> 13 (12 trade-path + 1 pretrade), pos median
+    time-to-fire unchanged (1.78s). ⚠ F-veto calibrated on only 5 pretrade
+    pos; all numbers censored (recordings stop at the fire).
+
 
 ================================================================================
 clerk  —  warm ibapi client pool + orch-trigger listener (runs the duos)
@@ -114,10 +137,116 @@ Current: clerk-1.1.py (clerk-1.0.py superseded; not on disk).
     and replayed / re-armed on restart; a reconnection watchdog re-warms the pool
     after the daily Gateway restart.
   - Loads its duo scripts BY FILENAME via _load_module (clerk-1.1.py): currently
-    "trade-mole-2.1.py" and "x-wing-2.1.py" — this loader line is the single edit
-    needed to point the live chain at a new x-wing / trade-mole version.
+    "trade-mole-2.2.py" (since 2026-07-30; clerk-1.2 switched too) and
+    "x-wing-2.1.py" — this loader line is the single edit needed to point the
+    live chain at a new x-wing / trade-mole version.
   A precise 1.0 -> 1.1 changelog is not recorded in-repo (1.0 is gone); the entry
   above describes the current 1.1 architecture.
+
+
+--------------------------------------------------------------------------------
+2026-07-28  BUGFIX (clerk-1.1.py AND clerk-1.2.py) — deferred sessions were
+            killed by a sentiment gate that did not apply to them
+--------------------------------------------------------------------------------
+  Symptom: BKYI (PR 02:59 ET, deferred to a 04:00 collection start) surged at
+  04:00:02 and trade-mole recorded ZERO data points / wrote no output file.
+
+  Cause: the "Sentiment BAD" handler resolved the trigger regime with
+  conditions.at(datetime.now()) — i.e. the instant the BAD ARRIVED (02:59 ->
+  DEFAULT -> finbert_gate=on -> tear down). But the session was deferred to
+  collect at 04:00, which resolves to WINDOW 04:00-06:59 -> finbert_gate=off,
+  where sentiment has NO authority and the surge is the sole trigger. finish()
+  then cancelled the pending defer timer, so reqMktData was never issued and the
+  session was gone 61 min before the surge.
+
+  This contradicted the design already stated elsewhere in the file:
+  on_buy_signal resolves finbert_gate at the SURGE instant, and
+  _begin_collection anchors the watch lifetime on COLLECTION START, explicitly
+  noting "04:00 ET for deferred overnight duos, not trigger arrival". The BAD
+  handler was the one place that missed the same consideration. For a live-market
+  session arrival ~= surge, so it never showed there.
+
+  Hit rate on the affected path was 100%: of 5 deferred sessions in 8 days of
+  clerk logs, 4 died this way (PMI 07-21, CRMT 07-21, MSGM 07-22 on clerk-1.1;
+  BKYI 07-28 on clerk-1.2). EDHL 07-26 had no BAD, survived, and collected
+  normally at 04:00 — the control case.
+
+  Fix: new DuoSession/TrioSession.conditions_instant() returns the scheduled
+  collection start while the session is still deferred (_defer_target set and
+  _watch_timer not yet armed) and `now` once collection has begun; the BAD
+  handler resolves against it. The existing gate-off branch already did the right
+  thing — it was simply never reached. _defer_target is left untouched so the
+  crash-replay record and arm reply are unaffected.
+
+  BEHAVIOUR CHANGE (intended): an overnight BAD-sentiment PR now survives to
+  04:00 and may trade on surge alone, which is what finbert_gate=off means for
+  that window. Intraday behaviour is unchanged (BAD still tears the session down).
+
+  Also: Orchestrator5.2 now logs the three gate inputs against their thresholds
+  on the BAD path ("[Gate] SYM BAD: positive=... indecisive=... combo=..."), so a
+  rejection is diagnosable from the log without joining it to the TSV by hand.
+
+
+--------------------------------------------------------------------------------
+2026-08-02  T47-airspeeder-1.0.py  ->  T47-airspeeder-2.0.py  (clerk-1.2 switched)
+            the 4-run DROP/PUSH ladder becomes ONE re-entry at SP1
+--------------------------------------------------------------------------------
+  Both versions are on disk; clerk-1.2.py's _load_module line is the only wiring
+  (t47mod = _load_module("t47_airspeeder", "T47-airspeeder-2.0.py")). The
+  clerk-facing API is byte-identical — set_anchor / launch_run1 / on_tick_price /
+  observe_order_status / on_run_done / shutdown — so nothing else changed, and
+  x-wing-2.1.py / trade-mole-2.2.py / clerk-1.1.py were not touched.
+
+  WHY: 1.0's re-entry rule carried a lot of state (HP re-anchoring on every new
+  high, HP_RESET, a PUSH threshold off LP, an LP dwell timer, up to 3 relaunches)
+  for a behaviour that had never been validated live. 2.0 keeps the entire safety
+  layer and replaces only the watch arithmetic with the rule drawn on slide 2 of
+  the design deck: PR -> EP1 -> HP1 -> SP1 -> EP2.
+
+  THE RULE (2.0): at the run-1 exit the exit avg fill is FROZEN as `level` (SP1)
+  and never re-anchors. While flat, LP tracks the lowest bid since that freeze;
+  DIP = (level - LP)/level*100 >= EP2_MIN_DIP_PCT (10.0) latches Valid-DIP; the
+  first bid >= level after that relaunches ONE fresh x-wing, priced the same way
+  1.0 did (on_buy_signal(ask, ask), Rule-F shape, session.xwing swapped BEFORE
+  the place). XWING_REENTRY_NUMBER = 1 => 2 runs max. Setting EP2_MIN_DIP_PCT = 0
+  disables the dip gate (any re-cross fires); both comparisons are >=.
+
+  ABORTED RUN 1 (entry Inactive / timeout / reject, so no SP1 exists): still gets
+  its one re-entry, aiming at ctl.trigger_print -> ctl.ask -> current bid. 1.0
+  re-anchored to the bare bid instead.
+
+  DROPPED constants: DROP_THRESHOLD_PCT, PUSH_THRESHOLD_PCT, LP_DWELL_SEC.
+  UNCHANGED: T47_WATCH_LIFETIME (2h from collection start) + T47_SESSION_END_ET
+  (20:00), both flat-only; the heartbeat that only sets _pending_finish while a
+  run is live (T47 still never touches ctl.stop_evt); the _prior_entry_ids
+  late-fill guard; t47:residual_position / t47:late_entry_fill /
+  t47:budget_exhausted:* / t47:launch_failed / t47:lifetime / t47:session_end.
+
+  OUTPUT: T47-tables/SYMBOL-yyyy-mm-dd-hh-t47v2.tsv — new "v2" suffix because the
+  ten 1.0 tables from 2026-07-28 in that directory carry the old column set. 13
+  columns: Time, CP-Bid, Ask, EP, SP, HP, LP, DIP(%), GAP(%), Valid-DIP, Run,
+  State, Event. SP shows the FROZEN level while the watch is open (so "the bid
+  came back to SP" reads off one row) and the latest exit fill otherwise;
+  GAP(%) = (bid - SP)/SP*100, i.e. 0.00 is the fire line; HP mirrors x-wing's
+  in-position high_water and is INFORMATIONAL ONLY (it drives nothing in 2.0).
+  Events: RUN_LAUNCH / ENTRY_FILL / EXIT_FILL / LATE_FILL / ABORT / LEVEL_SET /
+  VALID_DIP / RELAUNCH / LIFETIME_END / SESSION_END / CLIENT_DEAD / DONE:{reason}
+  (1.0's HP_RESET is gone — the level never re-anchors).
+
+  ALSO FIXED (carried over from 1.0): T47Writer.close() closed the handle but
+  left _fh non-None, so `opened` stayed True and a post-shutdown write would hit
+  a closed file. 2.0 nulls _fh, sets a _closed flag that makes write() a no-op,
+  and tracks "a file was ever created" in a separate _ever_opened flag (that is
+  what keeps a no-surge session from leaving an empty TSV).
+
+  VERIFIED: offline stub harness (T47 is ibapi-free and takes an injectable
+  clock) — 9 cases all pass: 5% dip then re-cross does NOT fire; 11% dip then
+  re-cross fires exactly once with session.xwing swapped BEFORE on_buy_signal;
+  run 2 end -> budget_exhausted, never a 3rd run; aborted run 1 aims at the
+  trigger print; late fill on the dead entry ends the trio; residual position
+  ends the trio; flat lifetime expiry -> t47:lifetime; no-surge session leaves no
+  file; TSV shape + post-close write dropped. PAPER-GW VERIFY STILL PENDING (as
+  it was for 1.0 / clerk-1.2 as a whole).
 
 
 ================================================================================
@@ -129,3 +258,10 @@ Operating rules (cross-cutting)
     dailyStats 77, daily-board 20000. Saturation shows up as handshake timeouts.
   - Bulk historical-data jobs go on the idle paper GW (4002); the live GW (4001)
     drops them under contention.
+
+
+
+
+###################
+The clerk-1.1.py was the latest version prior the T47 implementation to the system. The clerk-1.1.py is using the x-wing-2.1.py and trade-mole-2.1.py and the latest Yield file is v5-smoothed-yield_vs-stopLimits.tsv
+

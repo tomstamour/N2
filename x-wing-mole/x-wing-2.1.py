@@ -99,11 +99,11 @@ _CFG = n2_config.load_config()
 # --------------------------------------------------------------------------- #
 CAPITAL                       = 5.00            # dollar budget per trade
 ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
-INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v5-smoothed-yield_vs-stopLimits.tsv")
+INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v7-smoothed-yield_vs-stopLimits.tsv")
 LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
 PRICE_ACTION_TABLE_DIR        = str(_HERE / "xwing_tables")  # xwing-table_<symbol>_<date>_<time>.tsv
 LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal
-MAX_LIMIT_ENTRY_PERCENT_PRICE = 5.0             # entry = ref * (1 + pct/100)
+MAX_LIMIT_ENTRY_PERCENT_PRICE = 2.9             # entry = ref * (1 + pct/100)
 # Stale-ask entry pricing (added 2026-07-22). The entry reference is priced off the
 # HIGHER of (ask, trigger-print, last) — not the ask alone — because the ask in the
 # opening market-data snapshot is often stale when the surge fired within a few
@@ -115,7 +115,7 @@ MAX_LIMIT_ENTRY_PERCENT_PRICE = 5.0             # entry = ref * (1 + pct/100)
 # trigger print) the pad widens to STALE_QUOTE_ENTRY_PERCENT_PRICE: on the 14 stale
 # runs with price tables, max(ask,print)*1.04 rescued 5/14 vs 11/14 at *1.06. Runs
 # with a healthy ask (193 of 210) keep ref=ask and the 4% pad and are unaffected.
-STALE_QUOTE_ENTRY_PERCENT_PRICE = 6.0           # pad used when the ask is stale
+STALE_QUOTE_ENTRY_PERCENT_PRICE = 4.0           # pad used when the ask is stale
 STALE_QUOTE_THRESHOLD_PCT       = 1.0           # ask < print*(1-pct/100) => stale
 MAX_CAP_ENTRY_PERCENT         = 30.0            # cap = last_close * (1 + pct/100)
 # IBKR Price Management Algo on the BUY entry only (added in 2.1). The marketable
@@ -395,7 +395,7 @@ PA_COLUMNS = [
     "timestamp", "symbol", "phase", "bid", "ask", "mid", "orig_avg_fill",
     "filled_qty", "position", "yield_pct", "row_yield_threshold", "trigger_pct",
     "limit_pct", "aux_price", "lmt_price", "protective_order_id",
-    "protective_status", "event",
+    "protective_status", "event", "why_held",
 ]
 
 
@@ -506,12 +506,19 @@ class XWingClient(EWrapper, EClient):
                     permId, parentId, lastFillPrice, clientId, whyHeld,
                     mktCapPrice=0.0):
         self.ctl.on_order_status(orderId, status, float(filled),
-                                 float(avgFillPrice), float(lastFillPrice))
+                                 float(avgFillPrice), float(lastFillPrice),
+                                 why_held=whyHeld or "")
 
     def openOrder(self, orderId, contract, order, orderState):
-        self.ctl.log.debug("openOrder %d %s %s qty=%s status=%s", orderId,
-                           order.action, order.orderType, order.totalQuantity,
-                           orderState.status)
+        # INFO, not DEBUG: on a silent "Inactive" entry (see rejected-orders-findings
+        # PART B) warningText/completedStatus is the only reason IBKR ever sends, and
+        # at DEBUG we were discarding it.
+        self.ctl.log.info("openOrder %d %s %s qty=%s lmt=%s status=%s completed=%s warn=%r",
+                          orderId, order.action, order.orderType,
+                          order.totalQuantity, getattr(order, "lmtPrice", ""),
+                          orderState.status,
+                          getattr(orderState, "completedStatus", ""),
+                          getattr(orderState, "warningText", "") or "")
 
     def execDetails(self, reqId, contract, execution):
         self.ctl.log.info("exec %s %s %s @ %.4f (orderId=%d)", execution.side,
@@ -583,6 +590,7 @@ class XWingController:
         self.active_buy_id = None
         self.entry_ts = None            # time.time() when the entry order was placed
         self.entry_failed = None        # terminal event str once the entry is deemed dead
+        self.entry_why_held = ""        # IBKR whyHeld/warningText on a dead entry, if any
         self._entry_abort_pending = False  # timeout fired: cancel sent, awaiting resolution
         self._entry_cancel_ts = None    # time.time() when the timeout cancel was sent
         self.protective_id = None
@@ -897,7 +905,7 @@ class XWingController:
                           otype, qty, aux, lmt, f"({reason})" if reason else "")
 
     # ---------------------- callbacks ----------------------
-    def on_order_status(self, orderId, status, filled, avg, last_fill):
+    def on_order_status(self, orderId, status, filled, avg, last_fill, why_held=""):
         with self.lock:
             o = self.orders.get(orderId)
             if o is None:
@@ -925,16 +933,18 @@ class XWingController:
                         # loop stamps a terminal row and tears the duo down, freeing the
                         # pooled clerk client instead of idling in ENTRY_PENDING.
                         self.entry_failed = "entry_inactive"
+                        self.entry_why_held = why_held
                         if self.done_reason is None:
                             self.done_reason = "entry_inactive"
-                        self.log.warning("Entry order %d %s with no fill -> aborting run",
-                                         orderId, status)
+                        self.log.warning("Entry order %d %s with no fill (whyHeld=%r) "
+                                         "-> aborting run", orderId, status, why_held)
                         self.wake.set()
                 if newly > 0:
                     self.exiting = False
                     self.wake.set()  # arm/replace protective ASAP
-                self.log.info("BUY status id=%d %s filled=%.0f avg=%.4f", orderId,
-                              status, filled, avg)
+                self.log.info("BUY status id=%d %s filled=%.0f avg=%.4f%s", orderId,
+                              status, filled, avg,
+                              f" whyHeld={why_held!r}" if why_held else "")
 
             elif o["action"] == "SELL":
                 if newly > 0:
@@ -1080,6 +1090,7 @@ def control_loop(ctl: XWingController, start_ts: float):
                 limit_pct=_f(lim, 2), aux_price=_f(aux), lmt_price=_f(lmt),
                 protective_order_id=ctl.protective_id,
                 protective_status=prot.get("status", ""), event=event,
+                why_held=ctl.entry_why_held,
             )
 
         ctl.pa.write(row)

@@ -125,7 +125,7 @@ def _load_module(mod_name: str, filename: str):
 
 
 xwing = _load_module("xwing2", "x-wing-2.1.py")
-trademole = _load_module("trademole2", "trade-mole-2.1.py")
+trademole = _load_module("trademole2", "trade-mole-2.2.py")
 
 
 # --------------------------------------------------------------------------- #
@@ -359,11 +359,17 @@ class SharedIBClient(EWrapper, EClient):
         s = self.session
         if s is not None:
             s.xwing.on_order_status(orderId, status, float(filled),
-                                    float(avgFillPrice), float(lastFillPrice))
+                                    float(avgFillPrice), float(lastFillPrice),
+                                    why_held=whyHeld or "")
 
     def openOrder(self, orderId, contract, order, orderState):
-        logger.debug("client %d openOrder %d %s %s", self.client_id, orderId,
-                     order.action, orderState.status)
+        # INFO, not DEBUG: on a silent "Inactive" entry (rejected-orders-findings
+        # PART B) warningText/completedStatus is the only reason IBKR ever sends.
+        logger.info("client %d openOrder %d %s %s status=%s completed=%s warn=%r",
+                    self.client_id, orderId, order.action, order.orderType,
+                    orderState.status,
+                    getattr(orderState, "completedStatus", ""),
+                    getattr(orderState, "warningText", "") or "")
 
     def execDetails(self, reqId, contract, execution):
         logger.debug("client %d exec %s %s @ %.4f", self.client_id,
@@ -509,6 +515,23 @@ class DuoSession:
             return True
 
         return self._begin_collection()
+
+    def conditions_instant(self) -> datetime:
+        """The ET instant whose window governs this duo's trigger regime.
+
+        For a duo still deferred by a closed-market arm, that is its scheduled
+        collection start (04:00 ET) — NOT now, which may be hours earlier and in
+        a different regime. _begin_collection already anchors the watch lifetime
+        on collection start for exactly this reason, and on_buy_signal resolves
+        finbert_gate at the surge instant; a deferred duo's surge can only ever
+        happen in its collection window, so that is the window that must decide
+        whether sentiment has any authority over it.
+
+        Once collection has begun (_watch_timer armed), `now` is correct.
+        """
+        if self._defer_target is not None and self._watch_timer is None:
+            return self._defer_target
+        return datetime.now(tz=trademole.ET)
 
     def _to_record(self) -> dict:
         """Serialize the fields needed to reconstruct this deferred duo on replay."""
@@ -1212,12 +1235,16 @@ class Clerk:
                     session.set_sentiment_ok()
                     reply = {"status": "sentiment_ack", "symbol": ticker}
                 elif session and sentiment == "BAD":
-                    res = self.conditions.at(datetime.now(tz=trademole.ET))
+                    res = self.conditions.at(session.conditions_instant())
                     if not res.finbert_gate:
                         # Gate-off window: the surge is the only trigger
-                        # authority, so a pre-surge BAD is discarded too.
+                        # authority, so a pre-surge BAD is discarded too. For a
+                        # still-deferred duo the window is the one it will
+                        # COLLECT in (04:00 ET), not the one this BAD arrived in.
                         logger.info("[%s] Sentiment BAD ignored: finbert_gate off "
-                                    "in current window (%s)", ticker, res.window)
+                                    "in effective window (%s)%s", ticker, res.window,
+                                    "" if session._defer_target is None
+                                    else f" [deferred until {session._defer_target.isoformat()}]")
                         reply = {"status": "sentiment_ignored_gate_off",
                                  "symbol": ticker}
                     else:

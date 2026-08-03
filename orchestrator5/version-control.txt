@@ -18,6 +18,11 @@ Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
   - Run exactly ONE orchestrator at a time — never two of 5.0/5.1/5.2 (double-arm).
 
 Current version: Orchestrator5.2.py.  5.1 and 5.0 are frozen predecessors.
+NOTE: 5.2 has been extended IN PLACE five times since 2026-07-20 (keyword-leg
+replacement 07-28, FLANG third leg 07-29, Trigger column 07-29, OR->AND gate retune
+08-01, earnings branch 08-02, two solo branches 08-03).  There is no 5.3 — the dated
+sections below are the only record of which gate/schema a given day's TSV was written
+with, and from 08-02 the gate changes no longer change the schema at all.
 
 
 --------------------------------------------------------------------------------
@@ -61,7 +66,7 @@ TSV: 31 -> 24 columns.
 
 
 --------------------------------------------------------------------------------
-5.1 -> 5.2  (2026-07-20; Orchestrator5.2.py)  [CURRENT]
+5.1 -> 5.2  (2026-07-20; Orchestrator5.2.py)
 --------------------------------------------------------------------------------
 Scoring:
   - ADDED a 2nd headline model, FinMarBa (baptle/FinBERT_market_based, ONNX INT8;
@@ -88,3 +93,454 @@ Note (parallelism): threads (not multiprocessing) were chosen deliberately — b
   8-thread box each ~8 ms inference already spreads across all cores, so two at
   once mostly time-share (pair ~20 ms, ~no wall-clock overlap); the win is that
   both start at reception and overlap the longer clerk-arm round-trip + kw scoring.
+
+
+--------------------------------------------------------------------------------
+5.2 in-place change #1  (2026-07-28)  — KEYWORD LEG REPLACED
+--------------------------------------------------------------------------------
+Scoring:
+  - DROPPED the combo path entirely: get_default_scorer() and
+    `model_proba_PLUS_kw_mult_nb` are gone.  They came from
+    SELECTED-MODEL_classify_fromPRhigh_ge15_excStr2, trained on the BIASED label.
+  - ADDED two corrected-label ge15 tfidf pipelines, joblib-loaded directly from
+    tools/keyword/model_trained_on_04-PRstats-2026-05-04to06-18_TRAIN/
+    (classify_fromPRhigh_ge15 = body, ..._ge15_headline = headline).
+    keyword_scorer-2.py is still imported, but only for _strip_html and to put
+    keyword_finder on sys.path for strip_wire_boilerplate.
+  - _kw15_prep() reproduces the exact training text prep: strip HTML, strip wire
+    boilerplate, then cap (400 words for body, uncapped for headline).
+Trade gate: keyword leg is now an AND —
+    kw15_body_proba >= KW15_BODY_MIN (0.60)  AND  kw15_head_proba >= KW15_HEAD_MIN (0.65)
+  - Measured on the 777-row VAL holdout at fromPR_High >= 30%: 75 fires (9.7%),
+    43 TP / 32 FP = 57.3%, 3.18x lift, 30.7% recall.  Requiring BOTH is what earns
+    that — alone they give 40.9% (body) and 41.8% (headline), and OR'ing them
+    DILUTES to 35.7% on 213 fires, worse than either.  Jaccard 0.352 /
+    Spearman 0.592 between the two channels, i.e. genuinely different signals.
+  - CAVEAT: 0.60/0.65 were read off that same VAL grid, so 57.3% is a
+    post-selection estimate and optimistic.
+TSV: 30 -> 31 columns (model_proba_PLUS_kw_mult_nb -> kw15_body_proba + kw15_head_proba).
+⚠ `Keyword` in ClerkSentiment means a DIFFERENT rule before and after this date.
+
+
+--------------------------------------------------------------------------------
+5.2 in-place change #2  (2026-07-29)  — FLANG-BERT THIRD LEG
+--------------------------------------------------------------------------------
+Scoring:
+  - ADDED a 3rd headline model, FLANG-BERT (avinasht/FLANG-BERT_flang-bert, ONNX
+    INT8; tools/Encoder_Models/FLANG-BERT_headliner.py), in its OWN thread pool
+    (_flang_executor, FLANG_HEADLINE_WORKERS=4) submitted alongside the other two
+    in _on_row_built so all three run concurrently.
+  - NO new model script was written: the orchestrator loads the EXISTING frozen
+    headliner, which is the same module that produced the offline
+    FLANG-BERT_sentiment_score column via HeadScore11encoders.py — so the live
+    score equals an offline rescore of the same Headline by construction.
+  - Import gotchas: the module's public fn is analyze_headline (same name as
+    FinBERT's) and its loader is load_model (same as both others), so it is loaded
+    under the distinct module name "FLANG_BERT_headliner" and bound to the distinct
+    aliases score_flang_headline / load_flang_model.  Its timing key is
+    inference_ms, NOT FinMarBa's elapsed_ms.
+  - All three headline models are pre-warmed + smoke-inferred at startup.
+Trade gate: now an OR of THREE legs, ANY one fires:
+  - Headline leg: FinBERT positive >= 0.6  AND  FinMarBa indecisive <= 0.13
+  - Keyword  leg: kw15_body_proba >= 0.60  AND  kw15_head_proba >= 0.65
+  - FLANG    leg: FLANG sentiment_score >= 0.97  (FLANG_SCORE_MIN)
+    STANDALONE — it fires the trade on its own, it is not a confirmation.
+  - None-safe per condition (a missing score kills only its own leg).
+  - ClerkSentiment labels are now BUILT by joining the fired leg names with "_" in
+    the fixed order Keyword, FinBERT_FMB, FLANG — instead of the hard-coded 4-case
+    table (which would have become 8 cases).  This reproduces all four pre-FLANG
+    labels byte-identically and adds FLANG, Keyword_FLANG, FinBERT_FMB_FLANG,
+    Keyword_FinBERT_FMB_FLANG.
+Calibration of FLANG_SCORE_MIN=0.97 (2026-07-28, on price_stats_loader/outputs/
+  04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_Classed_BodyEnc_clean_
+  FromPRhigh.tsv, 3434 labelled rows):
+  - standalone: 304 fires (8.9%), 46.1% precision / 1.81x lift vs the >=15% target;
+    24.3% / 1.99x vs >=30%.  Passes both time blocks (early 1.85x / recent 1.60x).
+  - marginal: 191 of those fires (5.6% of all rows) are NOT already caught by the
+    FinBERT+FinMarBa leg and hold the same ~46% precision — i.e. the leg adds new
+    signal rather than re-firing on the same PRs.  This is what justified OR-ing it
+    in rather than AND-ing it as a confirmation.
+  - NOTE the body twin (FLANG-BERT_Body_sentiment_score) was measured and REJECTED:
+    its precision is flat from 0.90 to 0.98 (33-35%, ~1.3x lift), i.e. saturated and
+    useless as a gate.  Headline only.
+TSV: 31 -> 38 columns.
+  - Added a FLANG block after FMB_label: FLANG_time, FLANG_positive, FLANG_neutral,
+    FLANG_negative, FLANG_sentiment_score, FLANG_label, FLANG_ms.  Only
+    FLANG_sentiment_score feeds the gate; the rest are for offline re-analysis.
+    They map 1:1 onto the offline FLANG-BERT_* cols.  FLANG_time = completion
+    timestamp (FMB_time convention); FLANG_ms = the model's own inference_ms.
+Measured: FLANG warm inference median 5.3 ms / p95 12.2 ms (verify_headliners PASS,
+  max_drift 0.0000 vs the 2026-07-18 goldens, warm 6.1 ms).  The three ORT sessions
+  all use the default intra-op pool, so on this 8-thread box they mostly time-share
+  rather than truly overlap; still trivial against the clerk-arm round-trip.
+⚠ ClerkSentiment gains the FLANG labels from this date, and the TSV grows 7 columns.
+  Combined with change #1, a row's ClerkSentiment is only comparable across days if
+  BOTH dates are taken into account.
+
+
+--------------------------------------------------------------------------------
+5.2 in-place change #3  (2026-07-29)  — `Trigger` COLUMN
+   [superseded by change #4 (2026-08-01), which kept the cell but made the gate an AND]
+--------------------------------------------------------------------------------
+Observability only — the GATE IS UNCHANGED (same three legs, same five thresholds,
+same fire/no-fire decision on every row).  ClerkSentiment is byte-identical to
+change #2: verified over all 243 combinations of pass/fail/None for the five gate
+inputs (all 8 labels exercised) that the new code returns the same (is_ok, label)
+as the pre-change body.
+TSV: 38 -> 39 columns.
+  - Added `Trigger` as the LAST column, so every pre-existing column keeps its
+    index and positional readers of the new files still work.
+  - Grammar (one tab-free, newline-free cell):
+      <YES|NO> | FinBERT:<v> FMB:<v> kw15_body:<v> kw15_head:<v> FLANG:<v>
+    All five tokens always present, always in that order.  <v> is one of:
+      PASS(<score><op><thr>)  condition held
+      FAIL(<score><op><thr>)  condition failed
+      MISSING                 score was None (model error / future timeout)
+    <op> is always the relation that is TRUE of the row: >= / <= on a pass, its
+    negation < / > on a fail.  FMB is the ONLY <= condition (indecisive is a
+    ceiling, the other four are floors).  Scores print at 4 dp (display only — the
+    PASS/FAIL token is authoritative); thresholds at 2 dp when that round-trips
+    exactly, else %g, so a retuned 0.625 never prints as a misleading 0.62.
+  - Example:
+      YES | FinBERT:PASS(0.8231>=0.60) FMB:PASS(0.0512<=0.13)
+            kw15_body:FAIL(0.3104<0.60) kw15_head:FAIL(0.4412<0.65)
+            FLANG:FAIL(0.6210<0.97)                      [one cell, wrapped here]
+Why, given ClerkSentiment already names the fired legs:
+  - A leg is an AND of two models, so `BAD` never said WHICH half failed.  The
+    motivating case is FinBERT 0.74 PASS + FMB 0.31 FAIL -> no fire, which was
+    previously indistinguishable in the TSV from a row where everything scored ~0.
+  - Near-misses become greppable, which is what retuning a threshold needs.
+  - A dead scorer (None) is now MISSING rather than silently reading as a low
+    score.  That distinction previously existed only in logs/.
+  - Trigger is written on EVERY row — the gate runs before the arm branch — so it
+    survives the skipped:excluded_string / skipped:arm_rejected / skipped:not_armed
+    rows where ClerkSentiment discards the verdict entirely.
+Implementation:
+  - _evaluate_trigger now returns (is_ok, label, detail) — one call site.
+  - The five per-condition verdicts are named locals (c_fin/c_fmb/c_body/c_head/
+    c_fla) feeding BOTH the legs and the cell; _cond_token takes the verdict as a
+    PARAMETER rather than recomputing the comparison, so the cell cannot disagree
+    with the gate that fired.
+  - The [Gate] BAD log line (which used to hand-list the same 5 inputs vs the same
+    5 thresholds in a 9-arg format string) now logs `detail` verbatim — one source
+    of truth, and log == TSV cell by construction.
+  - Console block prints both `Trigger` (the cell) and `Trigger legs` (the label).
+⚠ Rotation: the live process at the time of this edit was still the pre-FLANG
+  31-col build, so the first restart rotates today's 31-col file to
+  news_output_<date>_rotated.tsv and starts a fresh 39-col file.  os.rename
+  CLOBBERS an existing _rotated.tsv for the same day — back the file up before a
+  second same-day schema switch, and note daily-board.py tails the live path and
+  will silently follow the new empty file.
+
+
+================================================================================
+5.2 in-place change #4  (2026-08-01)  — GATE: OR -> AND + ALL FIVE THRESHOLDS
+                                        RETUNED
+   [still a complete branch, but see 08-02 and 08-03 below: it is now one of FOUR,
+    and the 08-03 solo legs subsume it above kw15_body 0.70 / FLANG 0.975]
+--------------------------------------------------------------------------------
+This is a TRADE-BEHAVIOUR change, not observability.  The gate stops being an OR
+of three legs (ANY one fires) and becomes an AND of all five conditions (EVERY
+one must hold), and every threshold moves at the same time.
+
+                        old            new
+  SENTIMENT_POSITIVE_MIN 0.6      ->    0.8     FinBERT positive        (floor)
+  FMB_INDECISIVE_MAX     0.13     ->    0.14    FinMarBa indecisive     (ceiling)
+  KW15_BODY_MIN          0.60     ->    0.50    ge15 body model_proba   (floor)
+  KW15_HEAD_MIN          0.65     ->    0.50    ge15 head model_proba   (floor)
+  FLANG_SCORE_MIN        0.97     ->    0.96    FLANG sentiment_score   (floor)
+
+The three LEGS survive as names only.  Each leg is itself an AND, so "all three
+legs" and "all five conditions" are the SAME boolean function — the legs are now
+a grouping, not alternatives, and the FLANG leg is NO LONGER STANDALONE.
+
+Calibration (2026-08-01), on price_stats_loader/outputs/
+  06_PRstats_2026-06-22-2026-07-30_11EncBodyHeadScored_kwScored_FinBERT.tsv
+(1055 labelled rows; the full-coverage FinBERT_positive / FinMarBa_indecisive
+columns — note FMB_indecisive is populated on only 143 rows in that file and
+using it instead understates the AND badly):
+                                       fires         P@>=30%  lift    recall
+  OLD  OR  0.6/0.13/0.60/0.65/0.97      267 (25.3%)   32.6%   1.90x   48.1%
+  NEW  AND 0.8/0.14/0.50/0.50/0.96       26 ( 2.5%)   46.2%   2.69x    6.6%
+At the >=15% target the AND gate runs 80.8% precision / 2.51x lift (base 32.2%).
+The retuned cuts are matched TO the AND: loosening kw15 to 0.50/0.50 and FLANG to
+0.96 more than DOUBLES the fire count vs AND-with-the-old-thresholds (11 -> 26) at
+essentially unchanged precision, while FinBERT tightens 0.6 -> 0.8.  Deliberate
+trade: ~1 trade/day at a much higher hit rate, accepting the recall collapse.
+⚠ n=26 — 46.2% carries roughly a +/-19pp CI and is post-selection (the thresholds
+  were chosen against this same file).  An operating point, not a measurement.
+
+TSV: 39 columns, UNCHANGED.  No header change means NO rotation and no
+  _rotated.tsv — and also that the header does NOT tell you which gate wrote a
+  row.  Use the date, or read the per-row Trigger cell: it embeds the thresholds
+  in force, so rows written either side of the restart are self-describing even
+  within one daily file.
+ClerkSentiment: DEGENERATE from this date.  The label is still BUILT by joining
+  fired leg names in the fixed order Keyword, FinBERT_FMB, FLANG, but is now gated
+  on is_ok rather than on a non-empty `fired` list.  Since is_ok implies all three
+  legs, only two values can occur: "Keyword_FinBERT_FMB_FLANG" and "BAD" (plus the
+  unchanged skipped:*).  The other six OR-era labels (FLANG, Keyword_FLANG,
+  FinBERT_FMB, Keyword_FinBERT_FMB, FinBERT_FMB_FLANG, Keyword) are UNREACHABLE.
+  Old parsers keep working — they just see one label.  Trigger is now the only
+  informative gate cell.
+Implementation:
+  - is_ok = c_fin and c_fmb and c_body and c_head and c_fla  (was bool(fired)).
+  - label = '_'.join(fired) if is_ok else 'BAD'  (was `if fired else 'BAD'`).
+    THIS GUARD IS LOAD-BEARING: under AND a row can have one leg true and still not
+    fire, and the old expression would have labelled such a row "FLANG" while the
+    gate said BAD — the TSV would have contradicted the trade.
+  - _evaluate_trigger now returns a 4th value, missing_blocked: True when >=1 score
+    is None AND every condition that COULD be evaluated passed.  Rationale: a None
+    still kills only its own condition, but under AND that single false blocks
+    EVERY trade, where under OR another leg could still fire.  A silently dead
+    model is therefore indistinguishable from a quiet news day by fire count, so
+    _collect_and_log escalates that case to logger.warning("... BLOCKED BY MISSING
+    SCORE ONLY ...").  Grep it when the tape looks suspiciously silent.
+  - One call site, unpacked to 4 values.  Trigger cell format is UNCHANGED.
+Verified:
+  - Exhaustive 3^5 = 243 pass/fail/None check against the live _evaluate_trigger
+    (same method as change #3): is_ok == AND of the five conditions on every case;
+    label == 'BAD' on every non-firing case; missing_blocked true on exactly the
+    31 (= 2^5 - 1) cases with >=1 None and all evaluable conditions passing;
+    Trigger always 5 tokens, MISSING iff the score was None.  Exactly 1 of 243
+    cases fires.  Labels observed: {BAD, Keyword_FinBERT_FMB_FLANG} only.
+  - Corpus replay through the LIVE function reproduces the table above exactly
+    (26 fires, 80.8% @>=15%, 46.2% @>=30%).
+  - Replay over the 137 live 39-col rows in tables/: the AND gate fires 4 where the
+    OR build fired 27, and never fires on a row the OR gate rejected (subset).
+
+
+================================================================================
+2026-08-02 — EARNINGS TRADE LEG: PrClassifier + earning_scorer, OR-ed with the AND
+================================================================================
+WHAT: a SECOND trade branch beside the 2026-08-01 five-way AND.  The AND itself is
+  untouched and still a complete branch; a row can now ALSO fire on
+
+      FineClass == 'Earnings_Results' AND EarningScore >= 4 AND kw15_body >= 0.50
+
+      is_ok = core_and OR earnings_leg
+
+  kw15_body is the SAME c_body local the core branch uses — one condition, two
+  branches.  FinBERT / FMB / FLANG / kw15_head are NOT consulted by this leg.
+
+WHY: the core AND is structurally BLIND to earnings PRs.
+  tools/Earning_Scorer/Earnings_text_structures_report.md §4 measured the gate's own
+  FinBERT headline score at test AUC 0.297 on earnings PRs — ANTI-predictive.  Cause:
+  winners and duds share near-identical headlines ("X Reports Q1 2026 Financial
+  Results"); the separating numbers are in the BODY.  So the five-way AND cannot
+  select within this class at all, no matter how it is retuned.
+
+CALIBRATION (2026-08-02, on
+  tools/Earning_Scorer/PRstats_2026-05-04-2026-07-30_EarningResults_earnScored.tsv —
+  518 labelled Earnings_Results rows, base rate 7.1% on fromPR_High >= 30%, with
+  kw15_body recomputed by the frozen ge15 body pipeline):
+
+      gate                                  fires   prec@>=30%   lift
+      current five-way AND on these rows        3       0.000       —
+      EarningScore>=4 AND kw15_body>=0.50      36       0.472      6.6x
+      test block only (>=2026-06-20, n=79,      7       0.429      3.1x
+        base 13.9%)
+
+  OVERLAP WITH THE AND BRANCH IS EXACTLY ZERO — purely additive, ~0.71 extra
+  trades/day at the same precision bar the AND branch holds (46.2%).
+  Cut choice: precision is FLAT below 4 (>=1 .321, >=2 .314, >=3 .339) and steps up
+  at 4 (.472).  4 is the knee and matches the report's own defensible operating point.
+  Neither leg alone is enough: EarningScore>=4 alone .253, kw15_body>=0.50 alone .234
+  — the AND is what buys the lift.
+  !! n=36 => wide error bars, and EarningScore is a RANKING CUT, not a calibrated
+  probability: the >=30% base rate itself moved 3.7% (May) -> ~15-20% (Jun/Jul).
+
+!! EarningScore is INTEGER POINTS (observed -7..+9, median 0), NOT a 0-1 score.
+  A threshold like 0.4 would silently mean ">= 1" — 36.5% of earnings PRs at 32%
+  precision.  The points come from tools/Earning_Scorer/earn_score_params.json
+  (calibrated 2026-08-01, FROZEN): changing that file changes what ">= 4" means.
+
+Implementation:
+  - Two new path-loaded modules (neither has a hyphen, but neither dir is a package
+    and `earning_scorer` is a generic name):
+      tools/categorizer/PrClassifier.py     -> classify_pr, PRCLASS_BODY_LEAD_CHARS
+      tools/Earning_Scorer/earning_scorer.py-> earn_extract_metrics,
+                                               earn_score_metrics, earn_load_params
+    Both import-safe + thread-safe; no sys.modules pre-registration needed.
+  - New constants: EARN_CLASS, EARN_SCORE_MIN=4, EARN_SCORE_WAIT_SEC=10,
+    EARN_SCORE_WORKERS=2.  New pool _earn_executor (pure-Python regex => holds the
+    GIL; 2 workers only prevents head-of-line blocking, it is not a throughput knob).
+  - _classify_and_score_earnings(news_dict, primary_symbol): classifies EVERY PR
+    (headline, then body LEAD as fallback — reproducing PrClassifier.classify_row by
+    hand because news_dict's body key is body_raw, not Body/body), then SHORT-CIRCUITS
+    on non-Earnings_Results (~85% of rows never touch the extractor).  Scores the
+    Body-cell string, so an offline rescore reproduces the live number.  Never raises.
+  - Float-cap: earning_scorer's `mktcap` arg is really Float(M) x LastDailyClose x 1e6
+    (fallback MktCap($M) x 1e6) and moves the score by up to 2 points.  Computed on
+    the POOL thread (never in _on_row_built — _universe_cell takes a lock and scans a
+    DataFrame) for the article's FIRST in-universe ticker.  Scored once per ARTICLE
+    like every other model, so the 2nd ticker of a 2-ticker PR inherits that
+    denominator.  Deliberate (MAX_TICKERS_PER_ARTICLE is 2; such PRs are rare).
+  - _earn_params loaded ONCE in main() and always passed as params=: the default path
+    re-reads earn_score_params.json from disk on EVERY score_metrics call.
+  - _evaluate_trigger takes a 5th arg earn_val; missing_blocked is now scoped to the
+    core branch PLUS an earnings twin (known-Earnings_Results row, kw15_body OK,
+    EarningScore None) and gated on `not is_ok`.  The OR made this alarm MORE
+    important: a dead core model no longer halts all trading, so the tape looks even
+    less obviously broken.
+  - Trigger cell gains two APPENDED tokens; the five core tokens keep their position
+    and order, so 5-token parsers still work:
+        ... FLANG:FAIL(0.6210<0.96) earn:PASS(5>=4) class:Earnings_Results
+    `earn` prints INTEGER points via _cond_token's new val_fmt/thr_fmt params, and has
+    a FOURTH verdict `earn:NA` — class known and simply not Earnings_Results, i.e.
+    deliberately not scored.  Without NA, ~85% of rows would read earn:MISSING and
+    drown out the one row where the scorer actually died.
+  - ClerkSentiment is INFORMATIVE AGAIN (it was degenerate for exactly one day under
+    the pure AND).  Reachable: Keyword_FinBERT_FMB_FLANG, Earnings,
+    Keyword_FinBERT_FMB_FLANG_Earnings, BAD, plus the unchanged skipped:*.
+  - TSV 39 -> 42 cols: FineClass (every row), EarningScore + EarnBreakdown (only on
+    Earnings_Results rows — BLANK MEANS "not an earnings PR", NOT "scored 0").
+    Appended last, so every pre-existing column keeps its index.  First write after
+    restart rotates the day's file to *_rotated.tsv.
+  - Startup hard-fails (RuntimeError) unless the classifier returns Earnings_Results
+    for a canonical earnings headline and the scorer returns a positive int on a PR
+    with explicit revenue growth.
+
+Verified:
+  - Gate truth table (9 cases) through the LIVE _evaluate_trigger: core-only fires
+    with label Keyword_FinBERT_FMB_FLANG; earnings-only fires with label Earnings;
+    score 3 / kw_body 0.40 / Earnings_Date / score None all correctly do NOT fire;
+    score exactly 4 fires; both branches together label
+    Keyword_FinBERT_FMB_FLANG_Earnings.  missing_blocked: 5/5 cases correct.
+  - REGRESSION: 4000 random non-earnings rows — 0 verdicts differ from a reference
+    pure five-way AND.  The core branch is provably unchanged.
+  - Replay of tables/news_output_2026-07-31.tsv (45 rows) through the live worker +
+    gate: core token SCORES byte-identical to the shipped Trigger cell; verdicts match
+    a current-constants reference; EarningScore reproducible at equal float-cap.
+    1 new fire: GIGM score=7 [revG:+3(182%) profG:+2(829%) flip:+2].
+    NOTE two confounds that look like drift and are not: (1) that file predates the
+    2026-08-01 retune, so its Trigger embeds the OLD thresholds (0.60/0.13/0.60/0.65/
+    0.97); (2) the worker's float-cap comes from TODAY's universe TSV while the row's
+    Float/LastDailyClose are as of that day — 10 of 45 rows differ for that reason
+    alone.  => An offline rescore MUST use the row's own Float/LastDailyClose.
+  - Multi-day replay over 200 live rows (07-29..07-31): core AND fires 4 (2.0%),
+    earnings leg adds 1 (0.5%), overlap 0 => combined 2.5%.
+  - TSV write path: header is 42 cols and matches _TSV_COLUMNS; None -> blank cell;
+    EarnBreakdown carries no tabs/newlines.
+  - Startup: all five ready lines, incl. "PR classifier + earnings scorer ready
+    (smoke: class=Earnings_Results score=4 [revG:+3(60%) rec:+1] ...)".
+
+
+================================================================================
+2026-08-03 — TWO SOLO LEGS: kw15_body >= 0.70 and FLANG >= 0.975, each firing
+             ALONE                                                    [CURRENT]
+================================================================================
+WHAT: two MORE branches beside the 2026-08-01 five-way AND and the 2026-08-02
+  earnings leg.  Each is a SINGLE condition and fires the trade unaided:
+
+      KwBodySolo :  kw15_body_proba       >= KW15_BODY_SOLO_MIN  (0.70)
+      FLANGSolo  :  FLANG sentiment_score >= FLANG_SOLO_MIN      (0.975)
+
+      is_ok = core_and OR earnings_leg OR kwbody_solo_leg OR flang_solo_leg
+
+  Nothing was removed or retuned.  The five-way AND and the earnings leg are
+  byte-for-byte the same booleans; both solo legs are added BESIDE them, so this
+  change is purely ADDITIVE — every row that fired under the 08-02 build still
+  fires under this one (proved below).
+
+WHY: the AND gate was deliberately narrow (~2.5% of rows, ~1 trade/day, 6.6%
+  recall).  These two legs buy back part of that recall by letting a single
+  strongly-scoring channel trade on its own.
+
+!! THESE TWO CUTS WERE NOT CALIBRATED.  Alone among every threshold in this file,
+  0.70 and 0.975 were specified by the operator on 2026-08-03 and are NOT backed
+  by a fires/precision/lift measurement on a labelled corpus.  There is no
+  precision number for either leg at its chosen cut.  The nearest EXISTING
+  evidence, both from earlier calibrations and neither at these cuts:
+    - FLANG standalone at 0.97 (its 2026-07-28 calibration, 3434 rows): 304 fires
+      (8.9%), 46.1% precision / 1.81x lift @>=15%, 24.3% / 1.99x @>=30%.
+    - ge15 body channel alone at 0.60 (2026-07-28 VAL holdout): ~40.9% precision,
+      i.e. materially worse than the 57.3% the body+head PAIR bought.
+  Both suggest the solo legs run at a LOWER precision than the 46.2% @>=30% the
+  AND branch was tuned to.  That is the accepted trade: more trades, lower hit
+  rate.  Retune the two constants at the top of Orchestrator5.2.py.
+
+!! STRUCTURAL CONSEQUENCE — the solo legs SUBSUME the branches they were added
+  beside, because they re-read two of the same five scores at higher cuts:
+    - Any row with kw15_body >= 0.70 fires no matter what the other four models
+      said.  So the five-way AND and the earnings leg are only DECISIVE for rows
+      with kw15_body in [0.50, 0.70).
+    - Any row with FLANG >= 0.975 fires outright; the core's FLANG >= 0.96
+      condition only discriminates below 0.975.
+  The 2026-08-01 calibration therefore describes a BRANCH from this date, not the
+  gate.  Neither the AND's 46.2% nor the earnings leg's 47.2% is the gate's
+  precision any more, and no measurement of the combined gate exists.
+
+MEASURED EFFECT ON LIVE TAPE (replay of tables/news_output_2026-07-29..08-03,
+  197 rows with kw15/FLANG columns, current constants applied to both gates so
+  the delta isolates the solo legs — note 07-29..08-02 predate the 08-01 retune,
+  so these are NOT the fires those files actually shipped):
+
+      gate                          fires    rate
+      core AND + earnings              7     3.55%
+      + the two solo legs             29    14.72%     4.1x the trades
+      added by KwBodySolo only        11
+      added by FLANGSolo only         10
+      added by both                    1
+
+  This is a TRADE-RATE observation, not a precision claim — the replay rows carry
+  no fromPR_High label.  ~4x more trades than the 08-02 build; the plan's a-priori
+  guess had been the 5-10% band, the tape says ~15%.
+
+Implementation (all in Orchestrator5.2.py; no new imports, pools, models or
+  scores — both legs read values _evaluate_trigger already extracted):
+  - New constants KW15_BODY_SOLO_MIN = 0.70, FLANG_SOLO_MIN = 0.975 in their own
+    commented block after the earnings constants.  Retuning the gate is now an
+    EIGHT-constant edit, not six.
+  - Two per-condition locals c_body_solo / c_fla_solo alongside the existing seven,
+    same None-safe shape; two leg aliases; two entries APPENDED to `fired`
+    ('KwBodySolo', 'FLANGSolo') so every pre-existing label keeps its prefix and
+    order; is_ok gains two OR terms.
+  - missing_blocked gains a THIRD term, solo_missing = (kw_body is None) or
+    (flang is None).  A solo branch is ONE condition, so "every evaluable condition
+    passed" degenerates to "the score is missing".  This is deliberately much
+    LOUDER than the core/earnings terms — a dead kw or FLANG scorer now WARNs on
+    every row rather than only when four other models happened to agree — because
+    each of those scores now backs a branch that trades unaided, so losing one
+    silently removes a whole branch while the tape still looks alive.
+  - Trigger cell 7 -> 9 tokens, both APPENDED after class: (5-/7-token parsers keep
+    working):
+        ... earn:NA class:Product_Update kw15_body_solo:PASS(0.7500>=0.70) \
+            FLANG_solo:FAIL(0.1000<0.975)
+    They deliberately REPRINT the kw15_body and FLANG scores against the solo cuts,
+    so a row records BOTH thresholds it was judged against and stays self-describing
+    across a retune of either.  _fmt_thr already renders 0.975 as 0.975 (it falls
+    through to %g because f"{0.975:.2f}" == "0.97" does not round-trip) — verified.
+  - ClerkSentiment stays fully informative; the vocabulary widens sharply (42 labels
+    reachable in the truth table, e.g. KwBodySolo, FLANG_FLANGSolo, Keyword_KwBodySolo,
+    Keyword_FLANG_KwBodySolo_FLANGSolo).  Two implications constrain it: 0.70 > 0.50
+    so KwBodySolo always implies c_body, and 0.975 > 0.96 so FLANGSolo can NEVER
+    appear without FLANG.
+  - The `label = ... if is_ok else 'BAD'` guard REMAINS load-bearing: the solo legs
+    narrowed the one-leg-true-but-not-firing window (kw15_body in [0.50,0.70) with
+    kw15_head, FLANG < 0.96, non-earnings) but did not close it.
+  - Startup: the ge15 ready line now names the solo cut, and a NEW "[Gate] ACTIVE —
+    OR of 4 branches: ..." line echoes every branch with the thresholds in force.
+    The constants are module-level and read at import, so a process started before a
+    retune keeps the OLD gate until restarted, and nothing else in the log says which
+    one is live.  All three lines use _fmt_thr (%s), not %.2f, so 0.975 survives.
+
+TSV: 42 columns, UNCHANGED — no header change, so NO rotation and no _rotated.tsv.
+  Consequence: the header does NOT distinguish the 08-02 build from this one.  The
+  Trigger cell's TOKEN COUNT does: 7 tokens = 08-02, 9 tokens = 08-03.
+
+Verified:
+  - Exhaustive truth table, 3888 cases (3 FinBERT x 3 FMB x 4 kw15_body x 3
+    kw15_head x 4 FLANG x 3 FineClass x 3 EarningScore, the kw15_body and FLANG
+    grids straddling BOTH their cuts) through the LIVE _evaluate_trigger, checked
+    against an independently recomputed expectation: 0 errors on is_ok, label,
+    YES/NO verdict, 9-token count, token names/order, MISSING-iff-None, the solo
+    thresholds rendering as 0.70 / 0.975, and missing_blocked.
+  - ADDITIVE REGRESSION (the decisive check): 0 of 3888 cases flip YES -> NO versus
+    the pre-change gate (core_and OR earnings_leg); 1542 flip NO -> YES.  Re-asserted
+    per-row over the 197-row tape replay — also 0 flips.
+  - FLANGSolo never appears in a label without FLANG (0 counterexamples).
+  - Startup log lines format-checked directly (no second process started).
+  !! NOT verified by a live run: an Orchestrator5.2.py started 2026-08-02 was
+     RUNNING at the time of this edit and holds the OLD gate in memory.  It must be
+     restarted for these branches to take effect, and only ONE instance may run.

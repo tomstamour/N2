@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Best thresholds on FinBERT `positive` + the four FinMarBa headline columns
-for selecting big movers (`fromPR_High(%) >= threshold`, default 30).
+"""Best AND/OR threshold rules over a set of score columns, for selecting big
+movers (`fromPR_High(%) >= threshold`, default 30).
 
-Scope (5 columns, headline scores, both models externally trained so every row
-is an honest test):
+Columns and their fire direction are given with `--columns NAME>=` / `NAME<=`.
+The default is the original scope — FinBERT `positive` plus the four FinMarBa
+headline columns, all externally trained so every row is an honest test:
 
     positive                    fire HIGH  (>=)   FinBERT headline P(positive)
     FinMarBa_positive           fire HIGH  (>=)
     FinMarBa_sentiment_score    fire HIGH  (>=)   +/-1 scale (pos - neg)
     FinMarBa_negative           fire LOW   (<=)
     FinMarBa_indecisive         fire LOW   (<=)
+
+IMPORTANT — the columns are scored on the SAME rows that select the winning
+rule. With a few hundred candidate rules surviving the "Wilson-low > base"
+screen, several will clear it by chance, so a top rule's precision is an UPPER
+BOUND, not an estimate. The block-consistency guard is the only defence here and
+it is weak (it asks for lift >= 1x in both halves, not replication). To turn the
+number into an estimate, re-run the search on shuffled labels and subtract what
+the best rule scores on noise.
 
 What it does:
   1. Single-column frontier  - sweep a per-column quantile cutoff grid; report
@@ -48,7 +57,8 @@ TARGET = "fromPR_High(%)"
 DATE_COL = "ArrivalDate"
 SPLIT_DATE = "2026-06-20"
 
-# (column, operator) - operator is the fire direction.
+# (column, operator) - operator is the fire direction. Overridable with
+# --columns; these remain the default so existing invocations are unchanged.
 COLUMNS = [
     ("positive", ">="),
     ("FinMarBa_positive", ">="),
@@ -80,6 +90,66 @@ ANCHORS = {
 
 MIN_FIRES = 20          # a cutoff must fire on this many rows to be "recommendable"
 MIN_FIRES_COMBO = 12    # combos are sparser; slightly lower floor
+
+# The live O5.2 trade gate, as actually deployed (Orchestrator5.2.py:132-134):
+#   SENTIMENT_POSITIVE_MIN = 0.6, FMB_INDECISIVE_MAX = 0.13, COMBO_TRIGGER_MIN = 0.67
+# Earlier versions of this script hardcoded indecisive <= 0.1 and combo >= 0.6,
+# neither of which was ever the deployed value.
+LIVE_GATE_DEFAULT = "positive>=0.6,FinMarBa_indecisive<=0.13"
+COMBO_THRESHOLD_DEFAULT = 0.67
+
+
+# --------------------------------------------------------------------------- #
+# CLI spec parsing
+# --------------------------------------------------------------------------- #
+def parse_columns(specs):
+    """['positive>=', 'FinMarBa_indecisive<='] -> [('positive','>='), ...]"""
+    out = []
+    for s in specs:
+        for op in (">=", "<="):
+            if s.endswith(op):
+                name = s[:-len(op)].strip()
+                if not name:
+                    sys.exit(f"--columns: empty column name in {s!r}")
+                out.append((name, op))
+                break
+        else:
+            sys.exit(f"--columns: {s!r} must end with '>=' or '<='")
+    return out
+
+
+def parse_anchors(specs):
+    """['positive=0.5,0.6'] -> {'positive': [0.5, 0.6]}"""
+    out = {}
+    for s in specs:
+        if "=" not in s:
+            sys.exit(f"--anchors: {s!r} must look like NAME=v1,v2")
+        name, vals = s.split("=", 1)
+        try:
+            out[name.strip()] = [float(v) for v in vals.split(",") if v.strip()]
+        except ValueError:
+            sys.exit(f"--anchors: non-numeric value in {s!r}")
+    return out
+
+
+def parse_rule(spec):
+    """'positive>=0.6,FinMarBa_indecisive<=0.13' -> [(col, op, cut), ...]"""
+    legs = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        for op in (">=", "<="):
+            if op in part:
+                name, cut = part.split(op, 1)
+                try:
+                    legs.append((name.strip(), op, float(cut)))
+                except ValueError:
+                    sys.exit(f"--live-gate: non-numeric cutoff in {part!r}")
+                break
+        else:
+            sys.exit(f"--live-gate: {part!r} needs '>=' or '<='")
+    return legs
 
 
 # --------------------------------------------------------------------------- #
@@ -233,19 +303,70 @@ def main():
     ap.add_argument("--top", type=int, default=15, help="combos shown per section")
     ap.add_argument("--combo-col", default="model_proba_PLUS_kw_mult_nb",
                     help="live combo/keyword score column for section 7")
-    ap.add_argument("--combo-threshold", type=float, default=0.6,
-                    help="live combo gate threshold (default 0.6)")
+    ap.add_argument("--combo-threshold", type=float,
+                    default=COMBO_THRESHOLD_DEFAULT,
+                    help=f"live combo gate threshold (default "
+                         f"{COMBO_THRESHOLD_DEFAULT}, the deployed "
+                         f"COMBO_TRIGGER_MIN)")
+    ap.add_argument("--columns", nargs="+", default=None, metavar="NAME>=|NAME<=",
+                    help="score columns and their fire direction, e.g. "
+                         "'positive>=' 'FinMarBa_indecisive<='. Default: the "
+                         "five FinBERT/FinMarBa headline columns.")
+    ap.add_argument("--anchors", nargs="+", default=None, metavar="NAME=v1,v2",
+                    help="interpretable cutoffs added to each column's combo "
+                         "candidates alongside the quantile grid.")
+    ap.add_argument("--sweep-pair", default=None, metavar="COL_A,COL_B",
+                    help="pair for the focused 2D sweep (section 4). Default: "
+                         "the first '>=' column x the first '<=' column.")
+    ap.add_argument("--live-gate", default=LIVE_GATE_DEFAULT,
+                    help=f"the deployed AND rule to benchmark against "
+                         f"(default {LIVE_GATE_DEFAULT!r}). Pass '' to skip.")
     args = ap.parse_args()
+
+    columns = parse_columns(args.columns) if args.columns else list(COLUMNS)
+    anchors = parse_anchors(args.anchors) if args.anchors else dict(ANCHORS)
+    live_legs = parse_rule(args.live_gate) if args.live_gate else []
 
     path = pathlib.Path(args.tsv)
     if not path.exists():
         sys.exit(f"input not found: {path}")
     df = pd.read_csv(path, sep="\t", dtype=str)
 
-    missing = [c for c, _ in COLUMNS if c not in df.columns] + \
+    missing = [c for c, _ in columns if c not in df.columns] + \
               ([TARGET] if TARGET not in df.columns else [])
     if missing:
         sys.exit(f"missing columns: {', '.join(missing)}")
+    # A live-gate leg on a column absent from the file would silently misreport
+    # the benchmark row, so drop the benchmark rather than fake it.
+    if live_legs and any(c not in df.columns for c, _, _ in live_legs):
+        absent = sorted({c for c, _, _ in live_legs if c not in df.columns})
+        print(f"[warn] live-gate columns absent ({', '.join(absent)}); "
+              f"benchmark row skipped", file=sys.stderr)
+        live_legs = []
+
+    # Sweep pair: explicit, else first ">=" x first "<=".
+    if args.sweep_pair:
+        sweep = [c.strip() for c in args.sweep_pair.split(",")]
+        if len(sweep) != 2:
+            sys.exit("--sweep-pair needs exactly two comma-separated columns")
+        opmap = dict(columns)
+        for c in sweep:
+            if c not in opmap:
+                sys.exit(f"--sweep-pair column {c!r} is not in --columns")
+        sweep_a, sweep_b = sweep[0], sweep[1]
+    else:
+        # The sweep exists to examine the DEPLOYED pair, so prefer the live
+        # gate's own two columns when both are in scope; else first >= x first <=.
+        live_cols = [c for c, _, _ in live_legs]
+        ge = [c for c, op in columns if op == ">="]
+        le = [c for c, op in columns if op == "<="]
+        live_ge = [c for c in live_cols if c in ge]
+        live_le = [c for c in live_cols if c in le]
+        sweep_a = live_ge[0] if live_ge else (ge[0] if ge else columns[0][0])
+        sweep_b = live_le[0] if live_le else (
+            le[0] if le else (columns[1][0] if len(columns) > 1 else None))
+    op_a = dict(columns)[sweep_a]
+    op_b = dict(columns)[sweep_b] if sweep_b else None
 
     t = pd.to_numeric(df[TARGET], errors="coerce")
     keep = t.notna()
@@ -268,7 +389,8 @@ def main():
 
     lines = []
     P = lines.append
-    P(f"# Best thresholds: FinBERT `positive` + FinMarBa vs `{TARGET} >= {args.threshold:g}`")
+    col_title = ", ".join(f"`{c}`" for c, _ in columns)
+    P(f"# Best thresholds: {col_title} vs `{TARGET} >= {args.threshold:g}`")
     P(f"**Generated:** {date.today().isoformat()}  |  **Input:** `{path.name}`")
     P("")
     P("## 1. Data & method")
@@ -286,10 +408,14 @@ def main():
     P("- Metrics per cutoff: **fires** (rows firing), **TP** (fires that are "
       "movers), **precision** = TP/fires, **recall** = TP/all movers, **lift** = "
       "precision / base rate, with Wilson 95% CI on precision.")
-    P("- Fire direction: `positive`, `FinMarBa_positive`, "
-      "`FinMarBa_sentiment_score` fire HIGH (`>=`); `FinMarBa_negative`, "
-      "`FinMarBa_indecisive` fire LOW (`<=`, a real mover PR is decisive and "
-      "not negative).")
+    hi_cols = [c for c, op in columns if op == ">="]
+    lo_cols = [c for c, op in columns if op == "<="]
+    dirs = []
+    if hi_cols:
+        dirs.append(", ".join(f"`{c}`" for c in hi_cols) + " fire HIGH (`>=`)")
+    if lo_cols:
+        dirs.append(", ".join(f"`{c}`" for c in lo_cols) + " fire LOW (`<=`)")
+    P("- Fire direction: " + "; ".join(dirs) + ".")
     P("")
 
     # ---- single-column AUC orientation ----
@@ -300,7 +426,7 @@ def main():
     P("")
     P("| column | dir | AUC |")
     P("|---|---|---|")
-    for col, op in COLUMNS:
+    for col, op in columns:
         s = pd.to_numeric(df[col], errors="coerce")
         a = auc_mannwhitney(s, movers)
         if op == "<=":
@@ -317,7 +443,7 @@ def main():
       f">= {MIN_FIRES} rows).")
     P("")
     single_reco = {}  # col -> {"knee": (...), "hp": (...)}
-    for col, op in COLUMNS:
+    for col, op in columns:
         grid = GRID_GE if op == ">=" else GRID_LE
         cuts = quantile_cutoffs(df[col], grid)
         P(f"### `{col}`  (fire {op})")
@@ -358,10 +484,10 @@ def main():
 
     # ---- combo candidate legs ----
     cand = {}
-    for col, op in COLUMNS:
+    for col, op in columns:
         qs = CAND_GE if op == ">=" else CAND_LE
         cuts = {round(c, 3) for _, c in quantile_cutoffs(df[col], qs)}
-        cuts.update(ANCHORS.get(col, []))
+        cuts.update(anchors.get(col, []))
         cand[col] = [(op, c) for c in sorted(cuts)]
 
     def eval_rule(legs, mode):
@@ -402,7 +528,7 @@ def main():
       f"{MIN_FIRES_COMBO} and Wilson-low > base ({base:.1%}). "
       "`consist` = both-block lift>=1x guard.")
     P("")
-    cols = [c for c, _ in COLUMNS]
+    cols = [c for c, _ in columns]
     and_results = search("AND",
                          lambda m: m["n"] >= MIN_FIRES_COMBO and m["lo"] > base)
     and_results.sort(key=lambda x: (x[1]["prec"], x[1]["n"]), reverse=True)
@@ -416,31 +542,52 @@ def main():
         P("| _(no AND combo cleared the fires/precision floor)_ | | | | | | | |")
     P("")
 
-    # focused 2D sweep: FinBERT positive x FinMarBa_indecisive (the live-gate pair)
-    P("### Focused sweep: `positive` (>=) x `FinMarBa_indecisive` (<=)")
-    P("")
-    P("This is the live-gate pair `(positive >= p AND FinMarBa_indecisive <= q)`. "
-      "Cell = precision%% / recall%% (fires).")
-    P("")
-    p_cuts = [round(x, 2) for x in (0.5, 0.6, 0.7, 0.8)]
-    q_cuts = [0.05, 0.10, 0.15, 0.20]
-    header = "| positive \\ indec | " + " | ".join(f"<= {q:g}" for q in q_cuts) + " |"
-    P(header)
-    P("|" + "---|" * (len(q_cuts) + 1))
-    for p in p_cuts:
-        cells = []
-        for q in q_cuts:
-            fired, m, verdict, lifts = eval_rule(
-                [("positive", ">=", p), ("FinMarBa_indecisive", "<=", q)], "AND")
-            cells.append(f"{fmt_pct(m['prec'])} / {fmt_pct(m['recall'])} ({m['n']})")
-        P(f"| >= {p:g} | " + " | ".join(cells) + " |")
-    P("")
-    P("The live gate's `positive >= 0.6 AND FinMarBa_indecisive <= 0.1` sits in "
-      "the top-left of the meaningful range: it is the highest-precision corner "
-      "(~24%) but fires on very few PRs (recall ~6%). Precision rises sharply as "
-      "`indecisive` tightens; recall collapses. `indecisive <= 0.05` is below the "
-      "column's floor and fires on almost nothing.")
-    P("")
+    # focused 2D sweep over the chosen pair (default: the live-gate pair)
+    if sweep_b:
+        P(f"### Focused sweep: `{sweep_a}` ({op_a}) x `{sweep_b}` ({op_b})")
+        P("")
+        P(f"Cell = precision% / recall% (fires) for "
+          f"`({sweep_a} {op_a} p AND {sweep_b} {op_b} q)`.")
+        P("")
+
+        def sweep_cuts(colname, op):
+            """Anchors if given, else the column's own candidate quantiles."""
+            if anchors.get(colname):
+                return sorted(anchors[colname], reverse=(op == "<="))
+            qs = CAND_GE if op == ">=" else CAND_LE
+            return [c for _, c in quantile_cutoffs(df[colname], qs)]
+
+        p_cuts = sweep_cuts(sweep_a, op_a)
+        q_cuts = sweep_cuts(sweep_b, op_b)
+        P(f"| {sweep_a} \\ {sweep_b} | " +
+          " | ".join(f"{op_b} {q:g}" for q in q_cuts) + " |")
+        P("|" + "---|" * (len(q_cuts) + 1))
+        grid = {}
+        for p in p_cuts:
+            cells = []
+            for q in q_cuts:
+                fired, m, verdict, lifts = eval_rule(
+                    [(sweep_a, op_a, p), (sweep_b, op_b, q)], "AND")
+                grid[(p, q)] = m
+                cells.append(f"{fmt_pct(m['prec'])} / {fmt_pct(m['recall'])} ({m['n']})")
+            P(f"| {op_a} {p:g} | " + " | ".join(cells) + " |")
+        P("")
+        # Describe the surface from the numbers rather than asserting a shape.
+        usable = {k: m for k, m in grid.items() if m["n"] >= MIN_FIRES_COMBO}
+        if usable:
+            bp = max(usable, key=lambda k: usable[k]["prec"])
+            br = max(usable, key=lambda k: usable[k]["recall"])
+            P(f"Highest precision at >= {MIN_FIRES_COMBO} fires: "
+              f"`{sweep_a} {op_a} {bp[0]:g} AND {sweep_b} {op_b} {bp[1]:g}` -> "
+              f"{fmt_pct(usable[bp]['prec'])} precision, "
+              f"{fmt_pct(usable[bp]['recall'])} recall, "
+              f"{usable[bp]['n']} fires ({fmt_lift(usable[bp]['lift'])}). "
+              f"Widest coverage: `{sweep_a} {op_a} {br[0]:g} AND "
+              f"{sweep_b} {op_b} {br[1]:g}` -> {fmt_pct(usable[br]['prec'])} / "
+              f"{fmt_pct(usable[br]['recall'])} ({usable[br]['n']} fires).")
+        else:
+            P(f"_No cell in this sweep fires on >= {MIN_FIRES_COMBO} rows._")
+        P("")
 
     # ---- OR combos ----
     P("## 5. OR combinations (recall-ranked)")
@@ -473,7 +620,7 @@ def main():
     P("")
     P("| column | knee rule | knee P / R | high-prec rule | high-prec P / R |")
     P("|---|---|---|---|---|")
-    for col, op in COLUMNS:
+    for col, op in columns:
         if col in single_reco:
             _, ck, mk, vk, _ = single_reco[col]["knee"]
             _, ch, mh, vh, _ = single_reco[col]["hp"]
@@ -560,10 +707,11 @@ def main():
 
         # Curated sentiment rules, drawn from the sections above.
         test_rules = []
-        test_rules.append(("live sentiment leg: positive>=0.6 AND indecisive<=0.1",
-                           [("positive", ">=", 0.6),
-                            ("FinMarBa_indecisive", "<=", 0.1)]))
-        for col in ("positive", "FinMarBa_indecisive"):
+        if live_legs:
+            test_rules.append(
+                ("live sentiment leg: " + " AND ".join(
+                    f"{c}{op}{cut:g}" for c, op, cut in live_legs), live_legs))
+        for col in [c for c, _ in columns]:
             if col in single_reco:
                 op_, cc, _, _, _ = single_reco[col]["knee"]
                 test_rules.append((f"{col} {op_} {cc:g} (knee)",
@@ -592,6 +740,7 @@ def main():
         P("")
         P("| sentiment rule S | S alone (P/R) | combo OR S (P/R) | marginal adds (TP/fires, P, lift) | combo AND S (P/R) | AND delta [95% CI] |")
         P("|---|---|---|---|---|---|")
+        s7 = []
         for label, legs in test_rules:
             masks = [fire_mask(df[c], op, cut) for c, op, cut in legs]
             rule_fire = masks[0].copy()
@@ -603,45 +752,65 @@ def main():
             an, atp, aprec, arec, alift = hb_cell(combo_fire & rule_fire)
             if an > 0 and cn > 0:
                 lo, hi = newcombe_diff(ctp, cn, atp, an)
-                delta = f"{aprec - cprec:+.0%} [{lo*100:+.0f}, {hi*100:+.0f}]"
                 verdict = "helps" if lo > 0 else ("hurts" if hi < 0 else "n.s.")
-                delta = f"{delta} {verdict}"
+                delta = f"{aprec - cprec:+.0%} [{lo*100:+.0f}, {hi*100:+.0f}] {verdict}"
             else:
-                delta = "no fires"
+                verdict, delta = "no fires", "no fires"
+            s7.append({"label": label, "sprec": sprec, "mlift": mlift, "mn": mn,
+                       "aprec": aprec, "an": an, "verdict": verdict})
             P(f"| {label} | {fmt_pct(sprec)}/{fmt_pct(srec)} | "
               f"{fmt_pct(oprec)}/{fmt_pct(orec)} | {mtp}/{mn}, {fmt_pct(mprec)}, "
               f"{fmt_lift(mlift)} | {fmt_pct(aprec)}/{fmt_pct(arec)} | {delta} |")
         P("")
+        # Verdict is DERIVED from the table above, never asserted: with a
+        # user-supplied column set the old hardcoded conclusions could be
+        # flatly false for the data in front of us.
         P("### Deployment verdict")
         P("")
-        P(f"- `{ccol} >= {cthr:g}` is the strong leg (~{fmt_pct(cprec)} precision, "
-          f"{fmt_lift(clift)}). None of the sentiment rules match it standalone.")
-        P("- As an **extra OR leg they earn little**: the marginal (combo-missed) "
-          "fires run at roughly base rate (lift ~1x), i.e. the sentiment rules "
-          "mostly re-select combo's own winners or add fires with no edge. The "
-          "narrow live `positive>=0.6 AND indecisive<=0.1` adds a few movers "
-          "slightly above base but within noise, and it is disjoint from combo "
-          "(0 overlap) — which is why the live gate ORs them rather than "
-          "duplicating.")
-        P("- As an **AND conviction filter they do help**: tightening combo's "
-          "fires with `FinMarBa_indecisive <= 0.156` (or `positive` knee) raises "
-          "precision above combo alone while keeping useful volume — but on this "
-          "honest block (n small) the Newcombe CI on that gain typically still "
-          "spans 0, so treat it as a size-up signal, not a proven precision "
-          "jump. This matches the standing recommendation: sentiment = "
-          "conviction upgrade, `combo >= 0.6` = the trigger.")
+        beats = [r for r in s7 if not np.isnan(r["sprec"]) and r["sprec"] > cprec]
+        P(f"- `{ccol} >= {cthr:g}` alone: {fmt_pct(cprec)} precision, "
+          f"{fmt_lift(clift)}, {cn} fires. "
+          + (f"**{len(beats)} of {len(s7)}** sentiment rules beat it standalone ("
+             + ", ".join(f"`{r['label']}` {fmt_pct(r['sprec'])}" for r in beats[:3])
+             + ")." if beats else
+             f"None of the {len(s7)} sentiment rules beat it standalone."))
+        earners = [r for r in s7 if r["mn"] >= MIN_FIRES_COMBO
+                   and not np.isnan(r["mlift"]) and r["mlift"] > 1.0]
+        P("- **As an extra OR leg:** " + (
+            f"{len(earners)} rule(s) add combo-missed fires at lift > 1x — "
+            + ", ".join(f"`{r['label']}` ({r['mn']} adds, {fmt_lift(r['mlift'])})"
+                        for r in earners[:3]) + "."
+            if earners else
+            f"none of the {len(s7)} rules add combo-missed fires above base rate "
+            f"at >= {MIN_FIRES_COMBO} fires, i.e. they re-select combo's own "
+            f"winners or add fires with no edge."))
+        helps = [r for r in s7 if r["verdict"] == "helps"]
+        hurts = [r for r in s7 if r["verdict"] == "hurts"]
+        P("- **As an AND conviction filter:** " + (
+            f"{len(helps)} rule(s) raise combo's precision with a Newcombe CI "
+            f"excluding 0 — " + ", ".join(f"`{r['label']}` -> {fmt_pct(r['aprec'])} "
+                                          f"on {r['an']} fires" for r in helps[:3]) + "."
+            if helps else
+            f"no rule's precision gain over combo alone clears its Newcombe CI; "
+            f"{sum(1 for r in s7 if r['verdict'] == 'n.s.')} are n.s."
+            + (f", {len(hurts)} actively hurt" if hurts else "")
+            + ". Treat any apparent gain as a size-up signal, not a proven jump."))
+        P(f"- Sample size caveat: this block is n={n_hb} with {tot_mv_hb} movers, "
+          f"so CIs are wide and absence of significance is not evidence of "
+          f"absence.")
         P("")
 
     report = "\n".join(lines) + "\n"
     out = pathlib.Path(args.out) if args.out else pathlib.Path(
-        f"{date.today().isoformat()}_FinBERTpositive_FinMarBa_thresholds.md")
+        f"{date.today().isoformat()}_"
+        f"{'_'.join(c for c, _ in columns)[:60]}_thresholds.md")
     out.write_text(report)
 
     # concise stdout
     print(f"rows={n_rows} movers={total_movers} base={base:.1%} "
           f"(early {base_early:.1%} / recent {base_recent:.1%})")
     print("single-column (knee | high-prec):")
-    for col, op in COLUMNS:
+    for col, op in columns:
         if col in single_reco:
             _, ck, mk, vk, _ = single_reco[col]["knee"]
             _, ch, mh, vh, _ = single_reco[col]["hp"]

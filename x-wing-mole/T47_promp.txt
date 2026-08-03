@@ -1,0 +1,43 @@
+T47-airspeeder-1.0.py (T47) script definition
+
+The T47 script will be launched by the clerk-1.1.py (as it would launch a trade-mole + x-wing DUO) but instead it will launch a TRIO of scripts my now the new script that will be created (T47).
+Create new version of the script that need significant changes. 
+
+The main role of the T47 script will be to have the capacity the relaunch the x-wing script when price movement conditions are met and recognized by the T47..
+The ignitial trigger of the x-wing will still be made the trade-mole + sentiment trigger, the T47 will let it happen instantly for that innitial triggerring (named Trigger 1). The subsequent triggering of the x-wing will be made by the T47 script alone. The T47 script will have a variable named xwing_relaunch_number=3 (so the xwing could be relaunch 3 times after the innitial launch, so for runs of xwing in total).
+
+T47 relaunch behavior:
+
+Lexicon:
+PR: Press Release
+EP: Entry Price
+SP: Stop Price
+HP: High Price
+LP: Low Price
+CP: Current Price
+
+Definitions:
+EP: The Entry Price is the price at which the order was filled (managed by the x-wing, use the xwing value for fill price as EP).
+
+SP: Price at which the Stop Limit Order was filled (exit managed by the xwing script).
+
+HP: Highest price (use Bid price) point after the script starts recording the position, this price value keeps being tracked/recorded to keep the highest price point as a constantly updated reference. After the position is Exit (sold filled) the SP value becomes the HP value but afterward if a new price higher then the ST is recorded, this price becomes the new HP.
+
+LP: This is the lowest price (use Bid price) recorded and kept as a reference. After a position is Exit/filled (Sold), the LP (Low Price) value is reset to accomodate the fact that the price might have rise significantly since the last entry. After a new High Price (HP) point, the LP is reset from that new HP.
+
+CP: The price at the current (now/latest) moment.
+
+Calculations:
+DROP (%) = (HP - LP)*100/HP	Example: (10-9)*100/10=10% 	-If the DROP value is greater then 15%, the price can be considered as "Valid DROP". If the price keeps going down and the DROP becomes greater, the new Low Price value is re anchored as the new Low Price value. When a LP measured generates a "Valid DROP") the script can start recording the PUSH value which is the price percentage of price increase when the current price is greater then the LP.
+
+PUSH (%): A push can happen when the Current Price is greater then the LP and that we are in a "Valid DROP" state. The PUSH value is the price percentage increase when the current price is greater then the LP. The PUSH is the percentage gain from the latest LP point price.
+After a LP was recorded and the price is rising, if the Current Price (CP) is greater then X percent from the LP, an xwing instance is launched on that symbol.
+PUSH (%) = (CP - LP)*100/LP	Example: (11-10)*100/10=10%	If the PUSH value is greater then 10%, the price can be considered as an EP.
+
+Make the variables for PUSH and DROP values (and all other relevant variables) easily editable at the beginnig of the script. 
+
+Read the file ./T47_slide.png which I made to represent the behavior the T47 script has to reproduce. I want you to analyse this file properly and use it as a reference.
+
+The T47 script will have to create an output table with the columns: Time, CP-Bid, EP, SP, LP, HP, DROP(%), PUSH(%), Valid-DROP (YES/NO), Valid-PUSH (YES/NO). Make sure I dont forget important columns. Output the table (TSV) here ./T47-tables with a file name with SYMBOL-yyyy-mm-dd-hh-t47.tsv
+
+Use the AskUserQuestion tool to deeply understand my needs and challenge me regarding the pitfalls I might have not seen in this system design, then make a plan for that implementation.

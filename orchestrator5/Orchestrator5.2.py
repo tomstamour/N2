@@ -7,6 +7,7 @@ import threading
 import socket
 import time
 import importlib.util as _ilu
+import joblib
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -56,18 +57,104 @@ score_finmarba_headline = _finmarba_mod.score_headline
 load_finmarba_model     = _finmarba_mod.load_model
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── keyword/combo scorer import (keyword_scorer-2.py — hyphen, so importlib) ──
-# The LIVE body scorer (NOT the old keyword_scorer.py, whose ge20 defaults are
-# wrong). get_default_scorer() wires the frozen ge15 artifacts + pinned
-# prevalence 0.185 + the frozen combo JSON; O5.2 consumes ONLY
-# res["model_proba_PLUS_kw_mult_nb"]. The module inserts its own dir into
-# sys.path at exec time so its internal keyword_finder import resolves itself.
+# ── FLANG-BERT import (3rd headline model, 2026-07-29) ───────────────────────
+# avinasht/FLANG-BERT_flang-bert (ONNX INT8) — its `sentiment_score`
+# (positive − negative) is the STANDALONE 3rd trade leg (see _evaluate_trigger).
+# This is the SAME module that produced the offline FLANG-BERT_sentiment_score
+# column via tools/Encoder_Models/HeadScore11encoders.py, so the live score equals
+# an offline rescore of the same headline — which is what the >= FLANG_SCORE_MIN
+# cutoff was calibrated on. Do NOT edit the headliner or its
+# flangbert_sentiment_onnx/ artifacts; both are frozen.
+# Two collisions to be aware of: this module's public fn is `analyze_headline`
+# (the SAME name already bound to FinBERT above) and its loader is likewise named
+# `load_model`, so the distinct module name below plus the distinct aliases are
+# what keep the three modules' singletons (_inferencer/_model_dir) apart.
+# API: load_model() to pre-warm, analyze_headline(str) → dict with
+# {headline, positive, neutral, negative, sentiment_score, label, inference_ms}.
+# NOTE the timing key is `inference_ms` here, not FinMarBa's `elapsed_ms`.
+_flang_spec = _ilu.spec_from_file_location(
+    "FLANG_BERT_headliner",
+    str(SCRIPTS_DIR / "tools" / "Encoder_Models" / "FLANG-BERT_headliner.py"),
+)
+_flang_mod = _ilu.module_from_spec(_flang_spec)
+_flang_spec.loader.exec_module(_flang_mod)
+score_flang_headline = _flang_mod.analyze_headline
+load_flang_model     = _flang_mod.load_model
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── keyword scorers (keyword_scorer-2.py — hyphen, so importlib) ─────────────
+# 2026-07-28: the old `model_proba_PLUS_kw_mult_nb >= 0.67` combo leg is GONE.
+# It came from SELECTED-MODEL_classify_fromPRhigh_ge15_excStr2, trained on the
+# PRE-2026-07-26 BIASED fromPR_High label (the baseline was the PR's own bar).
+# Replaced by the corrected-label ge15 pair below — see the gate block ~line 120.
+#
+# Only the two text-prep helpers are borrowed from this module; the pipelines are
+# loaded straight from joblib and called directly. Deliberate: KeywordScorer's
+# score_texts() also runs the n-gram/keyword machinery for the kw_* methods,
+# which we would compute and throw away twice per PR on the trade-critical path.
+# The module inserts its own dir into sys.path at exec time so its internal
+# keyword_finder import resolves itself.
 _kw_spec = _ilu.spec_from_file_location(
     "keyword_scorer_2",
     str(SCRIPTS_DIR / "tools" / "keyword" / "keyword_scorer-2.py"),
 )
 kw2 = _ilu.module_from_spec(_kw_spec)
 _kw_spec.loader.exec_module(kw2)
+from keyword_finder import strip_wire_boilerplate  # noqa: E402 (kw2 put it on sys.path)
+
+# The two corrected-label models. Trained on
+# 04_PRstats_..._FromPRhigh_TRAIN_pre20260620_cap400.tsv (2647 rows, train pos
+# rate 0.2286) — i.e. TRAIN only, so VAL (777 rows from 2026-06-20) was an honest
+# holdout for the thresholds below.
+KW15_DIR = (SCRIPTS_DIR / "tools" / "keyword" /
+            "model_trained_on_04-PRstats-2026-05-04to06-18_TRAIN")
+KW15_BODY_PIPELINE = KW15_DIR / "classify_fromPRhigh_ge15" / "tfidf_fitted_pipeline.joblib"
+KW15_HEAD_PIPELINE = KW15_DIR / "classify_fromPRhigh_ge15_headline" / "tfidf_fitted_pipeline.joblib"
+
+# ⚠ The 400-word body cap is NOT optional. Corpus bodies are capped at 400 words
+# UPSTREAM (Training_guide §"already capped at 400 words", median = max = 400),
+# so the models only ever saw the first 400 words. Verified 2026-07-28 on the 777
+# VAL rows: dropping the cap moves max |Δproba| to 0.212 and FLIPS 49 fire
+# decisions (154 → 165 fires). The cap's ORDER relative to stripping does not
+# matter (max |Δ| 0.014, zero flips), so capping after the strip — as here — is
+# equivalent to the corpus's cap-then-strip. Headlines are never capped.
+KW15_BODY_MAX_WORDS = 400
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── PR classifier + earnings scorer (the Earnings trade leg, 2026-08-02) ──────
+# Neither filename has a hyphen, so a plain import would work — but both live in
+# directories that are NOT packages, and `earning_scorer` is a generic enough name
+# that putting its dir on sys.path invites a collision. Path-loading keeps the
+# file's existing style and touches nothing global. No sys.modules pre-registration
+# is needed here: that gotcha is specific to RTPR_connector3_Firehose's frozen
+# dataclass, and neither of these two defines one.
+#
+# Both are import-safe (module level is stdlib imports + literals + re.compile;
+# argparse/pandas are only touched inside their __main__-guarded main()) and
+# thread-safe (compiled regexes + function-locals only, no mutable globals), so a
+# pool worker can call them concurrently.
+_prclass_spec = _ilu.spec_from_file_location(
+    "PrClassifier",
+    str(SCRIPTS_DIR / "tools" / "categorizer" / "PrClassifier.py"),
+)
+_prclass_mod = _ilu.module_from_spec(_prclass_spec)
+_prclass_spec.loader.exec_module(_prclass_mod)
+classify_pr = _prclass_mod.classify            # (text) -> (FineClass, BroadClass)
+PRCLASS_BODY_LEAD_CHARS = _prclass_mod.BODY_LEAD_CHARS   # body fallback window (1500)
+
+# The regex earnings extractor + additive rule score. Its `mktcap` argument is
+# really FLOAT-CAP IN DOLLARS (Float(M shares) * LastDailyClose * 1e6), not market
+# cap — see _classify_and_score_earnings. Aliased like the headliners so nothing
+# generic (`classify`, `load_params`, `score_metrics`) lands in this namespace.
+_earn_spec = _ilu.spec_from_file_location(
+    "earning_scorer",
+    str(SCRIPTS_DIR / "tools" / "Earning_Scorer" / "earning_scorer.py"),
+)
+_earn_mod = _ilu.module_from_spec(_earn_spec)
+_earn_spec.loader.exec_module(_earn_mod)
+earn_extract_metrics = _earn_mod.extract_metrics
+earn_score_metrics   = _earn_mod.score_metrics
+earn_load_params     = _earn_mod.load_params
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── RTPR_connector3 import (shared helpers ONLY — the connector is NOT run) ───
@@ -118,23 +205,149 @@ CLERK_PORT             = n2_config.get_int(_CFG, 'CLERK_PORT', 8765)
 CLERK_TIMEOUT_SEC      = 5       # per-message TCP send/recv timeout
 CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sentiment
 
-# Trade-trigger gate (STEP 1b) — OR rule, either leg fires the trade:
-#   Headline leg: FinBERT `positive` >= SENTIMENT_POSITIVE_MIN
-#                 AND FinMarBa `indecisive` <= FMB_INDECISIVE_MAX  (both must hold)
-#   Keyword  leg: body combo `model_proba_PLUS_kw_mult_nb` >= COMBO_TRIGGER_MIN
-# (5.2 change: the old FinBERT-`positive`-alone leg at 0.83 is gone — the headline
-# leg now also requires FinMarBa's `indecisive` confirmation.) A score that is
-# None (model error / scorer timeout) makes its own condition false: a missing
-# positive OR indecisive kills the headline leg, a missing combo kills the keyword
-# leg; the other leg can still fire, and both legs false → "BAD". The wire
-# protocol to the clerk stays "OK"/"BAD"; the trigger source (Keyword /
-# FinBERT_FMB / Keyword_FinBERT_FMB) is recorded in the TSV ClerkSentiment only.
-SENTIMENT_POSITIVE_MIN = 0.6     # FinBERT `positive` floor (headline leg, cond 1)
-FMB_INDECISIVE_MAX     = 0.1347     # FinMarBa `indecisive` ceiling (headline leg, cond 2)
-COMBO_TRIGGER_MIN      = 0.6     # keyword-combo leg threshold (walk-forward rule)
+# Trade-trigger gate (STEP 1b) — an OR of FOUR branches as of 2026-08-03. A row trades
+# when ANY ONE of them holds:
+#   1. CORE      — the five-way AND defined immediately below (2026-08-01)
+#   2. EARNINGS  — FineClass/EarningScore/kw15_body (2026-08-02; block further down)
+#   3. KwBodySolo— kw15_body  >= KW15_BODY_SOLO_MIN alone   (2026-08-03; block below)
+#   4. FLANGSolo — FLANG score >= FLANG_SOLO_MIN alone      (2026-08-03; block below)
+#
+# THIS block defines branch 1 only. It is an AND over ALL FIVE conditions — the trade
+# fires on this branch only when EVERY one holds (2026-08-01; version-control.txt #4):
+#   FinBERT    `positive`        >= SENTIMENT_POSITIVE_MIN
+#   FinMarBa   `indecisive`      <= FMB_INDECISIVE_MAX     (the only ceiling)
+#   ge15 body  `model_proba`     >= KW15_BODY_MIN
+#   ge15 head  `model_proba`     >= KW15_HEAD_MIN
+#   FLANG-BERT `sentiment_score` >= FLANG_SCORE_MIN
+# The three LEGS (headline = FinBERT+FMB, keyword = body+head, FLANG) survive as names
+# in ClerkSentiment, but since each leg is itself an AND, "all three legs" and "all five
+# conditions" are the SAME boolean function — within this branch the legs are a
+# grouping, not alternatives.
+#
+# ⚠ The 2026-08-03 solo branches SUBSUME this one wherever they hold, because they read
+# two of these same five scores at higher cuts. This branch (and the earnings one) is
+# therefore only DECISIVE for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN)
+# — currently [0.50, 0.70) — and FLANG below FLANG_SOLO_MIN. The five thresholds below
+# were calibrated when this AND was the whole gate; that calibration describes the
+# branch, not the gate, from 2026-08-03 on.
+#
+# ⚠ MISSING scores. A None (model error / scorer timeout) makes only its OWN condition
+# false — but within this AND branch that single false blocks it entirely, and with four
+# branches now running a dead model no longer shows up as a silent tape at all. That is
+# why _evaluate_trigger returns `missing_blocked` and the caller logs a WARNING when a
+# MISSING score is the ONLY thing standing between the row and a fire; from 2026-08-03
+# that alarm also fires whenever kw15_body or FLANG is None, since each of those alone
+# is a whole branch.
+# The wire protocol to the clerk stays "OK"/"BAD"; the trigger source is in the TSV only
+# — ClerkSentiment (fired leg names joined with "_" in the fixed order Keyword,
+# FinBERT_FMB, FLANG, Earnings, KwBodySolo, FLANGSolo) and the Trigger column, which
+# drops a level below the legs and records YES/NO plus a PASS/FAIL/MISSING token per
+# CONDITION with its score and the threshold in force, so a row shows WHICH condition
+# failed and by how much.
+#
+# Calibration of the AND gate AND all five thresholds (2026-08-01), on
+# price_stats_loader/outputs/
+#   06_PRstats_2026-06-22-2026-07-30_11EncBodyHeadScored_kwScored_FinBERT.tsv
+# (1055 labelled rows; the full-coverage FinBERT_positive / FinMarBa_indecisive cols):
+#                                     fires         P@>=30%  lift    recall
+#   OLD  OR  0.6/0.13/0.60/0.65/0.97   267 (25.3%)   32.6%   1.90x   48.1%
+#   NEW  AND 0.8/0.14/0.50/0.50/0.96    26 ( 2.5%)   46.2%   2.69x    6.6%
+# At the >=15% target the AND gate runs 80.8% precision / 2.51x lift. The retuned
+# thresholds are matched TO the AND: loosening kw15 to 0.50/0.50 and FLANG to 0.96 more
+# than doubles the fire count vs AND-with-the-old-thresholds (11 -> 26) at essentially
+# unchanged precision, while FinBERT tightens 0.6 -> 0.8. Deliberate trade: ~1 trade/day
+# at a much higher hit rate, accepting the large recall drop.
+# ⚠ n=26 — 46.2% carries roughly a +/-19pp CI and is post-selection (the thresholds were
+# chosen against this same file). Treat it as an operating point, not a measurement.
+#
+# ⚠ 2026-07-28 keyword-leg REPLACEMENT (historical — explains OLD TSVs). `Keyword` in
+# ClerkSentiment means a DIFFERENT rule before and after that date. Was: body combo
+# `model_proba_PLUS_kw_mult_nb` >= 0.67 from the biased-label model. Now: the
+# corrected-label ge15 body+headline pair. Its 0.60/0.65 operating point (75 fires,
+# 57.3% precision, 3.18x lift on the 777-row VAL holdout) is SUPERSEDED by the
+# 2026-08-01 calibration above — the cuts are now 0.50/0.50 and the body+head PAIR no
+# longer fires on its own (though from 2026-08-03 the body channel alone does, at 0.70).
+# Original derivation: price_stats_loader/statsByClaude/
+# July28_SentimentScore_stats_report.md §5.1-5.4.
+#
+# ⚠ 2026-07-29 FLANG leg ADDED (historical — explains OLD TSVs). ClerkSentiment gained
+# the labels FLANG, Keyword_FLANG, FinBERT_FMB_FLANG and Keyword_FinBERT_FMB_FLANG from
+# that date, and the TSV grew the 7 FLANG_* columns (31 -> 38). The 2026-08-01 AND left
+# only the last of those four reachable; the 08-02 and 08-03 branches reopened the
+# vocabulary and added Earnings, KwBodySolo and FLANGSolo to it.
+SENTIMENT_POSITIVE_MIN = 0.8     # FinBERT `positive` floor
+FMB_INDECISIVE_MAX     = 0.14    # FinMarBa `indecisive` ceiling (the only <= condition)
+KW15_BODY_MIN          = 0.50    # ge15 BODY model_proba floor
+KW15_HEAD_MIN          = 0.50    # ge15 HEADLINE model_proba floor
+# FLANG-BERT headline sentiment_score (= positive − negative) floor. Was a STANDALONE
+# leg at 0.97, calibrated 2026-07-28 on 04_PRstats_2026-05-04-2026-07-23_..._FromPRhigh
+# .tsv (3434 rows): 304 fires (8.9%) at 46.1% precision / 1.81x lift, of which 191
+# (5.6% of all rows) were fires the FinBERT+FinMarBa leg missed at the same precision —
+# that marginal number is what justified OR-ing it in. Both facts are MOOT from
+# 2026-08-01: it is now one AND-ed condition among five, so its standalone precision no
+# longer describes anything the gate does. The BODY twin was measured and REJECTED
+# (precision flat 0.90 -> 0.98, 33-35%, ~1.3x lift — saturated ⇒ useless as a gate);
+# headline only. Retune HERE.
+FLANG_SCORE_MIN        = 0.96
 KW_SCORE_WAIT_SEC      = 10      # max wait on the kw-score future before STEP 1b
                                  # (~4 ms typical — a hung scorer must never
                                  # delay the trade decision beyond this)
+FLANG_SCORE_WAIT_SEC   = 10      # same ceiling for the FLANG future (~6.6 ms measured)
+
+# ── EARNINGS LEG (2026-08-02) — a SECOND trade branch, OR-ed with the five-way AND ──
+# ⚠ This partially undoes the 2026-08-01 "pure AND" switch. The five conditions above
+# are UNTOUCHED and still form one complete branch; what changed is that a row can now
+# also fire on:
+#       FineClass == 'Earnings_Results' AND EarningScore >= 4 AND kw15_body >= 0.50
+# so the gate is `core_and OR earnings_leg`. Note kw15_body is SHARED with the AND
+# branch (same condition, same local); kw15_head, FinBERT, FMB and FLANG are NOT
+# required by this leg.
+#
+# Why a separate branch instead of more AND conditions: the five-way AND is
+# structurally BLIND to earnings PRs. Earnings_text_structures_report.md §4 measured
+# the gate's own FinBERT headline score at test AUC 0.297 on earnings PRs — ANTI-
+# predictive — because winners and duds share near-identical headlines ("X Reports Q1
+# 2026 Financial Results"); the separating numbers are in the BODY.
+#
+# Calibrated 2026-08-02 on tools/Earning_Scorer/PRstats_2026-05-04-2026-07-30_
+# EarningResults_earnScored.tsv (518 labelled Earnings_Results rows, base rate 7.1%
+# on the >=30% target), with kw15_body recomputed by the frozen ge15 body pipeline:
+#     current five-way AND on those rows :  3 fires,  0.0% precision  (blind, as above)
+#     EarningScore>=4 AND kw15_body>=0.50: 36 fires, 47.2% precision, 6.6x lift
+#     test block only (>=2026-06-20, n=79, base 13.9%): 7 fires, 42.9%, 3.1x lift
+# OVERLAP WITH THE AND BRANCH IS EXACTLY ZERO — this leg is purely additive: ~0.71
+# extra trades/day at the same precision bar the AND branch holds (46.2%).
+# Cut choice: precision is FLAT below 4 (>=1 .321, >=2 .314, >=3 .339) and steps up at
+# 4 (.472) — 4 is the knee, and matches the report's own defensible operating point.
+# ⚠ n=36 ⇒ wide error bars, and EarningScore is a RANKING CUT, not a calibrated
+# probability: the >=30% base rate itself moved 3.7% (May) -> ~15-20% (Jun/Jul).
+# ⚠ EarningScore is INTEGER POINTS (observed −7…+9, median 0), NOT a 0-1 score — a
+# threshold like 0.4 would silently mean ">= 1" (36.5% of earnings PRs at 32%
+# precision). Retune HERE; the params behind the points are frozen in
+# tools/Earning_Scorer/earn_score_params.json (calibrated 2026-08-01).
+EARN_CLASS          = 'Earnings_Results'  # the only FineClass this leg accepts
+EARN_SCORE_MIN      = 4                   # EarningScore POINTS floor (integer, see above)
+EARN_SCORE_WAIT_SEC = 10                  # ceiling on the earn future, as KW/FLANG
+
+# ── SOLO LEGS (2026-08-03) — two MORE standalone branches, OR-ed beside the two above ──
+#   is_ok = core_and OR earnings_leg OR kw15_body >= KW15_BODY_SOLO_MIN
+#                                    OR flang    >= FLANG_SOLO_MIN
+# Each is ONE condition and fires the trade ALONE — no confirmation from any other model.
+# They re-read scores the core branch already consumes, at HIGHER cuts, which has a
+# structural consequence worth stating plainly: a row clearing a solo cut fires no matter
+# what the other four models said, so the five-way AND and the earnings leg are only
+# DECISIVE for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN) — i.e. [0.50,
+# 0.70) — and, for FLANG, below 0.975. Nothing was removed or retuned: every row that
+# fired before still fires, this is purely additive.
+# ⚠ UNLIKE EVERY OTHER CUT IN THIS FILE, these two were specified by the operator on
+# 2026-08-03 and were NOT calibrated against a labelled corpus. No fires/precision/lift
+# number backs them. For scale, from the calibrations recorded above: FLANG standalone at
+# 0.97 fired 8.9% of 3434 rows at 46.1% precision (>=15%) / 24.3% (>=30%), and the ge15
+# body channel alone ran ~41% precision at 0.60 — so expect the gate's fire rate to move
+# off the AND-era ~2.5% (~1 trade/day) into roughly the 5-10% band, at those standalone
+# precisions rather than the AND branch's 46.2% @>=30%. Retune HERE.
+KW15_BODY_SOLO_MIN = 0.70    # ge15 BODY model_proba — fires alone (core cut is 0.50)
+FLANG_SOLO_MIN     = 0.975   # FLANG sentiment_score — fires alone (core cut is 0.96)
 
 # Baseline lookups from the daily universe TSV.
 TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "no baseline"
@@ -161,21 +374,30 @@ FEED_SILENCE_TIMEOUT_SEC = 20    # connector heartbeats every 5s → 20s silence
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Worker pools (parallelism knobs) ──────────────────────────────────────────
-# The two headline models (FinBERT + FinMarBa) are the trade-critical path: a
-# burst of ~15 PRs inside 1s (observed 2026-07-02) clears in ~4 waves on 4
-# threads. Each model gets its OWN pool so they run simultaneously (both are ONNX
-# INT8 → inference releases the GIL, so two threads = genuine parallel execution
-# on separate cores) and FinMarBa can never starve FinBERT. For a single article
-# the critical path uses just one thread from each pool at once; the two 4-wide
-# pools only co-saturate under simultaneous bursts, tolerable for ~12 ms INT8
-# inferences. The keyword/combo scorer is ~4 ms/PR, so ONE worker absorbs the
-# worst observed burst (~60 ms of queue) and sidesteps any KeywordScorer/sklearn
+# The three headline models (FinBERT + FinMarBa + FLANG-BERT) are the
+# trade-critical path: a burst of ~15 PRs inside 1s (observed 2026-07-02) clears in
+# ~4 waves on 4 threads. Each model gets its OWN pool so they run simultaneously
+# (all are ONNX INT8 → inference releases the GIL, so three threads = genuine
+# parallel execution on separate cores) and no model can starve another. For a
+# single article the critical path uses just one thread from each pool at once; the
+# three 4-wide pools only co-saturate under simultaneous bursts, tolerable for
+# ~7-12 ms INT8 inferences. Note all three sessions use ORT's default intra-op
+# pool, so on this 8-thread box they mostly time-share rather than truly overlap
+# (measured ~20 ms for the FinBERT+FinMarBa pair; expect ~30 ms for the trio) —
+# still trivial against the clerk-arm round-trip, which dominates.
+# The keyword scorer is a few ms/PR (two tfidf predict_proba calls),
+# so ONE worker absorbs the worst observed burst and sidesteps any sklearn
 # thread-safety question.
 FINBERT_HEADLINE_WORKERS  = 4     # threads sharing the preloaded FinBERT model
 FINMARBA_HEADLINE_WORKERS = 4     # threads sharing the preloaded FinMarBa model
+FLANG_HEADLINE_WORKERS    = 4     # threads sharing the preloaded FLANG-BERT model
 KW_SCORE_WORKERS          = 1     # single worker on purpose — see above
 COLLECT_WORKERS           = 8     # per-ticker collectors (resolve futures + TSV)
 CLERK_WORKERS             = 6     # STEP-1a arms; a touch above clerk's 5-client pool
+# PR classifier + earnings scorer: pure-Python regex, so it HOLDS the GIL and cannot
+# truly overlap the other pools (unlike the ONNX models). 2 workers is not about
+# throughput — it just stops one long body from head-of-line-blocking the next PR.
+EARN_SCORE_WORKERS        = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEDUP_MAX_IDS = 50_000  # FIFO cap on the per-day seen-article-ID stash (leak guard)
@@ -220,9 +442,16 @@ _inscope_set: set = set()
 _nw_excluded_strings: set = set()
 _excluded_strings: set = set()
 
-# Keyword/combo scorer (keyword_scorer-2.py KeywordScorer) — loaded once in
-# main() before the feed connects, then only read by the kwscore worker.
-_kw_scorer = None
+# The two corrected-label ge15 sklearn pipelines — loaded once in main() before
+# the feed connects, then only read by the kwscore worker.
+_kw15_body_pipe = None
+_kw15_head_pipe = None
+
+# Calibrated earnings-score params (earn_score_params.json), loaded ONCE in main().
+# ⚠ Must always be passed explicitly as `params=` — earn_score_metrics(feats) with no
+# params calls load_params() internally, which does os.path.exists + json.load on
+# EVERY call, i.e. a disk read per PR on the trade-critical path.
+_earn_params = None
 
 # Orchestrator-side article-ID dedup. The connector's own dedup lives in its
 # dataframe_writer DOWNSTREAM of the row hook, and a WS reconnect can replay
@@ -260,12 +489,21 @@ _finbert_executor = ThreadPoolExecutor(max_workers=FINBERT_HEADLINE_WORKERS,
 # Second headline model — its own pool so it runs in parallel with FinBERT.
 _finmarba_executor = ThreadPoolExecutor(max_workers=FINMARBA_HEADLINE_WORKERS,
                                         thread_name_prefix='finmarba')
+# Third headline model (2026-07-29) — own pool again, so all three start at
+# reception and run concurrently rather than queueing behind one another.
+_flang_executor = ThreadPoolExecutor(max_workers=FLANG_HEADLINE_WORKERS,
+                                     thread_name_prefix='flang')
 _collect_executor = ThreadPoolExecutor(max_workers=COLLECT_WORKERS,
                                        thread_name_prefix='collect')
 
 # Keyword/combo body scorer — single worker (see KW_SCORE_WORKERS note above).
 _kw_executor = ThreadPoolExecutor(max_workers=KW_SCORE_WORKERS,
                                   thread_name_prefix='kwscore')
+
+# PR classifier + earnings scorer (2026-08-02) — its own pool so a long earnings body
+# never queues behind the keyword scorer, which sits on the same critical path.
+_earn_executor = ThreadPoolExecutor(max_workers=EARN_SCORE_WORKERS,
+                                    thread_name_prefix='earnscore')
 
 _tsv_lock = threading.Lock()
 
@@ -312,33 +550,81 @@ def analyze_finmarba(news_dict: dict) -> dict:
     }
 
 
-_KW_NONE_RESULT = {'model_proba_PLUS_kw_mult_nb': None, 'KwScoreCompletedAt': None}
+def analyze_flang(news_dict: dict) -> dict:
+    """FLANG-BERT (avinasht/FLANG-BERT_flang-bert) headline sentiment. Runs once
+    per article, in parallel with the other two headline models. Its
+    `sentiment_score` (positive − negative) must clear FLANG_SCORE_MIN for the trade
+    to fire — one of the five AND-ed gate conditions since 2026-08-01 (it was a
+    STANDALONE leg that fired on its own until then). The full distribution is stored
+    in the TSV FLANG_* columns for offline re-analysis.
+
+    Scores EXACTLY news_dict['Headline'], the same string the other two headline
+    models get, so the live value equals an offline HeadScore11encoders rescore of
+    the TSV's Headline column (where the threshold was calibrated)."""
+    result = score_flang_headline(news_dict['Headline'])
+    logger.info(
+        f"[FLANG] {news_dict['Symbol']} → {result['label'].upper()} "
+        f"(score={result['sentiment_score']:.4f}) in {result['inference_ms']:.1f}ms"
+    )
+    return {
+        'positive':        result['positive'],
+        'neutral':         result['neutral'],
+        'negative':        result['negative'],
+        'sentiment_score': result['sentiment_score'],
+        'label':           result['label'],
+        # NOTE: this module names its timing key `inference_ms`, unlike FinMarBa's
+        # `elapsed_ms` — normalised here so the TSV writer stays uniform.
+        'inference_ms':    result['inference_ms'],
+    }
+
+
+_KW_NONE_RESULT = {'kw15_body_proba': None, 'kw15_head_proba': None,
+                   'KwScoreCompletedAt': None}
+
+
+def _kw15_prep(text: str, max_words: int | None) -> str:
+    """The EXACT training text prep, in the order keyword_scorer-2.score_texts
+    uses it: strip HTML, strip wire boilerplate, then optionally cap. The corpus
+    capped BEFORE stripping; verified 2026-07-28 that the order is immaterial
+    (max |Δproba| 0.014, zero fire-decision flips over 777 VAL rows)."""
+    out = strip_wire_boilerplate(kw2._strip_html(text or ''))
+    return ' '.join(out.split()[:max_words]) if max_words else out
 
 
 def _score_keywords(news_dict: dict) -> dict:
-    """Keyword/combo scorer on the PR body. Runs once per article on the kwscore
-    worker. Never raises — any error returns the all-None dict so the pipeline
-    keeps running and the row records None.
+    """The two corrected-label ge15 model_proba scores — body and headline — which
+    together form the keyword trade leg. Runs once per article on the kwscore
+    worker. Never raises: any error returns the all-None dict. ⚠ Since 2026-08-01 the
+    gate is an AND, so that no longer just drops one leg — it blocks EVERY trade until
+    the scorer recovers, which is why _evaluate_trigger flags `missing_blocked` and the
+    caller escalates it to WARNING.
 
     Scores EXACTLY the string that lands in the TSV Body cell
     (clean_inline_text(body_raw)) — NOT the connector-cleaned article body —
     so the live number equals what an offline rescore of the same TSV produces
     (all backtests / walk-forward truth were computed on the Body column). An
-    empty body is scored anyway (combo ≈ 0.024) to stay consistent with offline
-    rescoring."""
+    empty body is scored anyway, to stay consistent with offline rescoring."""
     news_id = news_dict.get('ID')
     try:
         body_cell = c3.clean_inline_text(news_dict.get('body_raw') or '')
+        headline  = news_dict['Headline']
         t0 = time.monotonic()
-        res = _kw_scorer.score_text(body_cell, headline=news_dict['Headline'])
-        combo = res['model_proba_PLUS_kw_mult_nb']  # KeyError = combo not loaded → caught below
+        # One batched call per model; predict_proba on a 1-row list is the same
+        # code path score_texts uses.
+        body_p = _kw15_body_pipe.predict_proba(
+            [_kw15_prep(body_cell, KW15_BODY_MAX_WORDS)])[0][1]
+        head_p = _kw15_head_pipe.predict_proba(
+            [_kw15_prep(headline, None)])[0][1]
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         # numpy float64 → plain float; 6 decimals matches the backtest TSVs.
-        combo = float(round(float(combo), 6))
+        body_p = float(round(float(body_p), 6))
+        head_p = float(round(float(head_p), 6))
         logger.info(f"[KwScore] id={news_id} sym={news_dict.get('Symbol')}: "
-                    f"combo={combo:.6f} in {elapsed_ms:.1f}ms")
+                    f"kw15_body={body_p:.6f} kw15_head={head_p:.6f} "
+                    f"in {elapsed_ms:.1f}ms")
         return {
-            'model_proba_PLUS_kw_mult_nb': combo,
+            'kw15_body_proba': body_p,
+            'kw15_head_proba': head_p,
             'KwScoreCompletedAt': c3.format_millis_time(c3.now_fixed()),
         }
     except Exception as exc:
@@ -346,31 +632,310 @@ def _score_keywords(news_dict: dict) -> dict:
         return dict(_KW_NONE_RESULT)
 
 
+_EARN_NONE_RESULT = {'FineClass': None, 'EarningScore': None, 'EarnBreakdown': None}
+
+
+def _classify_and_score_earnings(news_dict: dict, primary_symbol: str) -> dict:
+    """Catalyst class for every PR + the earnings rule score for the ones that are
+    Earnings_Results. Runs once per article on the earnscore worker. Never raises:
+    any error returns the all-None dict, which simply makes the earnings leg false
+    (the five-way AND branch is unaffected — this leg is OR-ed beside it, so a dead
+    earnings scorer costs the new trades but never blocks the old ones).
+
+    Scores EXACTLY the string that lands in the TSV Body cell
+    (clean_inline_text(body_raw)) — the same string _score_keywords sees — so an
+    offline rescore of the daily TSV reproduces the live EarningScore. That is the
+    live == backtest invariant; never pass the raw payload or a differently-cleaned
+    body.
+
+    `primary_symbol` supplies the float-cap denominator for the two size-relative
+    point rules (revenue$ / profit$ vs Float x LastDailyClose). It is the article's
+    FIRST in-universe ticker: the score is computed once per ARTICLE like every other
+    model here, so on a 2-ticker PR the second ticker inherits the first's
+    denominator. Deliberate — MAX_TICKERS_PER_ARTICLE is 2 and 2-ticker PRs are rare."""
+    news_id = news_dict.get('ID')
+    try:
+        body_cell = c3.clean_inline_text(news_dict.get('body_raw') or '')
+        headline  = news_dict['Headline']
+        t0 = time.monotonic()
+
+        # Headline first, body LEAD as fallback — reproduces PrClassifier.classify_row
+        # without a shim dict (news_dict's body key is `body_raw`, not Body/body).
+        # The lead-only window matters: about-us / safe-harbor boilerplate deeper in
+        # the text is full of false triggers.
+        fine, _broad = classify_pr(headline)
+        if fine == 'Other':
+            fine, _broad = classify_pr(body_cell[:PRCLASS_BODY_LEAD_CHARS])
+
+        if fine != EARN_CLASS:
+            # ~85% of PRs — skip the extractor entirely. A non-Earnings_Results row can
+            # never fire the earnings leg, so its score would be dead weight.
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            logger.info(f"[EarnScore] id={news_id} sym={news_dict.get('Symbol')}: "
+                        f"class={fine} (not {EARN_CLASS}) — not scored, "
+                        f"in {elapsed_ms:.1f}ms")
+            return {'FineClass': fine, 'EarningScore': None, 'EarnBreakdown': None}
+
+        # Float-cap in DOLLARS — this is what earning_scorer calls `mktcap`. Mirrors
+        # its own _row_size_dollars: Float(M shares) x LastDailyClose x 1e6, falling
+        # back to MktCap($M) x 1e6. The universe columns are already in millions, so
+        # both 1e6 factors are exactly the M->units conversion. Done HERE on the pool
+        # thread, never in _on_row_built: _universe_cell takes _iti_df_lock and does a
+        # pandas mask scan, which must stay off the feed-reader thread.
+        fl  = _lookup_float(primary_symbol)
+        px  = _lookup_last_close(primary_symbol)
+        fcap = fl * px * 1e6 if (fl and px) else None
+        if not fcap:
+            mc = _lookup_mktcap(primary_symbol)
+            fcap = mc * 1e6 if mc else None
+
+        feats = earn_extract_metrics(headline, body_cell, fcap)
+        # These two hold every matched sentence of the PR verbatim — drop them before
+        # anything can log or serialize the dict.
+        feats.pop('_body_hits', None)
+        feats.pop('_head_hits', None)
+        score, breakdown = earn_score_metrics(feats, params=_earn_params)
+        score = int(score)
+        # One-lined defensively: the breakdown is a space-joined token string like
+        # "revG:+3(60%) rec:+1 prof/fcap:+1(0.34)", but it lands in a TSV cell.
+        breakdown = ' '.join(str(breakdown).split())
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(f"[EarnScore] id={news_id} sym={news_dict.get('Symbol')}: "
+                    f"class={fine} EarningScore={score} "
+                    f"(fcap={'None' if fcap is None else f'{fcap:.3e}'} "
+                    f"via {primary_symbol}) [{breakdown}] in {elapsed_ms:.1f}ms")
+        return {
+            'FineClass':     fine,
+            'EarningScore':  score,
+            'EarnBreakdown': breakdown,
+        }
+    except Exception as exc:
+        logger.error(f"[EarnScore] id={news_id}: scorer error: {exc}", exc_info=True)
+        return dict(_EARN_NONE_RESULT)
+
+
 # ─── Trade-trigger gate ───────────────────────────────────────────────────────
 
-def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, kw_val: dict) -> tuple:
-    """STEP-1b gate, OR rule:
-        Headline leg: FinBERT positive >= SENTIMENT_POSITIVE_MIN
-                      AND FinMarBa indecisive <= FMB_INDECISIVE_MAX  (both required)
-        Keyword  leg: body combo >= COMBO_TRIGGER_MIN
-    Returns (is_ok, label) naming what fired: 'Keyword', 'FinBERT_FMB',
-    'Keyword_FinBERT_FMB' (both), or 'BAD' (neither). A None score (model error /
-    scorer timeout) makes only its own condition false — a missing positive OR
-    indecisive kills the headline leg, a missing combo kills the keyword leg; the
-    other leg can still fire, and both legs false → 'BAD'."""
+def _fmt_thr(v: float) -> str:
+    """A gate threshold for the Trigger cell: 2 dp when that round-trips exactly
+    (true for the five core cuts → 0.80 / 0.14 / 0.50 / 0.50 / 0.96, and for the
+    0.70 solo cut), otherwise %g. So FLANG_SOLO_MIN renders as 0.975 rather than a
+    misleadingly-rounded 0.97, and a retune to 0.625 renders as 0.625."""
+    s = f"{v:.2f}"
+    return s if float(s) == v else f"{v:g}"
+
+
+def _cond_token(name: str, value, threshold, ok: bool, is_floor: bool,
+                val_fmt: str = '.4f', thr_fmt: str | None = None) -> str:
+    """One `name:VERDICT(score op threshold)` token of the Trigger cell.
+
+    `ok` is passed IN rather than recomputed here — that is what makes it
+    impossible for the TSV cell to disagree with the gate that actually fired.
+    The printed operator is always the relation that is TRUE of the row: `>=`/`<=`
+    on a pass, its negation `<`/`>` on a fail. A None score (model error / future
+    timeout) renders as a bare MISSING, so a dead scorer never looks like a model
+    that merely scored low. Scores are display-rounded to 4 dp — the PASS/FAIL
+    token, not the number, is authoritative.
+
+    `val_fmt`/`thr_fmt` exist for the earnings condition alone, whose score is
+    integer POINTS, not a probability: it renders `earn:PASS(5>=4)` instead of a
+    misleading `earn:PASS(5.0000>=4.00)`. Everything else keeps the 4 dp / _fmt_thr
+    defaults."""
+    if value is None:
+        return f"{name}:MISSING"
+    op = ('>=' if ok else '<') if is_floor else ('<=' if ok else '>')
+    thr = format(threshold, thr_fmt) if thr_fmt else _fmt_thr(threshold)
+    return f"{name}:{'PASS' if ok else 'FAIL'}({format(value, val_fmt)}{op}{thr})"
+
+
+def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, flang_val: dict,
+                      kw_val: dict, earn_val: dict) -> tuple:
+    """STEP-1b gate. Since 2026-08-03 it is an OR of FOUR branches:
+
+      CORE branch — the 2026-08-01 five-way AND, every condition required, unchanged:
+        FinBERT    positive        >= SENTIMENT_POSITIVE_MIN
+        FinMarBa   indecisive      <= FMB_INDECISIVE_MAX   (the only ceiling)
+        ge15 body  model_proba     >= KW15_BODY_MIN
+        ge15 head  model_proba     >= KW15_HEAD_MIN
+        FLANG-BERT sentiment_score >= FLANG_SCORE_MIN
+
+      EARNINGS branch (2026-08-02) — three conditions, also all required:
+        PrClassifier FineClass     == EARN_CLASS ('Earnings_Results')
+        EarningScore (POINTS, int) >= EARN_SCORE_MIN
+        ge15 body  model_proba     >= KW15_BODY_MIN   ← the SAME c_body local
+
+      KwBodySolo branch (2026-08-03) — ONE condition, fires unaided:
+        ge15 body  model_proba     >= KW15_BODY_SOLO_MIN
+
+      FLANGSolo branch (2026-08-03) — ONE condition, fires unaided:
+        FLANG-BERT sentiment_score >= FLANG_SOLO_MIN
+
+        is_ok = core_and OR earnings_leg OR kwbody_solo_leg OR flang_solo_leg
+
+    Returns (is_ok, label, detail, missing_blocked).
+
+    The earnings branch exists because the core AND is structurally blind to earnings
+    PRs — its FinBERT headline score measured test AUC 0.297 there (anti-predictive):
+    winners and duds share the same headline, the numbers are in the body. On 518
+    labelled Earnings_Results rows the core AND fired 3x at 0% precision while this
+    leg fires 36x at 47.2%, with ZERO overlap. See the EARNINGS LEG comment block at
+    the top of this file for the full calibration.
+
+    The two SOLO branches re-read scores the core branch already uses, at higher cuts,
+    so they SUBSUME it wherever they hold: the five-way AND and the earnings leg are
+    only decisive for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN).
+    ⚠ Their cuts are operator-specified (2026-08-03) and, alone among the thresholds in
+    this file, are NOT backed by a corpus calibration — see the SOLO LEGS comment block.
+
+    `label` joins the fired leg names with '_' in the fixed order ('Keyword',
+    'FinBERT_FMB', 'FLANG', 'Earnings', 'KwBodySolo', 'FLANGSolo'), gated on `is_ok`,
+    NOT on a non-empty `fired` — a row can have one leg true and still not fire (e.g.
+    Keyword alone), and labelling it 'Keyword' would contradict the gate. THAT GUARD IS
+    STILL LOAD-BEARING even though the solo legs made most single-leg cases firing ones.
+    The label names exactly which legs held, so it is fully informative again; the
+    vocabulary is now much wider than the AND-era 'Keyword_FinBERT_FMB_FLANG'/'BAD'
+    pair, e.g. 'KwBodySolo', 'FLANG_FLANGSolo', 'Keyword_KwBodySolo', 'Earnings',
+    'Keyword_FinBERT_FMB_FLANG_KwBodySolo_FLANGSolo'. Two implications constrain it:
+    KW15_BODY_SOLO_MIN > KW15_BODY_MIN, so 'KwBodySolo' always implies c_body (hence
+    'Keyword' too whenever kw15_head passes); and FLANG_SOLO_MIN > FLANG_SCORE_MIN, so
+    'FLANGSolo' can NEVER appear without 'FLANG'.
+
+    `missing_blocked` is the dead-model alarm: True when this row did NOT fire and the
+    only thing standing between it and a fire was a None score — every evaluable CORE
+    condition passed but a model/future returned nothing, OR a scored-eligible earnings
+    PR (class + kw15_body OK) has a None EarningScore, OR — since 2026-08-03 — kw15_body
+    or FLANG is None at all, because a solo branch has exactly ONE condition and a
+    missing score is therefore the whole of what blocked it. The caller logs it at
+    WARNING. That third term makes the alarm markedly louder by design: with four
+    branches a dead model no longer halts trading, so it is even less visible in the
+    fire count, while each of those two scores now backs a branch that trades unaided.
+
+    `detail` is the TSV `Trigger` cell (added 2026-07-29): the YES/NO verdict plus a
+    PASS/FAIL/MISSING token per CONDITION, so a row shows WHICH one failed and by how
+    much. It grew by appending only — the five core tokens keep their position and
+    order, `earn`/`class` were appended 2026-08-02 and the two solo tokens 2026-08-03 —
+    so a parser written for the 5- or 7-token format still works. Nine tokens now:
+        YES | FinBERT:PASS(0.8231>=0.80) FMB:PASS(0.0512<=0.14) \
+kw15_body:PASS(0.7300>=0.50) kw15_head:FAIL(0.4412<0.50) FLANG:FAIL(0.6210<0.96) \
+earn:NA class:Product_Update kw15_body_solo:PASS(0.7300>=0.70) \
+FLANG_solo:FAIL(0.6210<0.975)
+    The two solo tokens deliberately REPRINT the kw15_body and FLANG scores against
+    their own cuts, so the row records both thresholds it was judged against and stays
+    self-describing across a retune of either.
+    `earn` is the one token in POINTS, not a probability, and the one with a fourth
+    verdict: `earn:NA` on a row whose class is known and simply isn't Earnings_Results
+    (deliberately not scored — the common case), leaving `earn:MISSING` to mean what
+    MISSING means everywhere else, a score that should exist and doesn't.
+    All outputs come from the SAME per-condition booleans below, so the cell can never
+    disagree with the gate.
+
+    ⚠ The gate was an OR-of-three-legs through 2026-07-31, a pure AND on 2026-08-01, a
+    two-branch OR from 2026-08-02 and this four-branch OR from 2026-08-03; 'Keyword'
+    means a DIFFERENT rule before/after 2026-07-28, and the FLANG labels only exist from
+    2026-07-29 — see the gate comment blocks near the top of this file before comparing
+    historical TSVs. The TSV header does NOT distinguish the 08-02 and 08-03 builds
+    (still 42 cols); the Trigger cell's token count (7 vs 9) does."""
     positive   = finbert_val.get('positive')
     indecisive = finmarba_val.get('indecisive')
-    combo      = kw_val.get('model_proba_PLUS_kw_mult_nb')
-    headline_leg = (positive   is not None and positive   >= SENTIMENT_POSITIVE_MIN
-                    and indecisive is not None and indecisive <= FMB_INDECISIVE_MAX)
-    keyword_leg  = combo      is not None and combo      >= COMBO_TRIGGER_MIN
-    if headline_leg and keyword_leg:
-        return True, 'Keyword_FinBERT_FMB'
-    if headline_leg:
-        return True, 'FinBERT_FMB'
-    if keyword_leg:
-        return True, 'Keyword'
-    return False, 'BAD'
+    kw_body    = kw_val.get('kw15_body_proba')
+    kw_head    = kw_val.get('kw15_head_proba')
+    flang      = flang_val.get('sentiment_score')
+    fine_class = earn_val.get('FineClass')
+    earn_score = earn_val.get('EarningScore')
+    # Per-CONDITION verdicts, computed once and used for the gate, the legs AND the
+    # Trigger cell — so none of the three can drift from the others.
+    c_fin   = positive   is not None and positive   >= SENTIMENT_POSITIVE_MIN
+    c_fmb   = indecisive is not None and indecisive <= FMB_INDECISIVE_MAX
+    c_body  = kw_body    is not None and kw_body    >= KW15_BODY_MIN
+    c_head  = kw_head    is not None and kw_head    >= KW15_HEAD_MIN
+    c_fla   = flang      is not None and flang      >= FLANG_SCORE_MIN
+    c_class = fine_class == EARN_CLASS
+    c_earn  = earn_score is not None and earn_score >= EARN_SCORE_MIN
+    # 2026-08-03 solo cuts — the SAME two scores as c_body/c_fla, read at higher floors.
+    c_body_solo = kw_body is not None and kw_body >= KW15_BODY_SOLO_MIN
+    c_fla_solo  = flang   is not None and flang   >= FLANG_SOLO_MIN
+    headline_leg = c_fin  and c_fmb
+    keyword_leg  = c_body and c_head
+    flang_leg    = c_fla
+    # NOTE c_body is SHARED with keyword_leg — one condition, one local, two branches.
+    earnings_leg = c_class and c_earn and c_body
+    # The two 2026-08-03 solo branches: one condition each, each fires on its own.
+    kwbody_solo_leg = c_body_solo
+    flang_solo_leg  = c_fla_solo
+    # Appended, never reordered — every pre-existing label keeps its prefix and order.
+    fired = [name for name, ok in (('Keyword',     keyword_leg),
+                                   ('FinBERT_FMB', headline_leg),
+                                   ('FLANG',       flang_leg),
+                                   ('Earnings',    earnings_leg),
+                                   ('KwBodySolo',  kwbody_solo_leg),
+                                   ('FLANGSolo',   flang_solo_leg)) if ok]
+    # Core AND (2026-08-01). Equivalent to `headline_leg and keyword_leg and flang_leg`
+    # — each leg is itself an AND — but spelled over the five conditions because that
+    # is the rule as calibrated.
+    core_and = c_fin and c_fmb and c_body and c_head and c_fla
+    # The OR over all four branches — 2026-08-02 added earnings, 2026-08-03 the two solo
+    # legs. Every branch is added BESIDE the core AND, never inside it, so anything that
+    # fired under an earlier build still fires under this one.
+    is_ok = core_and or earnings_leg or kwbody_solo_leg or flang_solo_leg
+    # A None score is the ONLY thing blocking this row: every condition that could be
+    # evaluated passed, but at least one model/future gave nothing back. One term per
+    # branch; `not is_ok` because a row another branch already traded has nothing blocked.
+    _vals  = (positive, indecisive, kw_body, kw_head, flang)
+    _conds = (c_fin, c_fmb, c_body, c_head, c_fla)
+    core_missing = (any(v is None for v in _vals)
+                    and all(c for c, v in zip(_conds, _vals) if v is not None))
+    # Earnings twin: a known-Earnings_Results row whose kw15_body passed but whose
+    # EarningScore came back None — the earnings scorer is dead, not the news quiet.
+    earn_missing = c_class and c_body and earn_score is None
+    # Solo twin. A solo branch is a SINGLE condition, so "every evaluable condition
+    # passed" degenerates to "the one score is missing" — which makes this term much
+    # louder than the other two: a dead kw or FLANG scorer now WARNs on EVERY row rather
+    # than only on rows where four other models happened to agree. That volume IS the
+    # signal; each of those scores now backs a branch that can trade unaided, so losing
+    # one silently removes a whole branch while the tape still looks alive.
+    solo_missing = (kw_body is None) or (flang is None)
+    missing_blocked = (not is_ok) and (core_missing or earn_missing or solo_missing)
+    # is_floor=False for FMB alone — `indecisive` is a CEILING, the only <= condition.
+    detail = ' '.join(
+        _cond_token(name, value, threshold, ok, is_floor)
+        for name, value, threshold, ok, is_floor in (
+            ('FinBERT',   positive,   SENTIMENT_POSITIVE_MIN, c_fin,  True),
+            ('FMB',       indecisive, FMB_INDECISIVE_MAX,     c_fmb,  False),
+            ('kw15_body', kw_body,    KW15_BODY_MIN,          c_body, True),
+            ('kw15_head', kw_head,    KW15_HEAD_MIN,          c_head, True),
+            ('FLANG',     flang,      FLANG_SCORE_MIN,        c_fla,  True)))
+    # `earn` prints as integer POINTS ('5>=4'), hence the format overrides. NA rather
+    # than MISSING when the class is known and simply isn't Earnings_Results: the
+    # scorer was deliberately skipped, not broken. That distinction is the whole point
+    # of the token — ~85% of rows are non-earnings, and MISSING on all of them would
+    # drown out the one row where the scorer actually died. MISSING is therefore left
+    # to mean exactly what it means everywhere else: the score should exist and does
+    # not (an Earnings_Results row that failed to score, or a dead worker whose
+    # FineClass is None too).
+    if earn_score is None and fine_class is not None and not c_class:
+        detail += ' earn:NA'
+    else:
+        detail += ' ' + _cond_token('earn', earn_score, EARN_SCORE_MIN, c_earn, True,
+                                    val_fmt='d', thr_fmt='d')
+    # The class is categorical, not a threshold comparison, so it gets a plain token
+    # rather than a PASS/FAIL one — it doubles as the FineClass record in the log line.
+    detail += f" class:{fine_class if fine_class else 'MISSING'}"
+    # The two 2026-08-03 solo cuts, APPENDED for the same reason `earn`/`class` were: the
+    # seven tokens before them keep their position, so a 5- or 7-token parser still works.
+    # They print the SAME two scores as the kw15_body / FLANG tokens above against a
+    # DIFFERENT threshold, which is the point — the row records both cuts it was judged
+    # against, and stays self-describing when either is retuned. Plain probabilities and
+    # floors, so no format overrides; _fmt_thr renders 0.975 as 0.975, not 0.97.
+    detail += ' ' + _cond_token('kw15_body_solo', kw_body, KW15_BODY_SOLO_MIN,
+                                c_body_solo, True)
+    detail += ' ' + _cond_token('FLANG_solo', flang, FLANG_SOLO_MIN, c_fla_solo, True)
+    # `fired` alone is NOT the condition here: a row can still have a leg true and not
+    # fire, and labelling it after that leg would contradict the gate. The 2026-08-03
+    # solo branches NARROWED this window but did not close it — e.g. kw15_body 0.55
+    # (Keyword true with kw15_head, below the 0.70 solo cut), FLANG under 0.96, not an
+    # earnings PR: `fired` reads ['Keyword'] and the gate says BAD.
+    label = '_'.join(fired) if is_ok else 'BAD'
+    return is_ok, label, f"{'YES' if is_ok else 'NO'} | {detail}", missing_blocked
 
 
 # ─── Clerk senders (TCP/JSON to clerk-1.1.py) ────────────────────────────────
@@ -435,8 +1000,35 @@ _TSV_COLUMNS = [
     'positive', 'negative', 'neutral', 'sentiment_score', 'label',
     'FMB_time',
     'FMB_positive', 'FMB_indecisive', 'FMB_negative', 'FMB_sentiment_score', 'FMB_label',
+    # FLANG-BERT block (2026-07-29). Only FLANG_sentiment_score feeds the gate; the
+    # rest are for offline re-analysis. These map 1:1 onto the offline FLANG-BERT_*
+    # columns emitted by tools/Encoder_Models/HeadScore11encoders.py.
+    # FLANG_time = completion timestamp (FMB_time convention); FLANG_ms = the
+    # model's own inference_ms duration.
+    'FLANG_time',
+    'FLANG_positive', 'FLANG_neutral', 'FLANG_negative', 'FLANG_sentiment_score',
+    'FLANG_label', 'FLANG_ms',
     'ClerkSentiment',
-    'model_proba_PLUS_kw_mult_nb', 'KwScoreCompletedAt',
+    'kw15_body_proba', 'kw15_head_proba', 'KwScoreCompletedAt',
+    # Trigger (2026-07-29) — the gate's own account of itself: YES/NO plus a
+    # PASS/FAIL/MISSING token per condition with the score and the threshold it was
+    # compared against. Built by _evaluate_trigger from the same booleans the gate
+    # fires on. NOT a duplicate of ClerkSentiment: that one records the fired LEGS
+    # and is overwritten with 'skipped:*' when the ticker was never armed, whereas
+    # Trigger is populated on EVERY row (the gate runs before the arm branch), and
+    # it resolves a leg into its underlying models. Appended LAST on purpose —
+    # every pre-existing column keeps its index. Its TOKEN COUNT is also the only
+    # thing that distinguishes the 08-02 build (7) from the 08-03 one (9), since the
+    # solo branches added no columns and so leave this header identical.
+    'Trigger',
+    # Earnings block (2026-08-02) — appended LAST for the same reason. FineClass is the
+    # PrClassifier catalyst class, written on EVERY row. EarningScore (integer POINTS,
+    # not a probability) and EarnBreakdown are populated ONLY on Earnings_Results rows:
+    # the scorer is skipped elsewhere, so those two cells are blank for ~85% of rows —
+    # blank means "not an earnings PR", not "scored 0". EarnBreakdown names the rule
+    # families that fired with their values ("revG:+3(60%) rec:+1 prof/fcap:+1(0.34)"),
+    # which is what makes an EarningScore auditable without the 25 earn_* feature cols.
+    'FineClass', 'EarningScore', 'EarnBreakdown',
 ]
 
 
@@ -623,18 +1215,21 @@ def _iti_reload_worker(stop_event: threading.Event) -> None:
 # ─── Per-ticker collector — runs on collect_worker thread ────────────────────
 
 def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
-                     f_finbert, f_finmarba, f_kw, f_arm, arm_blocked: bool) -> None:
-    """Resolve the two headline models (FinBERT + FinMarBa) and the keyword/combo
-    body score, evaluate the OR trade gate, complete the clerk handshake (wait for
-    the STEP-1a arm reply, then send the STEP-1b sentiment), and write the TSV row.
+                     f_finbert, f_finmarba, f_flang, f_kw, f_earn, f_arm,
+                     arm_blocked: bool) -> None:
+    """Resolve the three headline models (FinBERT + FinMarBa + FLANG-BERT), the
+    keyword body/headline scores and the PR class + earnings score, evaluate the trade
+    gate, complete the clerk handshake (wait for the STEP-1a arm reply, then send the
+    STEP-1b sentiment), and write the TSV row.
 
     Ordering is load-bearing: we wait on the arm future *before* sending sentiment
     so the clerk has registered the session — required both for the OK gate and for
-    the BAD early-release to land. The kw future is resolved BEFORE the arm wait
-    (adds only ms; the arm reply wait already dominates), with a hard
-    KW_SCORE_WAIT_SEC ceiling so a hung scorer can't stall the trade decision. The
-    two headline futures were submitted together in _on_row_built and run in
-    parallel, so resolving them back-to-back here costs ~max(model), not the sum."""
+    the BAD early-release to land. The FLANG, kw and earnings futures are resolved
+    BEFORE the arm wait (adds only ms; the arm reply wait already dominates), each
+    with a hard ceiling (FLANG_SCORE_WAIT_SEC / KW_SCORE_WAIT_SEC /
+    EARN_SCORE_WAIT_SEC) so a hung model can't stall the trade decision. All the
+    scoring futures were submitted together in _on_row_built and run in parallel, so
+    resolving them back-to-back here costs ~max(model), not the sum."""
     news_id = news_dict['ID']
 
     # 1a) Headline FinBERT
@@ -655,6 +1250,16 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         finmarba_val = {}
         fmb_completed_at = None
 
+    # 1c) Headline FLANG-BERT (ran in parallel with both; supplies the standalone
+    #     `sentiment_score` leg). A failure leaves {} → its leg is simply false.
+    try:
+        flang_val = f_flang.result(timeout=FLANG_SCORE_WAIT_SEC)
+        flang_completed_at = c3.format_millis_time(c3.now_fixed())
+    except Exception as exc:
+        logger.error(f"FLANG-headliner error for id={news_id}: {exc}", exc_info=True)
+        flang_val = {}
+        flang_completed_at = None
+
     # 2) Keyword/combo body score (~ms; both fan-out tickers share the future)
     try:
         kw_val = f_kw.result(timeout=KW_SCORE_WAIT_SEC)
@@ -662,8 +1267,31 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         logger.error(f"[KwScore] {symbol}: kw future failed/timed out for id={news_id}: {exc}")
         kw_val = dict(_KW_NONE_RESULT)
 
-    # 3) OR trade gate → decision + trigger label
-    is_ok, trigger_label = _evaluate_trigger(finbert_val, finmarba_val, kw_val)
+    # 2b) PR class + earnings score (~ms; both fan-out tickers share the future).
+    #     A failure leaves the all-None dict → the earnings leg is simply false, and
+    #     the core AND branch is unaffected.
+    try:
+        earn_val = f_earn.result(timeout=EARN_SCORE_WAIT_SEC)
+    except Exception as exc:
+        logger.error(f"[EarnScore] {symbol}: earn future failed/timed out for id={news_id}: {exc}")
+        earn_val = dict(_EARN_NONE_RESULT)
+
+    # 3) Trade gate (core five-way AND OR earnings leg) → decision + label + Trigger cell
+    is_ok, trigger_label, trigger_detail, missing_blocked = _evaluate_trigger(
+        finbert_val, finmarba_val, flang_val, kw_val, earn_val)
+    # Log every gate input against its threshold, so a rejection can be diagnosed from
+    # the log alone. This is the SAME string that lands in the TSV Trigger cell, so the
+    # log can never drift from the row.
+    if not is_ok:
+        logger.info("[Gate] %s %s", symbol, trigger_detail)
+        # A single dead model can block a branch while looking exactly like a quiet
+        # news day — and the OR makes that quieter still, since the other branch keeps
+        # trading. Escalate the case where a MISSING score is the only thing that
+        # stopped this row, so logs/ shows a broken scorer instead of silence.
+        if missing_blocked:
+            logger.warning("[Gate] %s BLOCKED BY MISSING SCORE ONLY — a branch's "
+                           "every evaluable condition passed; a model or future is "
+                           "dead: %s", symbol, trigger_detail)
 
     # 4) Build the row. Created/Arrival*/Author/Exchange are pass-throughs from
     #    the reception (all stamped on the connector's fixed UTC-4 clock). The
@@ -699,14 +1327,35 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         'FMB_negative':         finmarba_val.get('negative'),
         'FMB_sentiment_score':  finmarba_val.get('sentiment_score'),
         'FMB_label':            finmarba_val.get('label'),
-        'model_proba_PLUS_kw_mult_nb': kw_val.get('model_proba_PLUS_kw_mult_nb'),
+        'FLANG_time':             flang_completed_at,
+        'FLANG_positive':         flang_val.get('positive'),
+        'FLANG_neutral':          flang_val.get('neutral'),
+        'FLANG_negative':         flang_val.get('negative'),
+        'FLANG_sentiment_score':  flang_val.get('sentiment_score'),
+        'FLANG_label':            flang_val.get('label'),
+        'FLANG_ms':               flang_val.get('inference_ms'),
+        'kw15_body_proba': kw_val.get('kw15_body_proba'),
+        'kw15_head_proba': kw_val.get('kw15_head_proba'),
         'KwScoreCompletedAt':          kw_val.get('KwScoreCompletedAt'),
+        # Set here, not in the clerk branches below: the gate verdict is recorded on
+        # every row even when the ticker is never armed.
+        'Trigger':                     trigger_detail,
+        # FineClass on every row; the other two only on Earnings_Results rows (blank
+        # elsewhere = not scored, NOT scored-zero).
+        'FineClass':                   earn_val.get('FineClass'),
+        'EarningScore':                earn_val.get('EarningScore'),
+        'EarnBreakdown':               earn_val.get('EarnBreakdown'),
     }
 
     # 5) Clerk STEP-1b — resolve the arm, then confirm sentiment. f_arm is None when
     #    the ticker was never armed (excluded headline, or not in the universe).
     #    ClerkSentiment encodes BOTH the trigger and the clerk reply:
-    #      armed        → "<Keyword|FinBERT|Keyword_FinBERT|BAD>:<reply status>"
+    #      armed        → "<fired legs joined by '_', or BAD>:<reply status>", e.g.
+    #                     "Keyword_FinBERT_FMB_FLANG:sent" (core branch), "Earnings:sent",
+    #                     "KwBodySolo:sent", "FLANG_FLANGSolo:sent", "BAD:sent". The
+    #                     2026-08-01 AND made this degenerate (two values); the 08-02
+    #                     earnings branch and the 08-03 solo branches made it informative
+    #                     again — the label names exactly which legs held.
     #      arm rejected → "skipped:arm_rejected"
     #      never armed  → "skipped:excluded_string" / "skipped:not_armed"
     #    (arm accept/reject detail stays in the log via _arm_clerk).
@@ -767,9 +1416,21 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
     print(f"  FMB_negative                 : {completed_dict['FMB_negative']}")
     print(f"  FMB_label                    : {completed_dict['FMB_label']}")
     print(f"  FMB_time                     : {completed_dict['FMB_time']}")
-    print(f"  model_proba_PLUS_kw_mult_nb  : {completed_dict['model_proba_PLUS_kw_mult_nb']}")
+    print(f"  FLANG_sentiment_score        : {completed_dict['FLANG_sentiment_score']}")
+    print(f"  FLANG_positive               : {completed_dict['FLANG_positive']}")
+    print(f"  FLANG_negative               : {completed_dict['FLANG_negative']}")
+    print(f"  FLANG_neutral                : {completed_dict['FLANG_neutral']}")
+    print(f"  FLANG_label                  : {completed_dict['FLANG_label']}")
+    print(f"  FLANG_ms                     : {completed_dict['FLANG_ms']}")
+    print(f"  FLANG_time                   : {completed_dict['FLANG_time']}")
+    print(f"  kw15_body_proba             : {completed_dict['kw15_body_proba']}")
+    print(f"  kw15_head_proba             : {completed_dict['kw15_head_proba']}")
     print(f"  KwScoreCompletedAt           : {completed_dict['KwScoreCompletedAt']}")
-    print(f"  Trigger                      : {trigger_label}")
+    print(f"  FineClass                    : {completed_dict['FineClass']}")
+    print(f"  EarningScore                 : {completed_dict['EarningScore']}")
+    print(f"  EarnBreakdown                : {completed_dict['EarnBreakdown']}")
+    print(f"  Trigger                      : {completed_dict['Trigger']}")
+    print(f"  Trigger legs                 : {trigger_label}")
     print(f"  ClerkSentiment               : {completed_dict['ClerkSentiment']}")
     print(f"{'='*60}\n")
 
@@ -889,13 +1550,26 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
             if symbol in _inscope_set:
                 f_arm[symbol] = _clerk_executor.submit(_arm_clerk, symbol)
 
-    # FinBERT + FinMarBa headliners + keyword/combo scorer run once per article
-    # (shared futures — all three are text-only and identical for both tickers).
-    # The two headline models are submitted together to their separate pools so
-    # they execute simultaneously (ONNX inference releases the GIL).
+    # FinBERT + FinMarBa + FLANG-BERT headliners + keyword scorer + PR class/earnings
+    # scorer run once per article (shared futures — all five are text-only and
+    # identical for both tickers). The three headline models are submitted together to
+    # their separate pools so they execute simultaneously (ONNX inference releases the
+    # GIL); the two regex/sklearn scorers hold it, so they interleave rather than
+    # overlap — the win is that everything starts at reception and runs under the
+    # (much longer) clerk-arm round-trip.
+    #
+    # The earnings scorer is the one model that needs a SYMBOL: its two size-relative
+    # point rules divide by float-cap. It gets the article's first in-universe ticker
+    # and is still scored once per ARTICLE, so a 2-ticker PR's second ticker inherits
+    # that denominator (MAX_TICKERS_PER_ARTICLE is 2; such PRs are rare). The lookup
+    # itself happens on the pool thread, not here — this one must stay lean.
+    primary_symbol = next((s for s in tickers if s in _inscope_set), tickers[0])
     f_finbert  = _finbert_executor.submit(analyze_finbert, news_dict)
     f_finmarba = _finmarba_executor.submit(analyze_finmarba, news_dict)
+    f_flang    = _flang_executor.submit(analyze_flang, news_dict)
     f_kw       = _kw_executor.submit(_score_keywords, news_dict)
+    f_earn     = _earn_executor.submit(_classify_and_score_earnings,
+                                       news_dict, primary_symbol)
 
     # Fan out a TSV row only for in-universe tickers. Out-of-universe partners are
     # never armed and would leave a near-empty audit row — skip them (still recorded
@@ -913,7 +1587,8 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
     for symbol in row_tickers:
         _collect_executor.submit(
             _collect_and_log, news_dict, tickers, symbol,
-            f_finbert, f_finmarba, f_kw, f_arm.get(symbol), arm_blocked,
+            f_finbert, f_finmarba, f_flang, f_kw, f_earn, f_arm.get(symbol),
+            arm_blocked,
         )
 
 
@@ -1024,13 +1699,13 @@ def _run_feed_client() -> None:
 
 def main():
     global _inscope_set, _nw_excluded_strings, _excluded_strings, _last_iti_reload_date
-    global _kw_scorer
+    global _kw15_body_pipe, _kw15_head_pipe, _earn_params
     logger.info("Orchestrator5.2 starting...")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Pre-warm BOTH headline models + a smoke inference each so the first real PR
-    # pays no session/tokenizer init or first-call kernel-JIT cost on either model.
+    # Pre-warm ALL THREE headline models + a smoke inference each so the first real
+    # PR pays no session/tokenizer init or first-call kernel-JIT cost on any model.
     logger.info("Pre-loading FinBERT-headliner model...")
     load_finbert_model()
     analyze_headline("startup self-check")          # warm ORT kernels
@@ -1041,19 +1716,77 @@ def main():
     score_finmarba_headline("startup self-check")   # warm ORT kernels
     logger.info("FinMarBa-headliner model ready.")
 
-    # Keyword/combo scorer: load the frozen ge15 artifacts (~1 s, prints its own
-    # "KeywordScorer: ... | combo=yes" line) and HARD-FAIL if the combo weights
-    # JSON didn't load — KeywordScorer.load only prints a note and score_text
-    # then silently lacks the combo key; a trading process must refuse to start
-    # rather than trade on None. The smoke call also pre-warms sklearn so the
-    # first real PR pays no first-call overhead.
-    logger.info("Pre-loading keyword/combo scorer...")
-    _kw_scorer = kw2.get_default_scorer()
-    smoke = _kw_scorer.score_text("startup self-check", headline="")
-    if "model_proba_PLUS_kw_mult_nb" not in smoke:
-        raise RuntimeError("combo score missing — DEFAULT_COMBO_MODEL JSON not "
-                           "found/loaded; refusing to start")
-    logger.info("Keyword/combo scorer ready.")
+    logger.info("Pre-loading FLANG-BERT-headliner model...")
+    load_flang_model()
+    score_flang_headline("startup self-check")      # warm ORT kernels
+    logger.info("FLANG-BERT-headliner model ready.")
+
+    # Keyword leg: load the two corrected-label ge15 pipelines and HARD-FAIL on
+    # any problem. joblib.load raises on a missing/corrupt file, and the smoke
+    # inferences below catch a pipeline that loads but cannot score — a trading
+    # process must refuse to start rather than run with a permanently-None
+    # keyword leg, which would silently degrade the gate to FinBERT/FMB only.
+    # The smoke calls also pre-warm sklearn so the first real PR pays no
+    # first-call overhead.
+    logger.info("Pre-loading ge15 keyword pipelines (body + headline)...")
+    _kw15_body_pipe = joblib.load(KW15_BODY_PIPELINE)
+    _kw15_head_pipe = joblib.load(KW15_HEAD_PIPELINE)
+    _smoke_body = _kw15_body_pipe.predict_proba(
+        [_kw15_prep("startup self-check", KW15_BODY_MAX_WORDS)])[0][1]
+    _smoke_head = _kw15_head_pipe.predict_proba(
+        [_kw15_prep("startup self-check", None)])[0][1]
+    for _name, _v in (("body", _smoke_body), ("headline", _smoke_head)):
+        if not (0.0 <= float(_v) <= 1.0):
+            raise RuntimeError(f"ge15 {_name} pipeline returned {_v!r}, not a "
+                               "probability; refusing to start")
+    logger.info("ge15 keyword pipelines ready (smoke: body=%.6f head=%.6f; "
+                "core branch needs body>=%s AND head>=%s, and body>=%s fires alone).",
+                _smoke_body, _smoke_head, _fmt_thr(KW15_BODY_MIN),
+                _fmt_thr(KW15_HEAD_MIN), _fmt_thr(KW15_BODY_SOLO_MIN))
+
+    # Earnings leg: load the calibrated score params ONCE (never in the hot path — the
+    # default path re-reads the JSON per call) and HARD-FAIL on any problem. Same
+    # reasoning as the keyword leg: this leg can fire trades on its own, so a
+    # classifier that silently stopped recognising Earnings_Results, or a scorer that
+    # returned something other than points, must stop the process rather than quietly
+    # remove a whole trade branch. The smoke calls also warm the regex caches.
+    logger.info("Pre-loading PR classifier + earnings scorer...")
+    _earn_params = earn_load_params()
+    _smoke_hl = "Acme Corp Reports Second Quarter 2026 Financial Results"
+    _smoke_body_txt = ("Revenue grew 60% year-over-year to $24.3 million. "
+                       "The company reported record quarterly revenue.")
+    _smoke_class, _ = classify_pr(_smoke_hl)
+    if _smoke_class != EARN_CLASS:
+        raise RuntimeError(f"PrClassifier returned {_smoke_class!r} for a canonical "
+                           f"earnings headline, expected {EARN_CLASS!r}; refusing to start")
+    _smoke_feats = earn_extract_metrics(_smoke_hl, _smoke_body_txt, None)
+    _smoke_feats.pop('_body_hits', None)
+    _smoke_feats.pop('_head_hits', None)
+    _smoke_score, _smoke_brk = earn_score_metrics(_smoke_feats, params=_earn_params)
+    if not isinstance(_smoke_score, int) or _smoke_score < 1:
+        raise RuntimeError(f"earning_scorer returned {_smoke_score!r} on a PR with "
+                           "explicit revenue growth; expected a positive int score — "
+                           "refusing to start")
+    logger.info("PR classifier + earnings scorer ready (smoke: class=%s score=%d [%s]; "
+                "leg needs FineClass==%s AND EarningScore>=%d AND kw15_body>=%s).",
+                _smoke_class, _smoke_score, _smoke_brk, EARN_CLASS, EARN_SCORE_MIN,
+                _fmt_thr(KW15_BODY_MIN))
+
+    # Echo the WHOLE gate once, every branch with the thresholds actually in force. The
+    # constants are module-level and read at import, so a process that was started before
+    # a retune keeps the OLD gate until it is restarted — and nothing else in the log
+    # says which one is live (the TSV header is identical across the 08-02 and 08-03
+    # builds). This line is the cheapest way to answer "which gate is this process
+    # running?" from logs/ alone.
+    logger.info("[Gate] ACTIVE — OR of 4 branches: "
+                "(1) CORE FinBERT>=%s AND FMB<=%s AND kw15_body>=%s AND kw15_head>=%s "
+                "AND FLANG>=%s | (2) EARNINGS class==%s AND earn>=%d AND kw15_body>=%s | "
+                "(3) KwBodySolo kw15_body>=%s | (4) FLANGSolo FLANG>=%s",
+                _fmt_thr(SENTIMENT_POSITIVE_MIN), _fmt_thr(FMB_INDECISIVE_MAX),
+                _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_HEAD_MIN),
+                _fmt_thr(FLANG_SCORE_MIN), EARN_CLASS, EARN_SCORE_MIN,
+                _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_BODY_SOLO_MIN),
+                _fmt_thr(FLANG_SOLO_MIN))
 
     # Load the universe (plain membership — no float filter). _iti_df also backs the
     # Float/MktCap/Exchange/close/ITI/tradeSize lookups for the TSV + clerk arm. The
@@ -1098,7 +1831,9 @@ def main():
         _clerk_executor.shutdown(wait=True)
         _finbert_executor.shutdown(wait=True)
         _finmarba_executor.shutdown(wait=True)
+        _flang_executor.shutdown(wait=True)
         _kw_executor.shutdown(wait=True)
+        _earn_executor.shutdown(wait=True)
         _collect_executor.shutdown(wait=True)
         logger.info("Orchestrator5.2 stopped.")
 

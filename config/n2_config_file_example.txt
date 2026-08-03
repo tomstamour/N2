@@ -28,6 +28,11 @@ IBKR_GATEWAY_HOST:
 IBKR_GATEWAY_PORT:
 4001
 
+# ChartExchange v1 API key (https://chartexchange.com/pricing/?hl=API). Used by
+# tools/fmp_hist_fetch/ChartExchangeFetch.py. Sent as the querystring 'api_key'.
+CHARTEXCHANGE_API_KEY:
+my-chartexchange-api-key
+
 # Clerk TCP/JSON listener — the channel Orchestrator4.0 uses to arm the clerk.
 CLERK_HOST:
 127.0.0.1

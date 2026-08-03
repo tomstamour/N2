@@ -12,3 +12,78 @@ fromPR_HighOfDay_addOn.py — 2026-07-06
 4. New columns: fromPR_High(%) and fromPR_HighTime(m:s) (elapsed MM:SS from Created to the high's bar, minutes unbounded, clamped at 00:00).
 5. Same scaffolding as highOfDay_addON.py (clientId 7, reconnects, 'ok'/'failure'/'skip' status, consecutive-failure HMDS abort, (symbol, created) cache). Output: <input_stem>_fromPRhigh.tsv.
 6. --timeout/-t flag (default 180s): 1-min extended-hours queries on illiquid small caps take 80-150s+ per symbol when the live stack (clerk/daily-board/scanner) shares the Gateway — run the full backfill when those are idle.
+
+fromPR_HighOfDay_addOn.py — 2026-07-26 (baseline fix)
+1. BUGFIX: the baseline was the close of the 1-min bar CONTAINING the PR, not the bar before it. The old test `start < created_dt` accepts the PR's own bar (09:00:00 < 09:00:05.467), so the denominator already priced the news in. Baseline is now the last bar ending at or before the PR minute (`start < created_dt.replace(second=0, microsecond=0)`). The high search still includes the PR's bar — that part was correct.
+2. Impact is the price move inside the PR's own minute, so the error is biased AGAINST the very reaction the metric measures: positive catalysts were understated, PRs that gapped down inside their minute were overstated. Verified 2026-07-26 on paper GW: ZCMD 2026-07-23 373.32 -> 200.49 (offering PR, -36.5% inside the PR minute); UPC 2026-06-26 371.00 -> 536.49; VIVK 2026-07-21 339.94 -> 478.18; TNMG 167.03 unchanged (no move inside its PR minute).
+3. Side effect: the `baseline is None` -> 'skip' guard can now actually fire. Previously the PR-minute bar always populated `baseline`, so rows with no genuine pre-PR price were silently scored 'ok' off a post-news denominator.
+4. Existing fromPR_High(%) values in the PRstats corpus predate this fix and are wrong; re-score by clearing the column (a plain --only-missing run will NOT touch rows that already have a value).
+
+strip_label_polluted_cols.py — 2026-07-27 (new)
+1. Drops the columns invalidated by the fromPR_High(%) baseline defect (see the 2026-07-26 fromPR_HighOfDay_addOn.py entry): the biased label itself, plus all 27 keyword-model columns (body pass + _pctl twins + _hl twins + model_proba_PLUS_kw_mult_nb) — those models were TRAINED on the biased label, so their scores carry the bias into whatever corpus they were applied to. n_kw_hits/_hl go too: they count hits against the model-SELECTED keyword list, so they are model outputs, not raw text features.
+2. Audited as NOT polluted and kept: fromPR_HighTime(m:s) (the fix changed only the denominator; the max-high bar is chosen in an untouched branch — values verified identical pre/post fix), DailyHigh(%)/($) (measured vs previous daily close, no PR-minute baseline exists), Trigger, nocoref_*, FinBERT positive/negative/neutral/sentiment_score/label, body_sentiment, boilerplate_category.
+3. Headline-RBscore is rule-based (fast_signal.py word list) and NOT polluted, but is in the default drop list by user request; --keep-rbscore retains it.
+4. --drop-cols overrides the default list; aborts without writing if any drop column is missing (guards against a silently-renamed column producing a half-cleaned file); --force to overwrite an existing output. Reads/writes with na_filter=False so blank cells stay blank instead of becoming the literal 'nan'.
+5. fromPR_status must be dropped alongside fromPR_High(%) whenever a re-score is intended: a stale 'skip' makes fromPR_HighOfDay_addOn.py --only-missing REFUSE to re-fetch that row (line 436), and the skip criterion itself changed with the baseline fix. KwScoreCompletedAt is the provenance stamp of the removed combo column and goes with it.
+6. Runs 2026-07-27 (all verified cell-by-cell against source, 0 diffs, Body/body round-trips):
+   - 01_PR-stats-...-_KeyWordScored_.tsv (2719 x 70) -> 01_PR-stats-2026-05-03to06-19-filtered-50float-12high_body_created_excStr2.tsv (2719 x 39); 31 dropped = the 29 default + DailyHigh(%)/DailyHigh($) (user: not useful).
+   - 02_PRstats_2026-06-20-2026-07-23_CoffeeFilter.tsv (814 x 43) -> ..._CoffeeFilter_clean.tsv (814 x 39); 4 dropped: fromPR_High(%), fromPR_status, model_proba_PLUS_kw_mult_nb, KwScoreCompletedAt. FMB_* (FinMarBa, externally trained) kept.
+   - 03_PRstats_2026-05-04-2026-07-16_CoffeeFilter_11EncScored_Classed_kwScored_BodyEnc.tsv (3306 x 215) -> ..._11EncScored_Classed_BodyEnc_clean.tsv (3306 x 182); 33 dropped = the 29 default + fromPR_status + KwScoreCompletedAt + DailyHigh(%)/($). ALL 100 encoder columns (30 headline-family + 70 body) and FineClass/BroadClass kept — externally trained / rule-based, and ~3h of inference that must never be regenerated needlessly.
+
+merge_scores_by_id.py — 2026-07-27 (new, statsByClaude/)
+1. Fills blank cells in a master TSV from a partial scored TSV, joined on ID. Unlike merge_body_encoder_cols.py (hardcoded to one same-length/same-order pair) this merges a SUBSET of rows, for the case where a corpus grew by appending rows that lacked the expensive score columns.
+2. Aborts without writing if: a patch column is absent from the master (--allow-new-cols to opt in), a patch ID is missing from the master or duplicated on either side, or a non-empty master cell would be overwritten (--overwrite to opt in). Master row count, row order and column order are always preserved.
+3. Used 2026-07-27 for both the encoder backfill and the fromPR propagation (see below).
+
+04 corpus assembly — 2026-07-27
+1. 03_..._BodyEnc_clean.tsv (3306 x 182) + 227 rows from 02_..._CoffeeFilter_clean.tsv -> 04_PRstats_2026-05-04-2026-07-23_..._clean.tsv (3533 x 188) via enriched_tsv_concatener.py --base/--add. Verified 0 cell diffs both blocks, 0 duplicate IDs.
+2. fromPR_High(%) re-scored from scratch on the FIXED baseline (paper GW 4002, clientId 7, 6.9h, 3518 lookups): 3434 ok / 99 skip. Corpus-wide effect vs the pre-fix values (recovered from git bacdf80, 3213 comparable rows): 50.0% unchanged, 38.0% corrected UP, 12.0% DOWN; median 4.58pp, p90 23.7pp, max 824pp. Label >=15%: 640 -> 802 positives (282 rows, 8.8%, change class); >=30%: 285 -> 383.
+3. CODX (9 rows) and BNBX (1) are PERMANENTLY unfetchable, not transient: CODX's IBKR contract is retired (conId 842556629 answers as CODX.OLD; SMART/NASDAQ/ISLAND all return 0 bars, reqMatchingSymbols shows no live USD alternative), BNBX is PINK/OTC with no HMDS data. They were booked 'failure', which made --only-missing retry them every run and trip CONSECUTIVE_FAILURE_ABORT (exit 2) — this would have failed the nightly cron. Reclassified to 'skip'. TODO: port ohlc_minute_fetch.py's ErrorWatch permanent-vs-transient 162 classification into fromPR_HighOfDay_addOn.py so this self-corrects.
+4. The 227 appended rows were backfilled with HeadScore11encoders (76s) + BodyScore11encoders (660s) + PrClassifier, then merged by ID fill-only-empty: 32234 cells filled, 0 diffs on the 3306 pre-existing rows. All 100 encoder cols + FineClass/BroadClass now 3533/3533. Alignment spot-checked against a live FinMarBa_headliner run on 4 new + 2 old rows (exact match) — confirms the join is by ID, not position.
+5. 01 corpus: corrected fromPR values PROPAGATED from 04 by ID (2712 rows, 8006 cells, 0 mismatches vs 04) rather than refetched; the 7 rows 04 does not cover were then fetched directly (6 ok, VFL unknown contract -> skip). Final 2719 x 41, 2653 ok / 66 skip. ~30s of Gateway time instead of ~5h.
+
+threshold_finder generalization + 3-column rule search — 2026-07-28
+1. threshold_finder_finbert_finmarba.py generalized: --columns "NAME>=|NAME<=", --anchors "NAME=v1,v2", --sweep-pair, --live-gate. Defaults unchanged for columns/anchors/sweep, so old invocations reproduce (verified: old-vs-new diff on the 04 corpus is title/prose only; overlapping sweep cells identical, e.g. positive>=0.5 x indec<=0.15 -> 22%/29% (550) both).
+2. CORRECTED two stale constants the script benchmarked against: it used indecisive<=0.1 and combo>=0.6, but Orchestrator5.2.py:132-134 deploys SENTIMENT_POSITIVE_MIN=0.6, FMB_INDECISIVE_MAX=0.13, COMBO_TRIGGER_MIN=0.67. The pre-existing 2026-07-21 report's live-gate row therefore compared against a gate that was never deployed. New defaults LIVE_GATE_DEFAULT / COMBO_THRESHOLD_DEFAULT match production.
+3. Section-7 "deployment verdict" prose was hardcoded assertions (true only for the original 5-column run); now DERIVED from the computed table, so a user column set cannot produce false conclusions. Focused-sweep prose likewise.
+4. Search over FLANG-BERT_sentiment_score + positive + FinMarBa_(Body_)indecisive, thresholds 15/30, both column sets -> outputs/2026-07-28_3col_threshold_{body,headline}_tp{15,30}.md. Winner (>=15%): fb>=0.95 AND positive>=0.8 AND FinMarBa_Body_indecisive<=0.08 -> 24 fires, 18 TP, 75.0%, 2.95x. AND >> OR (best OR only 1.31x). Body veto adds +28.1pp [+7.1,+42.7] over the 2-col rule; the HEADLINE veto adds nothing (40-43% vs 46.9% base at matched volume) - the channels are NOT interchangeable.
+5. NOT deployable: (a) FinMarBa_Body_indecisive is not computed by O5.2 (headliner only); (b) the edge vanishes at >=30% and reverses vs the 2-col rule in the recent block (1.39x vs 1.69x); (c) post-selection - 771 AND rules searched, so 75% is an upper bound and the Wilson [55%,88%] is pre-selection. TODO: permutation null to size the selection bias.
+6. Guard verified functional, not vacuous: consistency_verdict correctly FAILs positive>=0.8 AND indecisive<=0.1 at tp30 with block lifts [3.16x, 0.40x], reproducing the independent conditional_value finding.
+
+=== 2026-07-28 — keyword-model bake-off: which model best predicts fromPR_High(%), body vs headline ===
+1. EXTENDED tools/keyword/walkforward_eval.py (was: AUC + precision at ONE volume, no intervals):
+   --top-fracs (default 0.05,0.10,0.20,0.30) replaces --top-frac, which stays as a back-compat alias;
+   Wilson 95% CI on every precision cell; a MATCHED-VOLUME headline-vs-body block with Newcombe
+   method-10 CIs on the difference (same k both channels -> equal denominators, so Newcombe applies);
+   and an absolute-cutoff table (>=0.5..0.9) because top-k% is scale-free but undeployable.
+   wilson()/newcombe_diff() copied from statsByClaude/conditional_value.py:68-90 (3rd copy in repo).
+   Verified additive: --top-frac 0.10 reproduces the prior single-volume output.
+2. SCOPE fixed by the user: only model_trained_on_04-PRstats-2026-05-04to06-18_TRAIN/{ge15,ge15_headline,
+   ge40,ge40_headline} — the only 4 trained on the CORRECTED fromPR_High label (each
+   model_performance_summary.csv: n_train 2117 + n_test 530 = 2647, train pos rate 0.2286). The 12 dirs
+   under model_trained_on_PR-stats-2026-05-03to06-19/ learned the pre-2026-07-26 biased label or the
+   legacy DailyHigh target and were EXCLUDED. tfidf model_proba only (no binary pipeline, no kw_* methods).
+   Test set = VAL 777 rows from 2026-06-20 (all 4 trained on rows ending 06-18) — full corpus is invalid here.
+   Command: /home/tom/venv/bin/python walkforward_eval.py --val inputs/04_..._VAL_from20260620_cap400.tsv
+            --models <the 4 dirs> --thresholds 15,30,40
+3. RESULT — best model is ge15 BODY. Wins or ties every precision cell at top-10% and below, at all three
+   targets, and leads on AUC at all three (0.6990/0.7426/0.7404). Its only loss is top-5%@>=15 to
+   ge40_headline's 76.3%, which is 29/38 on a [61,87] interval — noise (see 5).
+4. ge40 CONFIRMED DEAD on precision as well as AUC: it loses to ge15 even at its own >=40% target
+   (top-10% 39.0% vs 40.3%). Spearman(ge15 body, ge40 body) = 0.813 — same ranker, a third of the
+   positives, double the CV variance. Do not train at the trade threshold.
+5. HEAD-VS-BODY IS NOT SEPARABLE: all 24 matched-volume Newcombe intervals contain zero, for both models,
+   at all 3 targets x 4 volumes. This retires the §5 caveat ("70.1% vs 67.5% is two PRs, treat as a lead
+   requiring a significance test") — the test was run and confirms neither direction. Weak residual signal:
+   for ge15, 11 of 12 signs favour body with 1 tie, agreeing with the AUC ordering; nested cells, so no
+   sign-test p is quotable. Spearman(body,headline) = 0.592 — different signals performing the same, which
+   argues for combining them rather than picking one.
+6. ge40_HEADLINE IS NOT DEPLOYABLE AT ANY CONSTANT: proba compressed by C=0.1 at 8% prevalence — 311 fires
+   at >=0.5, 13 at >=0.6, zero above. Its 100%@>=0.6 and its 76.3% top-5% cell are the same 13-PR corner.
+   Most usable high end is ge15 HEADLINE: 87 fires @>=0.7 / 63%, 28 @>=0.8 / 68%. ge15 body is more precise
+   per fire (46 @>=0.7 / 72%) but falls off a cliff to 4 fires at >=0.8.
+7. Folded into statsByClaude/July28_SentimentScore_stats_report.md as new §5.1-5.4 (§5's method league table
+   kept as-is; its closing caveat replaced by the actual test result), plus a cross-reference from §6.8.
+   §5's pre-existing figures reproduced EXACTLY from the new run (body 67.5% / head 64.9% @top-10%,
+   AUCs 0.6990/0.7426 and 0.6954/0.7139/0.7038) — confirms the text-prep path did not drift.
+8. No model promoted, no live constant changed (standing constraint).

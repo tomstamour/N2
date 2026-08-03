@@ -1,46 +1,253 @@
-# Rejected / "Inactive" entry orders — findings (last updated 2026-07-17)
+# Entry-order failure modes — findings (last updated 2026-07-27)
 
-## Summary
-On a buy-signal, x-wing places a marketable BUY LMT (ask * 1.04, outsideRth=True, GTC).
-Rarely, IBKR immediately marks it "Inactive" with filled=0 and NO error() callback / no
-reason code. x-wing's ENTRY_DEAD_STATUSES guard (x-wing-2.0.py:124, handled at :848-860)
-then aborts the run ("entry_inactive") and the clerk returns the client to the pool.
-The order was never live — this is IBKR deactivating it, not our code cancelling it.
+Two DISTINCT failure modes make a marketable BUY LMT entry come back with no
+fill. Part A is now CONFIRMED. Part B remains unexplained.
 
-## Confirmed occurrences (2 of 1822 x-wing runs)
-- CLIK  2026-07-17 07:00:03  BUY LMT 2  @ 1.9200 (ask 1.85)  -> Inactive @ +215ms
-- OFAL  2026-07-14 08:00:03  BUY LMT 30 @ 0.1633 (ask 0.157) -> Inactive @ +519ms
-- JZXN  2026-07-10 (pre-guard) marketable BUY LMT -> Inactive @ +110ms, no code
-  (the incident referenced by the code comment at x-wing-2.0.py:122)
+================================================================================
+PART A — IBKR PRICE CAP (error 2161)  ** CONFIRMED 2026-07-27, PFSA **
+================================================================================
 
-## Shared fingerprint
-- Marketable BUY LMT priced +4% ABOVE the ask (through the market)
-- Pre-market / ETH session
-- Low-priced small-cap ($1.85, $0.157)
-- Deactivated within ~100-520ms, NO error reason
-- Fired ~3s after a top-of-hour boundary that is also a pre-market session open
-  (07:00:03 and 08:00:03)
+## What it is
+IBKR does not reject an over-aggressive marketable limit; it ACCEPTS it, silently
+lowers the working price to its allowed band, reports back "Submitted", and sends
+error 2161 as a warning. The order is alive the whole time — just resting at a
+price we did not choose. Verbatim (clerk.log 2026-07-27 06:00:01.154):
 
-## Two candidate root causes (UNCONFIRMED)
-1. Pre-market price cap / precautionary check on a marketable limit set through the
-   market  -> a less-aggressive limit (at the ask, no +4%) might be accepted.
-2. Venue session had only just opened at the top-of-hour boundary and briefly rejected
-   the order  -> the same order resent ~300ms later might be accepted.
+  code=2161: BUY 2 PFSA NASDAQ.SCM @ 2.15  for U18283054  In accordance with our
+  regulatory obligations as a broker, we will initially cap (or limit) the price
+  of your Limit Order to 1.76 or a more aggressive price still within your
+  specified limit price.  If your order is not immediately executable, our
+  systems may, depending on market conditions, cap your order to a limit price
+  that is no more than the allowed amount away from the reference price at that
+  time. If this happens, you will not receive a fill. [...]
 
-## Why the exact reason is unknown
-Every Gateway API log under ~/Jts/settings-live/.../api.999.*.ibgzenc is ENCRYPTED.
-Plaintext reasons require enabling "Create API message log file" in the IB Gateway
-config (Configuration > API > Settings). Until then the exact IBKR reason is not on disk.
+This CONFIRMS candidate cause #1 in the old version of this file. No Gateway API
+message log was needed — 2161 arrives on the normal error() callback.
+NOTE: 2161 predates x-wing-2.1 (seen 07-20 and 07-22), so the Price Management
+Algo is NOT the cause. It is IBKR's standard broker price cap, applied either way.
 
-## Current handling (no auto-retry)
-x-wing-2.0.py treats Inactive/Cancelled/ApiCancelled on an unfilled entry as terminal:
-- ENTRY_DEAD_STATUSES  (line 124)
-- orderStatus abort     (lines 848-860)  -> entry_failed="entry_inactive"
-- ENTRY_REJECT_CODES    (line 118) + on_order_error (lines 883-894) for coded rejects
-- ENTRY_FILL_TIMEOUT_SEC=30 backstop (lines 959-973)
-A reprice/retry-on-Inactive was considered (delay+resend for cause #2, reprice-to-ask for
-cause #1) but NOT implemented — pending confirmation of the actual reason.
+## The PFSA incident (2026-07-27), clerk.log:508-557
+  06:00:00.708  duo armed. iti_baseline=2442.90 (~41 min between trades — a dead
+                name). lastClose=1.71.
+  06:00:00.891  Rule-F PRETRADE surge, 0.9 s into the entire session. Cumulative
+                volume 1,700 sh. last=1.81 stamped 06:00:00. Quote 1.65 x 2.05.
+  06:00:00.898  ENTRY: BUY LMT 2 PFSA @ 2.1500  (ask 2.05 x 1.05), orderId 26
+  06:00:01.154  ERROR 2161 -> capped to 1.76
+  06:00:01.159  "Submitted"  — live, but working at 1.76, ~14% under the offer
+  06:00:00-:06  quote frozen at 1.65 x 2.05
+  06:00:07-:10  ask runs 2.15 -> 2.16 -> 2.44 (now above our own 2.15 limit)
+  06:00:10.910  ENTRY_FILL_TIMEOUT_SEC=10 fires -> we cancel the resting BUY
+  06:00:11.008  Cancelled, no fill -> run aborted, logged as "entry_inactive"
 
-## Next step to confirm
-Enable the plaintext API message log in IB Gateway, then wait for the next Inactive entry
-to capture IBKR's human-readable reason before deciding on a fix.
+THE CANCEL WAS OURS. IBKR never rejected and never deactivated the order.
+
+Trades really did print around 2.25 during and after the run (verified on
+TradingView). They were simply unreachable: a buy limit working at 1.76 fills
+only against offers at or below 1.76. We were a passive bid ~20% under the market.
+
+## What sets the cap: IBKR's REFERENCE price
+Measured over all 12 caps pairable with an entry price, 2026-07-20 .. 07-27:
+
+  sym         our ref (ask/print)   IBKR cap   cap/ask   lastClose   cap/close
+  NIVF        1.2400                1.23       0.992     1.10        1.118
+  TOPS        0.8800                0.8800     1.000     0.78        1.128
+  PRFX        1.1900                1.19       1.000     1.135       1.048
+  BAOS        2.8000                2.77       0.989     2.51        1.104
+  RGNT        2.5100                2.50       0.996     2.38        1.050
+  GWH         0.9100                0.9146     1.005     0.8427      1.085
+  KAPA        0.3800                0.3742     0.985     0.358       1.045
+  WBUY        0.7986                0.7888     0.988     0.7486      1.054
+  AMIX        4.2900 (print)        4.42       1.030     3.98        1.111
+  WETO 07-27  0.0969                0.0968     0.999     0.1009      0.959
+  WETO 07-24  0.1168                0.1139     0.975     0.1144      0.996
+  PFSA        2.0500                1.76       0.859 <-- 1.71        1.029
+
+cap/ask sits in 0.975-1.030 for ELEVEN of twelve; cap/close scatters 0.96-1.13.
+=> the reference is normally the OFFER, and the cap lands essentially on it.
+
+PFSA is the lone outlier, and the reason is TIMING, not a bad quote: it fired
+0.9 s into the session, when IBKR had no tape to price a gap from. Its reference
+was still the prior close 1.71 (x1.03 = 1.7613 -> 1.76) or the 1.81 print
+(x0.97 = 1.7557 -> 1.76) — both round to the observed cap exactly. Every other
+capped fire happened deep into pre-market with a live tape, so its reference had
+already caught up to the offer.
+
+*** Rule F (pretrade staleness) is the only fire path that can trigger this
+early, so it is structurally exposed to the stale-reference cap. ***
+
+## The cap DOES release — and releasing has always cost money
+IBKR re-caps toward the moving reference, so a capped order can eventually work
+its way up to our full limit. Outcomes of all six capped orders that filled:
+
+  sym    latency   filled at                        outcome
+  TOPS   0.5 s     0.8799  (at the cap)             -12.38%
+  PRFX   0.5 s     1.1400  (below the cap)           -3.51%
+  KAPA   1.8 s     0.3727  (below the cap)           +8.99%  (peak +19.45%)
+  BAOS   7.2 s     2.9100  FULL LIMIT, cap released -13.40%
+  NIVF   9.3 s     1.3000  FULL LIMIT, cap released -11.54%
+  GWH    23.0 s    0.9464  FULL LIMIT, cap released  -9.35%
+
+All THREE cap-release fills lost 9-13%. The only winner filled in 1.8 s BELOW
+its cap, i.e. a normal immediate fill. This reproduces, on the capped population
+specifically, the finding that drove the 30->10 s timeout cut (x-wing-2.1.py:157):
+"of 27 entries that took >1s, only 3 made money; every fill past 15s lost bar one".
+
+## CONCLUSION: the cap is protective, not a bug to work around
+PFSA not filling was the system working. The cap held us out of a 10-second
+spike top on a name that trades every 41 minutes.
+
+REJECTED — an ask-chasing entry (re-price the resting limit as the ask moves,
+ceiling'd by MAX_CAP_ENTRY_PERCENT). Considered 2026-07-27, rejected because:
+  1. The cap is set relative to IBKR's reference, not to our limit. Bidding
+     2.56 instead of 2.15 still gets capped to ~1.76. Chasing cannot beat a cap.
+  2. IBKR already chases for us, bounded above by our limit — that is exactly
+     what the "FULL LIMIT, cap released" rows above are.
+  3. It manufactures the late chased-up fills that lost money 3 times out of 3.
+
+REJECTED — extending ENTRY_FILL_TIMEOUT_SEC past 10 s to let the cap ratchet.
+This is what would have "fixed" PFSA, and it is precisely what bought BAOS
+(-13.40%), NIVF (-11.54%) and GWH (-9.35%).
+
+Caveat: n=3 in the cap-release group. Small. Revisit if it grows and reverses.
+
+## Known gap in our instrumentation
+2161 is not in ENTRY_REJECT_CODES (x-wing-2.1.py:148), so x-wing's
+on_order_error (:955) drops it. Only the clerk's catch-all error() handler
+(clerk-1.1.py:340-347) logs it. Consequence: x-wing's own log, its price table,
+and the clerk's "finishing duo (xwing:entry_inactive)" line record a capped run
+with the SAME label as a genuine IBKR deactivation (Part B) — two completely
+different problems, indistinguishable in every historical grep.
+
+To identify a capped run today you must cross-reference clerk.log for a "code=2161"
+line on the same reqId. Diagnostic signature: cap/ask well below 1.0 means a stale
+early-session reference; cap/ask ~= 1.0 is a routine cap that usually fills fast.
+
+Open idea (NOT implemented): abort immediately when cap/ask is far below 1.0, so
+the run frees its pooled clerk client instead of resting 10 s at an unfillable
+price. On the evidence above this forgoes nothing.
+
+================================================================================
+PART B — SILENT "Inactive" ENTRY  ** STILL UNEXPLAINED **
+================================================================================
+
+Distinct from Part A: here IBKR immediately marks the entry "Inactive" with
+filled=0 and NO error() callback and no reason code. No 2161, no 202, nothing.
+x-wing's ENTRY_DEAD_STATUSES guard (x-wing-2.1.py:154, handled in
+on_order_status :928-941) aborts the run ("entry_inactive"). The order was never
+live — this is IBKR deactivating it, not our code cancelling it.
+
+## Confirmed occurrences (5 of ~1822 x-wing runs)
+Re-swept 2026-07-29 across xwing_tables/ + xwing-logs/ (match: table event
+"entry_inactive" AND log "Inactive with no fill"). The earlier list of 3 was
+incomplete — AIHS 2026-07-20 was always on disk and had been missed.
+
+  symbol  date        fire (ET)   entry                    pad     -> Inactive
+  ------  ----------  ----------  -----------------------  ------  ----------
+  JZXN    2026-07-10  (pre-guard) marketable BUY LMT       —       +110 ms
+  OFAL    2026-07-14  08:00:03.4  30 @ 0.1633 (ask 0.157)  4.00%   +519 ms
+  CLIK    2026-07-17  07:00:03.3   2 @ 1.9200 (ask 1.85)   4.00%   +215 ms
+  AIHS    2026-07-20  07:00:09.4   3 @ 1.6000 (ask 1.54)   4.00%    +97 ms
+  NCRA    2026-07-29  08:00:01.6   3 @ 1.6500 (ask 1.64)   0.40%   +427 ms
+
+NCRA detail (clerk.log:991-1075, xwing_NCRA_2026-07-29_08-00-00.log): armed on
+client 1018 08:00:00.913; Rule-F pretrade surge 08:00:01.603
+(bslnITI_over_pretrade_gap=2630.80>100, bid 1.63/ask 1.64, ZERO trade prints);
+BUY LMT 3 @ 1.6500 orderId 40 at 08:00:01.606 (outsideRth=1, usePriceMgmtAlgo=1);
+orderStatus Inactive filled=0 at 08:00:02.033. `grep code=2161` over that day's
+clerk.log = 0 hits; no 202/201/110 either. The 10 s ENTRY_FILL_TIMEOUT_SEC never
+ran — the order died at +427 ms, so the abort is a CONSEQUENCE of the Inactive,
+not our cancel.
+
+## Shared fingerprint (updated 2026-07-29)
+- Marketable BUY LMT priced ABOVE the ask, pre-market / ETH
+- Low-priced small-cap ($0.157 - $1.85)
+- Deactivated within ~100-520 ms, NO error reason
+- ALL FIVE fire 1.6-9.4 s after a top-of-hour boundary that is also a pre-market
+  session open (07:00 or 08:00). NCRA at +1.6 s is the closest yet.
+
+## What NCRA newly rules out
+1. The Price Management Algo does NOT prevent Part B. ENTRY_USE_PRICE_MGMT_ALGO
+   is True (x-wing-2.1.py:129 -> :699 -> :815) and orderId 40's placeOrder wire
+   dump carries it. x-wing-2.1 has been live since 2026-07-23, so NCRA is the
+   FIRST Part-B case with the algo attached — and it died anyway. The 2.1
+   mitigation addresses Part A only; do not expect it to help here.
+2. Limit aggressiveness is NOT the driver. The three 4.00%-pad cases were the
+   basis for the "too aggressive" theory; NCRA used a 0.40% pad (~0.6% over the
+   ask) and was deactivated faster than two of them.
+   PROVENANCE of that 0.40%: it is not an x-wing decision, it is a local
+   working-tree edit. As of 2026-07-29 x-wing-2.1.py has UNCOMMITTED changes
+   MAX_LIMIT_ENTRY_PERCENT_PRICE   5.0 -> 0.4   (:106)
+   STALE_QUOTE_ENTRY_PERCENT_PRICE 6.0 -> 3.0   (:118)
+   (git HEAD still holds 5.0 / 6.0). The edit predates today's 08:00 run, so the
+   0.40% pad was genuinely live for NCRA. Anyone re-reading the table above
+   should not conclude x-wing narrowed the pad on its own — and should note that
+   every future run stays on the tight pad until those constants are committed or
+   reverted, which changes fill behaviour well beyond this investigation.
+
+## Status of the candidate causes
+1. Pre-market price cap on a marketable limit  -> SUPERSEDED. That mechanism is
+   real but it is Part A, and it announces itself with 2161 and leaves the order
+   Submitted. It does not produce a silent Inactive.
+2. Venue session had only just opened at the top-of-hour boundary and briefly
+   rejected the order -> STILL OPEN, and now clearly the leading candidate. All
+   FIVE occurrences sit within seconds of a session-open boundary, and #1/#2
+   above have removed the competing explanations.
+
+## Next step to confirm — CORRECTED 2026-07-29
+The previous text here said to enable "Create API message log file". IT IS
+ALREADY ENABLED and has been for weeks; the logs were simply being looked for in
+the wrong directory. The live Gateway is IBC-managed and started with
+  --tws-settings-path=/home/tom/Jts/settings-live
+(see `ps`: /home/tom/IBC/live/scripts/ibcstart.sh 1030 -g), so API logs live in
+
+  ~/Jts/settings-live/pehghglnegcfnbchbdpcghnkjbmkglkilclcnofo/
+
+NOT in ~/Jts/gdopcnffpajbfdbiofimaemhbdphkopgaflihmln/ (that is the other
+profile). One file PER CLIENT ID:
+
+  api.<clientId>.<yyyymmdd>.<hhmmss>.ibgzenc
+
+To map a run to its file: take the clerk.log line "client NNNN connected" for the
+session and match clientId + that connect timestamp. For NCRA that is
+  api.1018.20260729.035921.ibgzenc     (2655 bytes)
+because clerk.log has "03:59:21.458 client 1018 connected; nextValidId=40".
+The sibling files for OFAL / CLIK / AIHS are still on disk under the same scheme.
+
+These files are AES-encrypted (header "IBGZENC\0", writerVersion 3, 16-byte IV,
+length-prefixed keyId "aaa", then length-prefixed AES/CBC/PKCS5Padding chunks
+over a gzip stream — see twslaunch/jutils/ibgzenc/{k,l,a,b} in
+Jts/ibgateway/1030/jars/twslaunch-1030.jar; note k.a is the 8-byte magic, NOT the
+key). There is no jts.ini flag to write them in plaintext.
+
+=> ACTION: send api.1018.20260729.035921.ibgzenc to IBKR API support, quoting
+   account U18283054, orderId 40, NCRA conId 898274064, 2026-07-29 08:00:01.606 ET,
+   and ask for the deactivation reason. That is the one route to a definitive
+   answer, and it should settle all five occurrences at once.
+
+## Meanwhile: we were also discarding reasons ourselves (fixed 2026-07-29)
+Independently of the encrypted logs, our own callbacks threw away the only fields
+IBKR does send on a deactivation:
+  - orderStatus receives whyHeld and never forwarded it to on_order_status
+  - openOrder logged at DEBUG and kept only orderState.status, dropping
+    warningText and completedStatus
+Fixed in x-wing-2.1.py, clerk-1.1.py and clerk-1.2.py: whyHeld is now threaded
+into on_order_status(..., why_held="") and appears in the "Entry order N Inactive
+with no fill (whyHeld=...)" warning, in the "BUY status" line, and in a NEW
+trailing why_held column on the x-wing price table. openOrder is now INFO and
+logs status/completedStatus/warningText. The `event` value is unchanged
+("entry_inactive") so analyze_trade_mole/analyze_firstrade_outcomes.py's
+NO_FILL_EVENTS set-match still works, and the new column is appended last so
+older TSVs still parse. If the NEXT occurrence carries a whyHeld or warningText,
+it will self-diagnose with no IBKR round-trip.
+
+================================================================================
+Current handling (unchanged, no auto-retry)
+================================================================================
+x-wing-2.1.py treats Inactive/Cancelled/ApiCancelled on an unfilled entry as
+terminal:
+  - ENTRY_DEAD_STATUSES   (:154)
+  - orderStatus abort     (:928-941)  -> entry_failed="entry_inactive"
+  - ENTRY_REJECT_CODES    (:148) + on_order_error (:965) for coded rejects
+  - ENTRY_FILL_TIMEOUT_SEC=10 backstop (:1041-1055), cancel + confirm
+2161 is deliberately NOT in ENTRY_REJECT_CODES: a capped order is alive and may
+still fill, so treating it as a reject would be wrong.

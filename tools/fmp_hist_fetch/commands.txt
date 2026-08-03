@@ -1,0 +1,5 @@
+python3 ChartExchangeFetch.py \
+--symbols-list ../../universe_finder/data/stocks_universe_2026-07-12.tsv \
+--date-range 13-07-2026 15-07-2026 \
+--float-max 100M --rate 60
+

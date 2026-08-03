@@ -2,8 +2,8 @@ python3 correlate_dailyhigh.py --input ../PR-stats-2026-05-19to06-19-filtered-50
 
 ##### Will output a matrix of "True positive"/"False positive" for different thresold of the sentiment score metrics.  
 python3 false_positive_count.py \
---columns-name positive nocoref_neutral_filter model_proba_PLUS_kw_mult_nb model_proba model_proba_hl kw_mult_nb_log Headline-RBscore \
---input /home/tom/Documents/ibkr_scripts/N2/scripts/price_stats_loader/outputs/02_PRstats_2026-06-20-2026-07-09_unfiltered_fromPRhigh_excStr2_RBscored_scoredFromPRmodel_comboScore.tsv \
+--columns-name positive FLANG-BERT_sentiment_score FinMarBa_indecisive FinMarBa_Body_indecisive \
+--input /home/tom/Documents/ibkr_scripts/N2/scripts/price_stats_loader/outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_Classed_BodyEnc_clean_FromPRhigh.tsv \
 --true-positive-threshold 30
 
 ##### Unified all-column fromPR_High(%) predictor report (auto-detects every usable

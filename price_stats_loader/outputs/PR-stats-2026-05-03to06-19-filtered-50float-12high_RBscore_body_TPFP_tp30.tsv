@@ -1,7 +1,0 @@
-level	positive	sentiment_score	nocoref_neutral_filter	nocoref_confidence_weighted	nocoref_net_score	nocoref_top_k	nocoref_positional	Headline-RBscore
-0.5	152/728	151/778	75/340	136/716	42/134	243/1635	67/287	316/2580
-0.6	130/607	129/665	28/108	65/253	14/46	223/1415	18/116	154/629
-0.7	105/475	101/515	8/35	15/52	3/16	200/1157	8/32	86/248
-0.8	66/275	59/295	2/12	1/8	1/7	111/601	0/11	36/51
-0.9	21/82	14/64	0/2	0/2	0/2	12/74	0/2	10/11
-0.95	0/0	0/0	0/0	0/0	0/0	0/0	0/0	5/4

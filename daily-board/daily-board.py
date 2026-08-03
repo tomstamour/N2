@@ -277,7 +277,14 @@ class DataManager:
         rest = [c for c in columns if c not in HIDDEN_COLS and c != 'Symbol']
 
         # Position specific columns right after Headline
-        positioned_after_headline = ['positive', 'FMB_indecisive', 'model_proba_PLUS_kw_mult_nb']
+        # 'model_proba_PLUS_kw_mult_nb' is the pre-2026-07-28 keyword score, kept
+        # here so older TSVs still position it; O5.2 now writes kw15_*_proba
+        # instead. Entries absent from the file are filtered out just below, so
+        # listing both schemas is safe.
+        positioned_after_headline = ['positive', 'FMB_indecisive',
+                                     'kw15_body_proba', 'kw15_head_proba',
+                                     'FLANG_sentiment_score',
+                                     'model_proba_PLUS_kw_mult_nb']
         to_reposition = [c for c in positioned_after_headline if c in rest]
         remaining = [c for c in rest if c not in to_reposition]
 

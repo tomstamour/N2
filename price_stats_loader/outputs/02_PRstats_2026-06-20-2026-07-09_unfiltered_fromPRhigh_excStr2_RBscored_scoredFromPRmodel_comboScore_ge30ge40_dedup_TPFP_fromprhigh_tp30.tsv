@@ -1,7 +1,0 @@
-level	kw_add_log_ge40	kw_mult_nb_log_ge40	model_proba_ge40	kw_add_log_pctl_ge40	kw_add_log_hl_ge40	model_proba_hl_ge40	model_proba_PLUS_kw_mult_nb	nocoref_neutral_filter	nocoref_confidence_weighted	nocoref_top_k	positive
-0.5	21/83	30/166	24/108	34/170	42/265	9/57	19/55	16/65	27/129	40/269	26/123
-0.6	14/44	29/161	0/0	27/136	13/68	7/45	17/43	2/20	14/56	37/246	25/110
-0.7	6/22	28/156	0/0	26/107	0/2	6/35	12/33	1/2	1/9	34/210	16/84
-0.8	1/5	28/148	0/0	20/76	0/0	6/24	6/23	0/0	1/0	21/116	12/49
-0.9	0/0	23/141	0/0	11/33	0/0	4/12	1/11	0/0	0/0	3/11	5/17
-0.95	0/0	21/137	0/0	3/14	0/0	3/8	0/3	0/0	0/0	0/0	0/1

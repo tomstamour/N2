@@ -180,9 +180,11 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
     """
     Fetch 1-min bars around created_dt and measure the high since the PR.
 
-    Baseline is the close of the last 1-min bar starting before created_dt;
-    the high is the max bar high from created_dt to 8 PM ET of target_dt
-    (extended hours included).
+    Baseline is the close of the last 1-min bar ENDING at or before the PR's
+    own minute (i.e. the last bar strictly before created_dt truncated to the
+    minute) — the bar containing the PR already prices the news in and is
+    excluded; the high is the max bar high from created_dt to 8 PM ET of
+    target_dt (extended hours included), which DOES include the PR's bar.
 
     Returns (pct, high_time_str, status) where status is one of:
       'ok'      - data fetched and both columns computed
@@ -246,9 +248,16 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
     high = None
     high_time = None
     one_min = timedelta(minutes=1)
+    # The bar CONTAINING the PR starts before created_dt but already holds the
+    # news reaction, so it must not become the baseline — comparing against it
+    # subtracts the very move this metric measures (and inverts the sign on a
+    # PR that gaps down inside its own minute). Baseline is therefore the last
+    # bar that ENDS at or before the PR minute's start; that same PR-minute bar
+    # still counts as a high candidate below, which is intended.
+    pr_minute_start = created_dt.replace(second=0, microsecond=0)
     for bar in bars:
         start = bar_time_et(bar)
-        if start < created_dt:
+        if start < pr_minute_start:
             baseline = bar.close
         if start + one_min > created_dt and start <= session_end:
             if high is None or bar.high > high:
@@ -256,7 +265,8 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
                 high_time = start
 
     if baseline is None or not baseline:
-        logging.warning(f"{symbol}: no bar before {created_dt} to use as baseline, skipping.")
+        logging.warning(f"{symbol}: no bar ending at or before {pr_minute_start} "
+                        f"to use as baseline, skipping.")
         return None, None, 'skip'
     if high is None:
         logging.warning(f"{symbol}: no bars between {created_dt} and {session_end}, skipping.")
@@ -278,8 +288,10 @@ def main():
             'Enrich a news TSV with fromPR_High(%) and fromPR_HighTime(m:s) columns.\n\n'
             'Connects to an IBKR TWS/Gateway instance and, for each row, measures '
             'the highest price reached since the PR "Created" time as a % of the '
-            'price just before the PR came out (close of the last 1-min bar before '
-            'Created), extended hours included. The window runs until 8 PM ET of '
+            'price just before the PR came out (close of the last 1-min bar ending '
+            "at or before the PR's own minute — the bar containing Created already "
+            'prices the news in and is excluded), extended hours included. The '
+            'window runs until 8 PM ET of '
             'the same session, or of the next trading session for PRs created '
             'after the close / on non-trading days. fromPR_HighTime(m:s) is the '
             'elapsed MM:SS from Created to the bar where that high printed, '
