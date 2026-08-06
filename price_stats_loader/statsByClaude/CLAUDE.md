@@ -23,6 +23,13 @@ keyword variants, `FineClass`/`BroadClass`) and writes one unified
 per-level breakdowns, de-cloned top-N combo search, threshold sweep). Default
 threshold 30; see `commands.txt` for the canonical invocations.
 
+`class_hitrate_ranking.py` (2026-08-05) is the precision-framed counterpart of
+`class_conditional_predictors.py`: that one ranks ENCODERS by within-class AUC,
+this one ranks the CLASSES themselves by `P(fromPR_High(%) >= threshold)` with
+95% Wilson CIs, one-vs-rest Fisher exact + BH-FDR, a FineClass-nested-in-
+BroadClass table, and a class x encoder cut search. Ranking is on the LOWER
+Wilson bound so small classes can't top the table on a lucky point estimate.
+
 ## Run
 
 Default run (threshold 20%, 5-fold CV, no plots):

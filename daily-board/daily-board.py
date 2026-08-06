@@ -241,8 +241,14 @@ def find_surge_time(symbol, arrival_et, directory=MOLE_OUTPUT_DIR):
 
 def _read_surge_time(path):
     """Read a trade-mole-table CSV and return the surge-detection time from
-    the first TRADE row with surge_detected=True, NO_SURGE_LABEL if the file
-    was read but no such row exists, or None only on a read/parse failure.
+    the first row flagged surge_detected=True, NO_SURGE_LABEL if the file was
+    read but no such row exists, or None only on a read/parse failure.
+
+    The surge can be carried on any event_type — the mole flags it on TRADE
+    rows and, since the pretrade-ITI trigger work, on PRETRADE_SURGE rows too
+    (reason bslnITI_over_pretrade_gap). surge_detected is the authoritative
+    signal (only genuine surge events set it), so we key off it alone rather
+    than whitelisting event types, which silently dropped pretrade surges.
     """
     try:
         with open(path, 'r', encoding='utf-8', errors='replace') as fh:
@@ -251,8 +257,7 @@ def _read_surge_time(path):
                 return None
             if 'surge_detected' in reader.fieldnames:
                 for row in reader:
-                    if row.get('event_type') == 'TRADE' and \
-                            str(row.get('surge_detected', '')).strip().lower() == 'true':
+                    if str(row.get('surge_detected', '')).strip().lower() == 'true':
                         return row.get('Time') or row.get('local_arrival_iso')
             return NO_SURGE_LABEL
     except Exception as exc:  # noqa: BLE001

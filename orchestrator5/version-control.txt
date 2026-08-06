@@ -20,7 +20,7 @@ Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
 Current version: Orchestrator5.2.py.  5.1 and 5.0 are frozen predecessors.
 NOTE: 5.2 has been extended IN PLACE five times since 2026-07-20 (keyword-leg
 replacement 07-28, FLANG third leg 07-29, Trigger column 07-29, OR->AND gate retune
-08-01, earnings branch 08-02, two solo branches 08-03).  There is no 5.3 — the dated
+08-01, earnings branch 08-02, three solo branches 08-03).  There is no 5.3 — the dated
 sections below are the only record of which gate/schema a given day's TSV was written
 with, and from 08-02 the gate changes no longer change the schema at all.
 
@@ -427,16 +427,39 @@ Verified:
 
 
 ================================================================================
-2026-08-03 — TWO SOLO LEGS: kw15_body >= 0.70 and FLANG >= 0.975, each firing
-             ALONE                                                    [CURRENT]
+2026-08-03 — THREE SOLO LEGS, each firing ALONE                       [CURRENT]
 ================================================================================
-WHAT: two MORE branches beside the 2026-08-01 five-way AND and the 2026-08-02
+WHAT: three MORE branches beside the 2026-08-01 five-way AND and the 2026-08-02
   earnings leg.  Each is a SINGLE condition and fires the trade unaided:
 
-      KwBodySolo :  kw15_body_proba       >= KW15_BODY_SOLO_MIN  (0.70)
-      FLANGSolo  :  FLANG sentiment_score >= FLANG_SOLO_MIN      (0.975)
+      KwBodySolo  :  kw15_body_proba       >= KW15_BODY_SOLO_MIN        (0.70)
+      FLANGSolo   :  FLANG sentiment_score >= FLANG_SOLO_MIN            (0.975)
+      FinBERTSolo :  FinBERT positive      >= SENTIMENT_POSITIVE_SOLO_MIN (0.935)
 
       is_ok = core_and OR earnings_leg OR kwbody_solo_leg OR flang_solo_leg
+                      OR finbert_solo_leg
+
+  (KwBodySolo + FLANGSolo landed first; FinBERTSolo followed in the same session.)
+
+!! A FOURTH SOLO LEG WAS IMPLEMENTED AND REMOVED THE SAME DAY, before it ever ran
+  live: FMBSolo, FinMarBa `indecisive <= 0.115` (FMB_INDECISIVE_SOLO_MAX).
+  REASON — it is DIRECTION-AGNOSTIC.  FinMarBa's classes are negative/indecisive/
+  positive, so a LOW `indecisive` means "confident", in EITHER direction.  Inside
+  the core AND that is harmless: FinBERT positive >= 0.8 pins the sign alongside
+  it.  STANDALONE nothing does, and the leg trades confidently-BAD news.
+  Not hypothetical — measured on the live tape:
+    - It fired 2026-07-29 WETO "Wetour Robotics Announces Share Consolidation" —
+      a REVERSE SPLIT — on indecisive=0.0961 with FMB_label='positive', while BOTH
+      other headline models disagreed: FinBERT positive 0.150, FLANG
+      sentiment_score -0.8037.  FinMarBa was confidently WRONG and, standalone,
+      that trades.
+    - It was also by far the loosest cut measured, 44/552 rows (8.0%) vs 2.9%
+      (FLANGSolo) / 2.4% (KwBodySolo) / 1.3% (FinBERTSolo) — it roughly doubled
+      the whole gate on its own, and the 7 rows it added beyond the other legs
+      were mostly low-catalyst promotional PRs.
+  If it is ever revisited it needs a DIRECTION condition beside it (e.g. also
+  require FLANG > 0, or FMB_label == 'positive').  The removal is recorded in a
+  standing warning in the SOLO LEGS constant block, so it is not re-derived.
 
   Nothing was removed or retuned.  The five-way AND and the earnings leg are
   byte-for-byte the same booleans; both solo legs are added BESIDE them, so this
@@ -447,11 +470,11 @@ WHY: the AND gate was deliberately narrow (~2.5% of rows, ~1 trade/day, 6.6%
   recall).  These two legs buy back part of that recall by letting a single
   strongly-scoring channel trade on its own.
 
-!! THESE TWO CUTS WERE NOT CALIBRATED.  Alone among every threshold in this file,
-  0.70 and 0.975 were specified by the operator on 2026-08-03 and are NOT backed
-  by a fires/precision/lift measurement on a labelled corpus.  There is no
-  precision number for either leg at its chosen cut.  The nearest EXISTING
-  evidence, both from earlier calibrations and neither at these cuts:
+!! THESE THREE CUTS WERE NOT CALIBRATED.  Alone among every threshold in this file,
+  0.70 / 0.975 / 0.935 were specified by the operator on 2026-08-03 and are NOT
+  backed by a fires/precision/lift measurement on a labelled corpus.  There is no
+  precision number for any of the three legs at its chosen cut.  The nearest
+  EXISTING evidence, both from earlier calibrations and neither at these cuts:
     - FLANG standalone at 0.97 (its 2026-07-28 calibration, 3434 rows): 304 fires
       (8.9%), 46.1% precision / 1.81x lift @>=15%, 24.3% / 1.99x @>=30%.
     - ge15 body channel alone at 0.60 (2026-07-28 VAL holdout): ~40.9% precision,
@@ -461,84 +484,96 @@ WHY: the AND gate was deliberately narrow (~2.5% of rows, ~1 trade/day, 6.6%
   rate.  Retune the two constants at the top of Orchestrator5.2.py.
 
 !! STRUCTURAL CONSEQUENCE — the solo legs SUBSUME the branches they were added
-  beside, because they re-read two of the same five scores at higher cuts:
-    - Any row with kw15_body >= 0.70 fires no matter what the other four models
-      said.  So the five-way AND and the earnings leg are only DECISIVE for rows
-      with kw15_body in [0.50, 0.70).
-    - Any row with FLANG >= 0.975 fires outright; the core's FLANG >= 0.96
-      condition only discriminates below 0.975.
+  beside, because each re-reads one of the same five scores at a STRICTLY TIGHTER
+  cut (0.70 > 0.50, 0.975 > 0.96, 0.935 > 0.8).  Each c_*_solo therefore IMPLIES
+  its core twin.  The five-way AND and the earnings leg are only DECISIVE in the
+  band below every solo cut: kw15_body in [0.50,0.70), FLANG in [0.96,0.975),
+  positive in [0.8,0.935).  FMB `indecisive` and kw15_head are the two core
+  conditions with no solo twin, i.e. the only ones that can still veto.
   The 2026-08-01 calibration therefore describes a BRANCH from this date, not the
   gate.  Neither the AND's 46.2% nor the earnings leg's 47.2% is the gate's
   precision any more, and no measurement of the combined gate exists.
 
 MEASURED EFFECT ON LIVE TAPE (replay of tables/news_output_2026-07-29..08-03,
-  197 rows with kw15/FLANG columns, current constants applied to both gates so
-  the delta isolates the solo legs — note 07-29..08-02 predate the 08-01 retune,
-  so these are NOT the fires those files actually shipped):
+  209 rows with kw15/FLANG columns, current constants applied to both tiers so the
+  delta isolates the solo legs — note 07-29..08-02 predate the 08-01 retune, so
+  these are NOT the fires those files actually shipped):
 
-      gate                          fires    rate
-      core AND + earnings              7     3.55%
-      + the two solo legs             29    14.72%     4.1x the trades
-      added by KwBodySolo only        11
-      added by FLANGSolo only         10
-      added by both                    1
+      gate                              fires    rate
+      08-02 build (core AND + earnings)     7     3.35%
+      + the three solo legs                31    14.83%   4.4x the 08-02 build
+      added by KwBodySolo                  11
+      added by FLANGSolo                   10
+      added by FinBERTSolo                  2
+      added by KwBodySolo+FLANGSolo         1
 
   This is a TRADE-RATE observation, not a precision claim — the replay rows carry
-  no fromPR_High label.  ~4x more trades than the 08-02 build; the plan's a-priori
-  guess had been the 5-10% band, the tape says ~15%.
+  no fromPR_High label.  For reference, the removed FMBSolo leg would have added a
+  further 7 rows on top of these (18.18%, 5.4x); those 7 are listed in the removal
+  note above and are exactly the rows the shipped gate now declines.
 
 Implementation (all in Orchestrator5.2.py; no new imports, pools, models or
-  scores — both legs read values _evaluate_trigger already extracted):
-  - New constants KW15_BODY_SOLO_MIN = 0.70, FLANG_SOLO_MIN = 0.975 in their own
-    commented block after the earnings constants.  Retuning the gate is now an
-    EIGHT-constant edit, not six.
-  - Two per-condition locals c_body_solo / c_fla_solo alongside the existing seven,
-    same None-safe shape; two leg aliases; two entries APPENDED to `fired`
-    ('KwBodySolo', 'FLANGSolo') so every pre-existing label keeps its prefix and
-    order; is_ok gains two OR terms.
-  - missing_blocked gains a THIRD term, solo_missing = (kw_body is None) or
-    (flang is None).  A solo branch is ONE condition, so "every evaluable condition
-    passed" degenerates to "the score is missing".  This is deliberately much
-    LOUDER than the core/earnings terms — a dead kw or FLANG scorer now WARNs on
-    every row rather than only when four other models happened to agree — because
-    each of those scores now backs a branch that trades unaided, so losing one
-    silently removes a whole branch while the tape still looks alive.
-  - Trigger cell 7 -> 9 tokens, both APPENDED after class: (5-/7-token parsers keep
-    working):
+  scores — every leg reads a value _evaluate_trigger already extracted):
+  - New constants KW15_BODY_SOLO_MIN = 0.70, FLANG_SOLO_MIN = 0.975,
+    SENTIMENT_POSITIVE_SOLO_MIN = 0.935 in their own commented block after the
+    earnings constants.  Retuning the gate is now a NINE-constant edit, not six.
+  - Three per-condition locals c_body_solo / c_fla_solo / c_fin_solo alongside the
+    existing seven, same None-safe shape; three leg aliases; three entries APPENDED
+    to `fired` ('KwBodySolo', 'FLANGSolo', 'FinBERTSolo') so every pre-existing label
+    keeps its prefix and order; is_ok gains three OR terms.
+  - missing_blocked gains a THIRD term, solo_missing = kw_body/flang/positive is
+    None.  `indecisive` is deliberately NOT in it — it backs no solo branch, so
+    core_missing remains the right scope for it.  A solo branch is ONE condition, so "every evaluable condition
+    passed" degenerates to "the score is missing".  Deliberately much LOUDER than the
+    core/earnings terms — a dead scorer now WARNs on every row rather than only when
+    the other models happened to agree — because all three of those scores back a
+    branch that trades unaided.
+  - Trigger cell 7 -> 10 tokens, all three APPENDED after class: (5-/7-token parsers
+    keep working):
         ... earn:NA class:Product_Update kw15_body_solo:PASS(0.7500>=0.70) \
-            FLANG_solo:FAIL(0.1000<0.975)
-    They deliberately REPRINT the kw15_body and FLANG scores against the solo cuts,
-    so a row records BOTH thresholds it was judged against and stays self-describing
-    across a retune of either.  _fmt_thr already renders 0.975 as 0.975 (it falls
-    through to %g because f"{0.975:.2f}" == "0.97" does not round-trip) — verified.
-  - ClerkSentiment stays fully informative; the vocabulary widens sharply (42 labels
-    reachable in the truth table, e.g. KwBodySolo, FLANG_FLANGSolo, Keyword_KwBodySolo,
-    Keyword_FLANG_KwBodySolo_FLANGSolo).  Two implications constrain it: 0.70 > 0.50
-    so KwBodySolo always implies c_body, and 0.975 > 0.96 so FLANGSolo can NEVER
-    appear without FLANG.
+            FLANG_solo:FAIL(0.1000<0.975) FinBERT_solo:FAIL(0.8231<0.935)
+    They deliberately REPRINT the three scores against the solo cuts, so a row records
+    BOTH thresholds it was judged against and stays self-describing across a retune of
+    either.  All three are floors, so `FMB` remains the ONLY `<=` token in the cell.
+    _fmt_thr renders 0.975 and 0.935 exactly (both fall through to %g because their
+    2-dp form does not round-trip) — verified.
+  - ClerkSentiment stays fully informative; the vocabulary widens sharply (e.g.
+    KwBodySolo, FLANG_FLANGSolo, FMBSolo, FinBERT_FMB_FinBERTSolo_FMBSolo,
+    Keyword_FLANG_KwBodySolo_FLANGSolo; 90 labels reachable in the truth table).
+    Because every solo cut is strictly tighter than its core twin, each solo name
+    implies its twin's condition: KwBodySolo => c_body, FLANGSolo can NEVER appear
+    without FLANG, FinBERTSolo => c_fin (hence FinBERT_FMB whenever FMB agrees).
   - The `label = ... if is_ok else 'BAD'` guard REMAINS load-bearing: the solo legs
     narrowed the one-leg-true-but-not-firing window (kw15_body in [0.50,0.70) with
-    kw15_head, FLANG < 0.96, non-earnings) but did not close it.
+    kw15_head, FLANG < 0.96, positive < 0.935, non-earnings) but did not close it.
   - Startup: the ge15 ready line now names the solo cut, and a NEW "[Gate] ACTIVE —
-    OR of 4 branches: ..." line echoes every branch with the thresholds in force.
+    OR of 5 branches: ..." line echoes every branch with the thresholds in force.
     The constants are module-level and read at import, so a process started before a
     retune keeps the OLD gate until restarted, and nothing else in the log says which
-    one is live.  All three lines use _fmt_thr (%s), not %.2f, so 0.975 survives.
+    one is live.  All three lines use _fmt_thr (%s), not %.2f, so 0.975 and 0.935
+    survive.
 
 TSV: 42 columns, UNCHANGED — no header change, so NO rotation and no _rotated.tsv.
   Consequence: the header does NOT distinguish the 08-02 build from this one.  The
-  Trigger cell's TOKEN COUNT does: 7 tokens = 08-02, 9 tokens = 08-03.
+  Trigger cell's TOKEN COUNT does: 7 = 08-02, 10 = this build.  (9- and 11-token
+  variants existed only inside the 08-03 editing session and never wrote a live row.)
 
 Verified:
-  - Exhaustive truth table, 3888 cases (3 FinBERT x 3 FMB x 4 kw15_body x 3
-    kw15_head x 4 FLANG x 3 FineClass x 3 EarningScore, the kw15_body and FLANG
-    grids straddling BOTH their cuts) through the LIVE _evaluate_trigger, checked
-    against an independently recomputed expectation: 0 errors on is_ok, label,
-    YES/NO verdict, 9-token count, token names/order, MISSING-iff-None, the solo
-    thresholds rendering as 0.70 / 0.975, and missing_blocked.
-  - ADDITIVE REGRESSION (the decisive check): 0 of 3888 cases flip YES -> NO versus
-    the pre-change gate (core_and OR earnings_leg); 1542 flip NO -> YES.  Re-asserted
-    per-row over the 197-row tape replay — also 0 flips.
+  - Exhaustive truth table, 5184 cases (4 FinBERT x 3 FMB x 4 kw15_body x 3 kw15_head
+    x 4 FLANG x 3 FineClass x 3 EarningScore — the FinBERT, kw15_body and FLANG grids
+    each straddling BOTH their cuts) through the LIVE _evaluate_trigger, checked
+    against an independently recomputed expectation: 0 errors on is_ok, label, YES/NO
+    verdict, 10-token count, token names/order, MISSING-iff-None, the solo thresholds
+    rendering as 0.70 / 0.975 / 0.935, and missing_blocked.
+  - The removal is asserted, not assumed: FMB_INDECISIVE_SOLO_MAX must not exist, no
+    label may contain 'FMBSolo', no appended solo token may be a `<=` ceiling, and a
+    low `indecisive` must never fire a row on its own (grid includes ind=0.10, which
+    would have cleared the removed 0.115 cut) — 0 violations in 5184 cases.
+  - ADDITIVE REGRESSION (the decisive check): 0 of 5184 cases flip YES -> NO versus
+    the pre-change gate (core_and OR earnings_leg); 2734 flip NO -> YES.  Re-asserted
+    per-row over the 209-row tape replay — 0 flips.
+  - Tape: the 7 rows the removed leg would have traded (incl. the WETO reverse split)
+    are confirmed NOT to fire under the shipped gate.
   - FLANGSolo never appears in a label without FLANG (0 counterexamples).
   - Startup log lines format-checked directly (no second process started).
   !! NOT verified by a live run: an Orchestrator5.2.py started 2026-08-02 was

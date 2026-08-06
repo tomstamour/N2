@@ -205,12 +205,13 @@ CLERK_PORT             = n2_config.get_int(_CFG, 'CLERK_PORT', 8765)
 CLERK_TIMEOUT_SEC      = 5       # per-message TCP send/recv timeout
 CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sentiment
 
-# Trade-trigger gate (STEP 1b) — an OR of FOUR branches as of 2026-08-03. A row trades
+# Trade-trigger gate (STEP 1b) — an OR of FIVE branches as of 2026-08-03. A row trades
 # when ANY ONE of them holds:
 #   1. CORE      — the five-way AND defined immediately below (2026-08-01)
 #   2. EARNINGS  — FineClass/EarningScore/kw15_body (2026-08-02; block further down)
-#   3. KwBodySolo— kw15_body  >= KW15_BODY_SOLO_MIN alone   (2026-08-03; block below)
-#   4. FLANGSolo — FLANG score >= FLANG_SOLO_MIN alone      (2026-08-03; block below)
+#   3. KwBodySolo — kw15_body  >= KW15_BODY_SOLO_MIN alone         (08-03; block below)
+#   4. FLANGSolo  — FLANG score >= FLANG_SOLO_MIN alone            (08-03; block below)
+#   5. FinBERTSolo— positive   >= SENTIMENT_POSITIVE_SOLO_MIN alone(08-03; block below)
 #
 # THIS block defines branch 1 only. It is an AND over ALL FIVE conditions — the trade
 # fires on this branch only when EVERY one holds (2026-08-01; version-control.txt #4):
@@ -225,11 +226,12 @@ CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sen
 # grouping, not alternatives.
 #
 # ⚠ The 2026-08-03 solo branches SUBSUME this one wherever they hold, because they read
-# two of these same five scores at higher cuts. This branch (and the earnings one) is
-# therefore only DECISIVE for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN)
-# — currently [0.50, 0.70) — and FLANG below FLANG_SOLO_MIN. The five thresholds below
-# were calibrated when this AND was the whole gate; that calibration describes the
-# branch, not the gate, from 2026-08-03 on.
+# THREE of these same five scores at strictly tighter cuts. This branch (and the earnings
+# one) is therefore only DECISIVE in the band below every solo cut: kw15_body in [0.50,
+# 0.70), FLANG in [0.96, 0.975), positive in [0.8, 0.935). FMB `indecisive` and kw15_head
+# are the two with no solo twin, i.e. the only ones that can still veto. The five below were
+# calibrated when this AND was the whole gate; that calibration describes the branch, not
+# the gate, from 2026-08-03 on.
 #
 # ⚠ MISSING scores. A None (model error / scorer timeout) makes only its OWN condition
 # false — but within this AND branch that single false blocks it entirely, and with four
@@ -240,7 +242,7 @@ CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sen
 # is a whole branch.
 # The wire protocol to the clerk stays "OK"/"BAD"; the trigger source is in the TSV only
 # — ClerkSentiment (fired leg names joined with "_" in the fixed order Keyword,
-# FinBERT_FMB, FLANG, Earnings, KwBodySolo, FLANGSolo) and the Trigger column, which
+# FinBERT_FMB, FLANG, Earnings, KwBodySolo, FLANGSolo, FinBERTSolo) and the Trigger column, which
 # drops a level below the legs and records YES/NO plus a PASS/FAIL/MISSING token per
 # CONDITION with its score and the threshold in force, so a row shows WHICH condition
 # failed and by how much.
@@ -329,25 +331,45 @@ EARN_CLASS          = 'Earnings_Results'  # the only FineClass this leg accepts
 EARN_SCORE_MIN      = 4                   # EarningScore POINTS floor (integer, see above)
 EARN_SCORE_WAIT_SEC = 10                  # ceiling on the earn future, as KW/FLANG
 
-# ── SOLO LEGS (2026-08-03) — two MORE standalone branches, OR-ed beside the two above ──
+# ── SOLO LEGS (2026-08-03) — THREE standalone branches, OR-ed beside the two above ───
 #   is_ok = core_and OR earnings_leg OR kw15_body >= KW15_BODY_SOLO_MIN
-#                                    OR flang    >= FLANG_SOLO_MIN
+#                                    OR flang     >= FLANG_SOLO_MIN
+#                                    OR positive  >= SENTIMENT_POSITIVE_SOLO_MIN
 # Each is ONE condition and fires the trade ALONE — no confirmation from any other model.
-# They re-read scores the core branch already consumes, at HIGHER cuts, which has a
-# structural consequence worth stating plainly: a row clearing a solo cut fires no matter
-# what the other four models said, so the five-way AND and the earnings leg are only
-# DECISIVE for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN) — i.e. [0.50,
-# 0.70) — and, for FLANG, below 0.975. Nothing was removed or retuned: every row that
-# fired before still fires, this is purely additive.
-# ⚠ UNLIKE EVERY OTHER CUT IN THIS FILE, these two were specified by the operator on
+# Every one re-reads a score the CORE branch already consumes, at a STRICTLY TIGHTER cut
+# (0.70 > 0.50, 0.975 > 0.96, 0.935 > 0.8). Two consequences follow and are worth stating
+# plainly:
+#   - Each c_*_solo IMPLIES its core twin, so a solo fire never contradicts the core
+#     branch, it just doesn't wait for the other four conditions.
+#   - The five-way AND and the earnings leg are only DECISIVE in the band BELOW every
+#     solo cut — kw15_body in [0.50, 0.70), FLANG in [0.96, 0.975), positive in
+#     [0.8, 0.935). Outside it a single score trades. FMB `indecisive` and kw15_head are
+#     the two core conditions with NO solo twin, i.e. the only ones that can still veto.
+# Nothing was removed or retuned: every row that fired before still fires — purely
+# additive, at each step.
+# ⚠ UNLIKE EVERY OTHER CUT IN THIS FILE, all three were specified by the operator on
 # 2026-08-03 and were NOT calibrated against a labelled corpus. No fires/precision/lift
-# number backs them. For scale, from the calibrations recorded above: FLANG standalone at
-# 0.97 fired 8.9% of 3434 rows at 46.1% precision (>=15%) / 24.3% (>=30%), and the ge15
-# body channel alone ran ~41% precision at 0.60 — so expect the gate's fire rate to move
-# off the AND-era ~2.5% (~1 trade/day) into roughly the 5-10% band, at those standalone
-# precisions rather than the AND branch's 46.2% @>=30%. Retune HERE.
-KW15_BODY_SOLO_MIN = 0.70    # ge15 BODY model_proba — fires alone (core cut is 0.50)
-FLANG_SOLO_MIN     = 0.975   # FLANG sentiment_score — fires alone (core cut is 0.96)
+# number backs any of them. For scale, from the calibrations recorded above: FLANG
+# standalone at 0.97 fired 8.9% of 3434 rows at 46.1% precision (>=15%) / 24.3% (>=30%),
+# and the ge15 body channel alone ran ~41% precision at 0.60 — i.e. BELOW the AND
+# branch's 46.2% @>=30%. Measured fire rate on live tape rather than a labelled corpus:
+# the AND-era ~2.5% (~1 trade/day) -> ~15% with these three (209 rows,
+# 2026-07-29..08-03). Retune HERE.
+#
+# ⚠ DO NOT ADD AN `indecisive <= x` SOLO LEG. It was implemented on 2026-08-03 as a
+# fourth solo branch (FMB_INDECISIVE_SOLO_MAX = 0.115) and REMOVED the same day, before
+# it ever ran live. Reason: FinMarBa's classes are negative/indecisive/positive, so a LOW
+# `indecisive` means "confident" — in EITHER DIRECTION. Inside the core AND that is
+# harmless because FinBERT positive >= 0.8 pins the sign alongside it; STANDALONE nothing
+# does, and the leg trades confidently-BAD news. Not hypothetical: on the 2026-07-29 tape
+# it fired WETO "Wetour Robotics Announces Share Consolidation" — a REVERSE SPLIT — on
+# indecisive=0.0961 with FMB_label='positive', while BOTH other headline models
+# disagreed (FinBERT positive 0.150, FLANG sentiment_score -0.8037). It was also by far
+# the loosest cut measured, 44/552 rows (8.0%) vs 2.9% / 2.4% / 1.3% for the three legs
+# below. If it is ever revisited, it needs a DIRECTION condition beside it.
+KW15_BODY_SOLO_MIN          = 0.70   # ge15 BODY model_proba — alone (core cut 0.50)
+FLANG_SOLO_MIN              = 0.975  # FLANG sentiment_score — alone (core cut 0.96)
+SENTIMENT_POSITIVE_SOLO_MIN = 0.935  # FinBERT positive      — alone (core cut 0.80)
 
 # Baseline lookups from the daily universe TSV.
 TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "no baseline"
@@ -750,7 +772,7 @@ def _cond_token(name: str, value, threshold, ok: bool, is_floor: bool,
 
 def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, flang_val: dict,
                       kw_val: dict, earn_val: dict) -> tuple:
-    """STEP-1b gate. Since 2026-08-03 it is an OR of FOUR branches:
+    """STEP-1b gate. Since 2026-08-03 it is an OR of FIVE branches:
 
       CORE branch — the 2026-08-01 five-way AND, every condition required, unchanged:
         FinBERT    positive        >= SENTIMENT_POSITIVE_MIN
@@ -764,13 +786,16 @@ def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, flang_val: dict,
         EarningScore (POINTS, int) >= EARN_SCORE_MIN
         ge15 body  model_proba     >= KW15_BODY_MIN   ← the SAME c_body local
 
-      KwBodySolo branch (2026-08-03) — ONE condition, fires unaided:
-        ge15 body  model_proba     >= KW15_BODY_SOLO_MIN
-
-      FLANGSolo branch (2026-08-03) — ONE condition, fires unaided:
-        FLANG-BERT sentiment_score >= FLANG_SOLO_MIN
+      THREE SOLO branches (2026-08-03) — ONE condition each, each firing unaided:
+        KwBodySolo   ge15 body  model_proba     >= KW15_BODY_SOLO_MIN       (0.70)
+        FLANGSolo    FLANG-BERT sentiment_score >= FLANG_SOLO_MIN           (0.975)
+        FinBERTSolo  FinBERT    positive        >= SENTIMENT_POSITIVE_SOLO_MIN (0.935)
 
         is_ok = core_and OR earnings_leg OR kwbody_solo_leg OR flang_solo_leg
+                        OR finbert_solo_leg
+
+      There is deliberately NO `indecisive <= x` solo branch — see the SOLO LEGS
+      comment block at the top of the file before adding one.
 
     Returns (is_ok, label, detail, missing_blocked).
 
@@ -781,47 +806,55 @@ def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, flang_val: dict,
     leg fires 36x at 47.2%, with ZERO overlap. See the EARNINGS LEG comment block at
     the top of this file for the full calibration.
 
-    The two SOLO branches re-read scores the core branch already uses, at higher cuts,
-    so they SUBSUME it wherever they hold: the five-way AND and the earnings leg are
-    only decisive for rows with kw15_body in [KW15_BODY_MIN, KW15_BODY_SOLO_MIN).
+    The three SOLO branches re-read scores the core branch already uses, at STRICTLY
+    TIGHTER cuts, so each c_*_solo IMPLIES its core twin and they SUBSUME the core
+    branch wherever they hold: the five-way AND and the earnings leg are only decisive
+    in the band below every solo cut — kw15_body in [0.50, 0.70), FLANG in [0.96,
+    0.975), positive in [0.8, 0.935). FMB `indecisive` and kw15_head are the two core
+    conditions with no solo twin, i.e. the only ones that can still veto.
     ⚠ Their cuts are operator-specified (2026-08-03) and, alone among the thresholds in
-    this file, are NOT backed by a corpus calibration — see the SOLO LEGS comment block.
+    this file, are NOT backed by a corpus calibration — see the SOLO LEGS comment block,
+    which also records why a fourth `indecisive <= x` solo leg was written and then
+    removed the same day (direction-agnostic: a low `indecisive` means "confident",
+    either way, with nothing to pin the sign the way FinBERT positive does in the AND).
 
     `label` joins the fired leg names with '_' in the fixed order ('Keyword',
-    'FinBERT_FMB', 'FLANG', 'Earnings', 'KwBodySolo', 'FLANGSolo'), gated on `is_ok`,
-    NOT on a non-empty `fired` — a row can have one leg true and still not fire (e.g.
-    Keyword alone), and labelling it 'Keyword' would contradict the gate. THAT GUARD IS
-    STILL LOAD-BEARING even though the solo legs made most single-leg cases firing ones.
-    The label names exactly which legs held, so it is fully informative again; the
-    vocabulary is now much wider than the AND-era 'Keyword_FinBERT_FMB_FLANG'/'BAD'
-    pair, e.g. 'KwBodySolo', 'FLANG_FLANGSolo', 'Keyword_KwBodySolo', 'Earnings',
-    'Keyword_FinBERT_FMB_FLANG_KwBodySolo_FLANGSolo'. Two implications constrain it:
-    KW15_BODY_SOLO_MIN > KW15_BODY_MIN, so 'KwBodySolo' always implies c_body (hence
-    'Keyword' too whenever kw15_head passes); and FLANG_SOLO_MIN > FLANG_SCORE_MIN, so
-    'FLANGSolo' can NEVER appear without 'FLANG'.
+    'FinBERT_FMB', 'FLANG', 'Earnings', 'KwBodySolo', 'FLANGSolo', 'FinBERTSolo'),
+    gated on `is_ok`, NOT on a non-empty `fired` — a row can have one leg true and still
+    not fire (e.g. Keyword alone), and labelling it 'Keyword' would contradict the gate.
+    THAT GUARD IS STILL LOAD-BEARING even though the solo legs made most single-leg
+    cases firing ones. The label names exactly which legs held, so it is fully
+    informative again; the vocabulary is far wider than the AND-era
+    'Keyword_FinBERT_FMB_FLANG'/'BAD' pair, e.g. 'KwBodySolo', 'FLANG_FLANGSolo',
+    'FinBERTSolo', 'Earnings'. Because every solo cut is strictly tighter than its core
+    twin, each solo name implies its twin's condition: 'KwBodySolo' implies c_body
+    (hence 'Keyword' whenever kw15_head passes), 'FLANGSolo' can NEVER appear without
+    'FLANG', and 'FinBERTSolo' implies c_fin (hence 'FinBERT_FMB' whenever FMB agrees).
 
     `missing_blocked` is the dead-model alarm: True when this row did NOT fire and the
     only thing standing between it and a fire was a None score — every evaluable CORE
     condition passed but a model/future returned nothing, OR a scored-eligible earnings
-    PR (class + kw15_body OK) has a None EarningScore, OR — since 2026-08-03 — kw15_body
-    or FLANG is None at all, because a solo branch has exactly ONE condition and a
-    missing score is therefore the whole of what blocked it. The caller logs it at
-    WARNING. That third term makes the alarm markedly louder by design: with four
-    branches a dead model no longer halts trading, so it is even less visible in the
-    fire count, while each of those two scores now backs a branch that trades unaided.
+    PR (class + kw15_body OK) has a None EarningScore, OR — since 2026-08-03 — ANY of
+    kw15_body / FLANG / positive is None at all, because a solo branch has exactly ONE
+    condition and a missing score is therefore the whole of what blocked it. The caller
+    logs it at WARNING. That third term makes the alarm markedly louder by design: with
+    five branches a dead model no longer halts trading, so it is even less visible in
+    the fire count, while every one of those three scores now backs a branch that trades
+    unaided. `indecisive` is NOT in that term — it backs no solo branch, so the core
+    term above is the right scope for it.
 
     `detail` is the TSV `Trigger` cell (added 2026-07-29): the YES/NO verdict plus a
     PASS/FAIL/MISSING token per CONDITION, so a row shows WHICH one failed and by how
     much. It grew by appending only — the five core tokens keep their position and
-    order, `earn`/`class` were appended 2026-08-02 and the two solo tokens 2026-08-03 —
-    so a parser written for the 5- or 7-token format still works. Nine tokens now:
+    order, `earn`/`class` were appended 2026-08-02 and the three solo tokens 2026-08-03
+    — so a parser written for the 5- or 7-token format still works. TEN tokens now:
         YES | FinBERT:PASS(0.8231>=0.80) FMB:PASS(0.0512<=0.14) \
 kw15_body:PASS(0.7300>=0.50) kw15_head:FAIL(0.4412<0.50) FLANG:FAIL(0.6210<0.96) \
 earn:NA class:Product_Update kw15_body_solo:PASS(0.7300>=0.70) \
-FLANG_solo:FAIL(0.6210<0.975)
-    The two solo tokens deliberately REPRINT the kw15_body and FLANG scores against
-    their own cuts, so the row records both thresholds it was judged against and stays
-    self-describing across a retune of either.
+FLANG_solo:FAIL(0.6210<0.975) FinBERT_solo:FAIL(0.8231<0.935)
+    The three solo tokens deliberately REPRINT the kw15_body / FLANG / FinBERT scores
+    against their own cuts, so the row records both thresholds it was judged against and
+    stays self-describing across a retune of either. `FMB` remains the ONLY `<=` token.
     `earn` is the one token in POINTS, not a probability, and the one with a fourth
     verdict: `earn:NA` on a row whose class is known and simply isn't Earnings_Results
     (deliberately not scored — the common case), leaving `earn:MISSING` to mean what
@@ -830,11 +863,13 @@ FLANG_solo:FAIL(0.6210<0.975)
     disagree with the gate.
 
     ⚠ The gate was an OR-of-three-legs through 2026-07-31, a pure AND on 2026-08-01, a
-    two-branch OR from 2026-08-02 and this four-branch OR from 2026-08-03; 'Keyword'
+    two-branch OR from 2026-08-02 and this five-branch OR from 2026-08-03; 'Keyword'
     means a DIFFERENT rule before/after 2026-07-28, and the FLANG labels only exist from
     2026-07-29 — see the gate comment blocks near the top of this file before comparing
     historical TSVs. The TSV header does NOT distinguish the 08-02 and 08-03 builds
-    (still 42 cols); the Trigger cell's token count (7 vs 9) does."""
+    (still 42 cols); the Trigger cell's token count does — 7 = 08-02, 10 = this build.
+    (9- and 11-token variants existed only inside the 2026-08-03 editing session and
+    never wrote a live row.)"""
     positive   = finbert_val.get('positive')
     indecisive = finmarba_val.get('indecisive')
     kw_body    = kw_val.get('kw15_body_proba')
@@ -851,32 +886,38 @@ FLANG_solo:FAIL(0.6210<0.975)
     c_fla   = flang      is not None and flang      >= FLANG_SCORE_MIN
     c_class = fine_class == EARN_CLASS
     c_earn  = earn_score is not None and earn_score >= EARN_SCORE_MIN
-    # 2026-08-03 solo cuts — the SAME two scores as c_body/c_fla, read at higher floors.
-    c_body_solo = kw_body is not None and kw_body >= KW15_BODY_SOLO_MIN
-    c_fla_solo  = flang   is not None and flang   >= FLANG_SOLO_MIN
+    # 2026-08-03 solo cuts — the SAME three scores as c_body/c_fla/c_fin, read at strictly
+    # tighter cuts, so each of these IMPLIES its core twin. There is deliberately NO
+    # `indecisive` solo cut: see the SOLO LEGS block (it is direction-agnostic).
+    c_body_solo = kw_body  is not None and kw_body  >= KW15_BODY_SOLO_MIN
+    c_fla_solo  = flang    is not None and flang    >= FLANG_SOLO_MIN
+    c_fin_solo  = positive is not None and positive >= SENTIMENT_POSITIVE_SOLO_MIN
     headline_leg = c_fin  and c_fmb
     keyword_leg  = c_body and c_head
     flang_leg    = c_fla
     # NOTE c_body is SHARED with keyword_leg — one condition, one local, two branches.
     earnings_leg = c_class and c_earn and c_body
-    # The two 2026-08-03 solo branches: one condition each, each fires on its own.
-    kwbody_solo_leg = c_body_solo
-    flang_solo_leg  = c_fla_solo
+    # The three 2026-08-03 solo branches: one condition each, each fires on its own.
+    kwbody_solo_leg  = c_body_solo
+    flang_solo_leg   = c_fla_solo
+    finbert_solo_leg = c_fin_solo
     # Appended, never reordered — every pre-existing label keeps its prefix and order.
     fired = [name for name, ok in (('Keyword',     keyword_leg),
                                    ('FinBERT_FMB', headline_leg),
                                    ('FLANG',       flang_leg),
                                    ('Earnings',    earnings_leg),
                                    ('KwBodySolo',  kwbody_solo_leg),
-                                   ('FLANGSolo',   flang_solo_leg)) if ok]
+                                   ('FLANGSolo',   flang_solo_leg),
+                                   ('FinBERTSolo', finbert_solo_leg)) if ok]
     # Core AND (2026-08-01). Equivalent to `headline_leg and keyword_leg and flang_leg`
     # — each leg is itself an AND — but spelled over the five conditions because that
     # is the rule as calibrated.
     core_and = c_fin and c_fmb and c_body and c_head and c_fla
-    # The OR over all four branches — 2026-08-02 added earnings, 2026-08-03 the two solo
+    # The OR over all five branches — 2026-08-02 added earnings, 2026-08-03 the three solo
     # legs. Every branch is added BESIDE the core AND, never inside it, so anything that
     # fired under an earlier build still fires under this one.
-    is_ok = core_and or earnings_leg or kwbody_solo_leg or flang_solo_leg
+    is_ok = (core_and or earnings_leg or kwbody_solo_leg or flang_solo_leg
+             or finbert_solo_leg)
     # A None score is the ONLY thing blocking this row: every condition that could be
     # evaluated passed, but at least one model/future gave nothing back. One term per
     # branch; `not is_ok` because a row another branch already traded has nothing blocked.
@@ -889,11 +930,12 @@ FLANG_solo:FAIL(0.6210<0.975)
     earn_missing = c_class and c_body and earn_score is None
     # Solo twin. A solo branch is a SINGLE condition, so "every evaluable condition
     # passed" degenerates to "the one score is missing" — which makes this term much
-    # louder than the other two: a dead kw or FLANG scorer now WARNs on EVERY row rather
-    # than only on rows where four other models happened to agree. That volume IS the
-    # signal; each of those scores now backs a branch that can trade unaided, so losing
-    # one silently removes a whole branch while the tape still looks alive.
-    solo_missing = (kw_body is None) or (flang is None)
+    # louder than the other two: a dead scorer now WARNs on EVERY row rather than only on
+    # rows where the other models happened to agree. That volume IS the signal; all three
+    # of these scores back a branch that can trade unaided, so losing one silently removes
+    # a whole branch while the tape still looks alive. `indecisive` is deliberately NOT
+    # here — it backs no solo branch, so core_missing above is the right scope for it.
+    solo_missing = kw_body is None or flang is None or positive is None
     missing_blocked = (not is_ok) and (core_missing or earn_missing or solo_missing)
     # is_floor=False for FMB alone — `indecisive` is a CEILING, the only <= condition.
     detail = ' '.join(
@@ -920,20 +962,24 @@ FLANG_solo:FAIL(0.6210<0.975)
     # The class is categorical, not a threshold comparison, so it gets a plain token
     # rather than a PASS/FAIL one — it doubles as the FineClass record in the log line.
     detail += f" class:{fine_class if fine_class else 'MISSING'}"
-    # The two 2026-08-03 solo cuts, APPENDED for the same reason `earn`/`class` were: the
+    # The three 2026-08-03 solo cuts, APPENDED for the same reason `earn`/`class` were: the
     # seven tokens before them keep their position, so a 5- or 7-token parser still works.
-    # They print the SAME two scores as the kw15_body / FLANG tokens above against a
-    # DIFFERENT threshold, which is the point — the row records both cuts it was judged
-    # against, and stays self-describing when either is retuned. Plain probabilities and
-    # floors, so no format overrides; _fmt_thr renders 0.975 as 0.975, not 0.97.
+    # They print the SAME three scores as the kw15_body / FLANG / FinBERT tokens above
+    # against a DIFFERENT threshold, which is the point — the row records both cuts it was
+    # judged against, and stays self-describing when either is retuned. Plain
+    # probabilities and floors, so no format overrides; _fmt_thr renders 0.975 and 0.935
+    # exactly rather than rounding them to 2 dp. There is no FMB_solo token — that leg was
+    # removed the day it was written (see the SOLO LEGS block).
     detail += ' ' + _cond_token('kw15_body_solo', kw_body, KW15_BODY_SOLO_MIN,
                                 c_body_solo, True)
     detail += ' ' + _cond_token('FLANG_solo', flang, FLANG_SOLO_MIN, c_fla_solo, True)
+    detail += ' ' + _cond_token('FinBERT_solo', positive, SENTIMENT_POSITIVE_SOLO_MIN,
+                                c_fin_solo, True)
     # `fired` alone is NOT the condition here: a row can still have a leg true and not
     # fire, and labelling it after that leg would contradict the gate. The 2026-08-03
     # solo branches NARROWED this window but did not close it — e.g. kw15_body 0.55
-    # (Keyword true with kw15_head, below the 0.70 solo cut), FLANG under 0.96, not an
-    # earnings PR: `fired` reads ['Keyword'] and the gate says BAD.
+    # (Keyword true with kw15_head, below the 0.70 solo cut), FLANG under 0.96, FinBERT
+    # under 0.935, not an earnings PR: `fired` reads ['Keyword'] and the gate says BAD.
     label = '_'.join(fired) if is_ok else 'BAD'
     return is_ok, label, f"{'YES' if is_ok else 'NO'} | {detail}", missing_blocked
 
@@ -1778,15 +1824,16 @@ def main():
     # says which one is live (the TSV header is identical across the 08-02 and 08-03
     # builds). This line is the cheapest way to answer "which gate is this process
     # running?" from logs/ alone.
-    logger.info("[Gate] ACTIVE — OR of 4 branches: "
+    logger.info("[Gate] ACTIVE — OR of 5 branches: "
                 "(1) CORE FinBERT>=%s AND FMB<=%s AND kw15_body>=%s AND kw15_head>=%s "
                 "AND FLANG>=%s | (2) EARNINGS class==%s AND earn>=%d AND kw15_body>=%s | "
-                "(3) KwBodySolo kw15_body>=%s | (4) FLANGSolo FLANG>=%s",
+                "(3) KwBodySolo kw15_body>=%s | (4) FLANGSolo FLANG>=%s | "
+                "(5) FinBERTSolo positive>=%s",
                 _fmt_thr(SENTIMENT_POSITIVE_MIN), _fmt_thr(FMB_INDECISIVE_MAX),
                 _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_HEAD_MIN),
                 _fmt_thr(FLANG_SCORE_MIN), EARN_CLASS, EARN_SCORE_MIN,
                 _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_BODY_SOLO_MIN),
-                _fmt_thr(FLANG_SOLO_MIN))
+                _fmt_thr(FLANG_SOLO_MIN), _fmt_thr(SENTIMENT_POSITIVE_SOLO_MIN))
 
     # Load the universe (plain membership — no float filter). _iti_df also backs the
     # Float/MktCap/Exchange/close/ITI/tradeSize lookups for the TSV + clerk arm. The

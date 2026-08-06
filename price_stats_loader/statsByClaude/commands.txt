@@ -130,3 +130,12 @@ LouMcD-SDict_Body_sentiment_score \
 --subset-date-from 2026-06-20 --report-suffix _OOSonly
 
 
+
+##### CLASS PREDICTIVENESS (hit-rate framing) - 2026-08-05
+##### Ranks BroadClass/FineClass by P(fromPR_High(%) >= 30) with Wilson CIs and
+##### BH-FDR, then finds the best within-class encoder cut per class. Complements
+##### class_conditional_predictors.py (which ranks encoders by within-class AUC);
+##### this one ranks the CLASSES themselves and reports precision, not AUC.
+/home/tom/venv/bin/python class_hitrate_ranking.py \
+../outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_Classed_BodyEnc_clean_FromPRhigh.tsv \
+--threshold 30
