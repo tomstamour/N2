@@ -26,6 +26,8 @@ tables/
 logs/
 # regenerated FinBERT ONNX model (rebuild with setup.sh / FinBERT-*.py --export)
 finbert_onnx/
+# regenerated FinBERT ONNX feature-extraction model (rebuild with finbert_embed_core.py --export)
+finbert_feat_onnx/
 
 # --- but DO track the .tsv outputs in price_stats_loader/outputs/ ---
 # (re-include the folder first, since a file can't be un-ignored while its parent dir is)
