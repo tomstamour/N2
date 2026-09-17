@@ -24,11 +24,31 @@ Extraction families (each hit keeps the metric, the value and the sentence):
     I. size-relative     extracted revenue/profit $ divided by float-cap
                          (Float x LastDailyClose; batch mode only)
 
-Scoring: additive points per family; thresholds/points come from a params dict.
-Defaults are the calibrated values in earn_score_params.json next to this
-script (written by evaluate_earning_scorer.py); built-in provisional values are
-used when that file is absent.  Output = EarningScore (points, can be negative)
-plus an EarnBreakdown observability string ("revG:+3(60.0%) rec:+1 ...").
+The family set is deliberately still A-I after the 2026-08-14 rebuild.  Two
+candidate families were tested against the train block and REJECTED — see
+"rejected families" in Earnings_text_structures_report.md.  Extraction is not
+the weak link: only 2 of the 30 train-block positives have nothing to extract.
+
+TWO SCORES ARE EMITTED, and the distinction is load-bearing:
+
+    EarningScore    int, "points".  FROZEN — this is the field the live trade
+                    gate reads (`EarningScore >= 4` in
+                    orchestrator5/orchestrator_trigger_rules.txt).  Families
+                    A-I only, thresholds/points from earn_score_params.json.
+                    Family J does NOT feed it.  Do not change its scale: the
+                    gate's integer cut would silently mean something else, and
+                    O5.2 refuses to start on a fractional threshold.
+
+    EarnScoreNorm   float in [0,1], the 2026-08-14 rebuild.  Freely re-derived
+                    weights over the same families, fitted on the
+                    2026-05-04..08-13 corpus, weights in earn_norm_params.json.
+                    Nothing live reads it yet.  It is a RANKING score, not a
+                    calibrated probability — the base rate is regime-shifted
+                    across the corpus, so the absolute value does not transfer.
+
+Both params files are written by evaluate_earning_scorer.py; built-in
+provisional values are used when a file is absent.  EarnBreakdown /
+EarnNormBreakdown are the matching observability strings.
 
 CLI (mirrors keyword_scorer-2.py conventions):
     batch:  /home/tom/venv/bin/python earning_scorer.py --input FILE.tsv
@@ -37,6 +57,7 @@ CLI (mirrors keyword_scorer-2.py conventions):
                 --stdin --headline-text "Some headline"   -> JSON on stdout
 
 Module use:  from earning_scorer import extract_metrics, score_metrics
+             (live path), or score_norm for the rebuilt score.
 """
 
 import argparse
@@ -49,8 +70,9 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_INPUT = os.path.join(SCRIPT_DIR,
-                             "PRstats_2026-05-04-2026-07-30_EarningResults.tsv")
+                             "PRstats_2026-05-04-2026-08-13_EarningResults.tsv")
 DEFAULT_PARAMS_FILE = os.path.join(SCRIPT_DIR, "earn_score_params.json")
+DEFAULT_NORM_FILE = os.path.join(SCRIPT_DIR, "earn_norm_params.json")
 
 # --------------------------------------------------------------------------
 # metric vocabulary
@@ -532,11 +554,133 @@ def score_metrics(feats, params=None):
     return pts, " ".join(parts) if parts else "none"
 
 
-def score_text(headline, body, mktcap=None, params=None):
+# --------------------------------------------------------------------------
+# EarnScoreNorm: the 2026-08-14 rebuild (0-1)
+#
+# Everything above this line is FROZEN because the live gate reads it.  This
+# block is the retrained score: same extraction, freely re-derived weights.
+#
+# The indicator set is defined HERE, not in the evaluator, so the weights are
+# fitted against exactly the booleans that runtime will compute.  If a feature
+# is added, it appears in both places at once or in neither.
+# --------------------------------------------------------------------------
+def _best(feats, key):
+    """Best of the body (earn_) and headline (earnH_) value for one metric."""
+    vals = [feats.get("earn_" + key, float("nan")),
+            feats.get("earnH_" + key, float("nan"))]
+    vals = [v for v in vals if isinstance(v, (int, float)) and not math.isnan(v)]
+    return max(vals) if vals else float("nan")
+
+
+def _ge(v, thr):
+    return (not math.isnan(v)) and v >= thr
+
+
+# name -> fn(feats, thresholds) -> bool.  Order fixes the weight-vector order.
+NORM_FEATURES = {
+    # headline channel — the strongest structures in the 2026-08-13 corpus
+    "hl_rev_growth":  lambda f, t: _ge(f.get("earnH_rev_growth_pct", float("nan")),
+                                       t["rev_lo"]),
+    "hl_has_pct":     lambda f, t: bool(f.get("earnH_has_pct", 0)),
+    "hl_has_metric":  lambda f, t: bool(f.get("earnH_has_metric", 0)),
+    # growth
+    "rev_growth_lo":  lambda f, t: _ge(_best(f, "rev_growth_pct"), t["rev_lo"]),
+    "rev_growth_hi":  lambda f, t: _ge(_best(f, "rev_growth_pct"), t["rev_hi"]),
+    "rev_decline":    lambda f, t: (lambda v: (not math.isnan(v)) and v < 0)(
+                                       _best(f, "rev_growth_pct")),
+    "prof_growth":    lambda f, t: _ge(_best(f, "profit_growth_pct"), t["prof_thr"]),
+    # claims / guidance / flips
+    "record":         lambda f, t: (f.get("earn_record_count", 0)
+                                    + f.get("earnH_record_count", 0)) > 0,
+    "guid_raise":     lambda f, t: max(f.get("earn_guidance", 0),
+                                       f.get("earnH_guidance", 0)) > 0,
+    "guid_cut":       lambda f, t: min(f.get("earn_guidance", 0),
+                                       f.get("earnH_guidance", 0)) < 0,
+    "expects_record": lambda f, t: bool(f.get("earn_expects_record", 0)
+                                        or f.get("earnH_expects_record", 0)),
+    "profit_flip":    lambda f, t: bool(f.get("earn_profit_flip", 0)),
+    "margin_up":      lambda f, t: _ge(f.get("earn_margin_delta_bps", float("nan")),
+                                       t["margin_bps_thr"]),
+    "neg_flag":       lambda f, t: f.get("earn_neg_flags", 0) > 0,
+    # size-relative
+    "rev_fcap":       lambda f, t: _ge(f.get("earn_rev_to_floatcap", float("nan")),
+                                       t["rev_fcap_thr"]),
+    "prof_fcap":      lambda f, t: _ge(f.get("earn_profit_to_floatcap", float("nan")),
+                                       t["prof_fcap_thr"]),
+    # shape of the PR itself
+    "no_structure":   lambda f, t: f.get("earn_n_hits", 0) == 0,
+    "sched_only":     lambda f, t: bool(f.get("earn_scheduling_only", 0)),
+}
+
+# The fitted 2026-08-14 values, mirrored here because earn_norm_params.json is
+# GITIGNORED (the repo whitelist tracks no .json) -- on a fresh clone the file
+# does not exist, and a zeroed fallback would silently return 0.5 for every PR.
+# evaluate_earning_scorer.py overwrites the file; if you re-run it, paste the
+# new numbers here too or the clone and this disk will disagree.
+BUILTIN_NORM = {
+    "thresholds": {"rev_lo": 10.0, "rev_hi": 75.0, "prof_thr": 30.0,
+                   "margin_bps_thr": 200.0, "rev_fcap_thr": 0.25,
+                   "prof_fcap_thr": 0.1},
+    "weights": {
+        "hl_rev_growth": 0.35, "hl_has_pct": 0.30, "hl_has_metric": 0.40,
+        "rev_growth_lo": 0.60, "rev_growth_hi": -0.10, "rev_decline": -0.25,
+        "prof_growth": 0.35, "record": 0.0, "guid_raise": 0.25,
+        "guid_cut": 0.0, "expects_record": 0.0, "profit_flip": 0.20,
+        "margin_up": -0.10, "neg_flag": 0.05, "rev_fcap": 0.35,
+        "prof_fcap": 0.10, "no_structure": -0.25, "sched_only": 0.0,
+    },
+    "bias": -0.70,
+}
+
+
+def load_norm_params(path=None):
+    path = path or DEFAULT_NORM_FILE
+    if os.path.exists(path):
+        with open(path) as fh:
+            n = json.loads(json.dumps(BUILTIN_NORM))     # deep copy of defaults
+            loaded = json.load(fh)
+            n["thresholds"].update(loaded.get("thresholds", {}))
+            n["weights"].update(loaded.get("weights", {}))
+            n["bias"] = loaded.get("bias", n["bias"])
+            return n
+    return json.loads(json.dumps(BUILTIN_NORM))
+
+
+def norm_indicators(feats, thresholds):
+    """The binary feature vector, as a dict.  Shared by fit and runtime."""
+    return {name: bool(fn(feats, thresholds)) for name, fn in NORM_FEATURES.items()}
+
+
+def score_norm(feats, norm=None):
+    """feats -> (EarnScoreNorm in [0,1], breakdown string).
+
+    Ranking score, NOT a calibrated probability: the >=30% base rate moves
+    5.0% -> 20.9% -> 20.0% -> 13.4% across May..Aug 2026, so the absolute
+    value does not transfer between regimes.  Compare rows, not thresholds.
+    """
+    n = norm or load_norm_params()
+    ind = norm_indicators(feats, n["thresholds"])
+    raw = float(n["bias"])
+    parts = []
+    for name, on in ind.items():
+        if not on:
+            continue
+        w = float(n["weights"].get(name, 0.0))
+        raw += w
+        if w:
+            parts.append(f"{name}:{w:+.2f}")
+    proba = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, raw))))
+    return proba, " ".join(parts) if parts else "none"
+
+
+def score_text(headline, body, mktcap=None, params=None, norm=None):
     feats = extract_metrics(headline, body, mktcap)
     score, breakdown = score_metrics(feats, params)
     feats["EarningScore"] = score
     feats["EarnBreakdown"] = breakdown
+    nscore, nbreak = score_norm(feats, norm)
+    feats["EarnScoreNorm"] = nscore
+    feats["EarnNormBreakdown"] = nbreak
     return feats
 
 
@@ -575,15 +719,19 @@ def _row_size_dollars(r):
     return None
 
 
-def score_dataframe(df, params=None):
+def score_dataframe(df, params=None, norm=None):
     import pandas as pd
+    params = params or load_params()
+    norm = norm or load_norm_params()
     rows = []
     for _, r in df.iterrows():
         feats = score_text(str(r.get("Headline", "")), str(r.get("Body", "")),
-                           _row_size_dollars(r), params)
+                           _row_size_dollars(r), params, norm)
         rows.append({c: feats.get(c) for c in FEATURE_COLS}
                     | {"EarningScore": feats["EarningScore"],
-                       "EarnBreakdown": feats["EarnBreakdown"]})
+                       "EarnBreakdown": feats["EarnBreakdown"],
+                       "EarnScoreNorm": feats["EarnScoreNorm"],
+                       "EarnNormBreakdown": feats["EarnNormBreakdown"]})
     return pd.concat([df.reset_index(drop=True),
                       pd.DataFrame(rows)], axis=1)
 
@@ -596,6 +744,9 @@ def main():
     ap.add_argument("--params", default=None,
                     help="score params JSON (default: earn_score_params.json "
                          "next to this script, else built-ins)")
+    ap.add_argument("--norm-params", default=None,
+                    help="EarnScoreNorm weights JSON (default: "
+                         "earn_norm_params.json next to this script)")
     ap.add_argument("--stdin", action="store_true",
                     help="read one Body from stdin, print JSON")
     ap.add_argument("--headline-text", default="", help="headline for --stdin")
@@ -603,10 +754,11 @@ def main():
     args = ap.parse_args()
 
     params = load_params(args.params)
+    norm = load_norm_params(args.norm_params)
 
     if args.stdin:
         body = sys.stdin.read()
-        feats = score_text(args.headline_text, body, args.mktcap, params)
+        feats = score_text(args.headline_text, body, args.mktcap, params, norm)
         feats.pop("_body_hits", None)
         feats.pop("_head_hits", None)
         out = {k: (None if isinstance(v, float) and math.isnan(v) else v)
@@ -616,13 +768,17 @@ def main():
 
     import pandas as pd
     df = pd.read_csv(args.input, sep="\t")
-    scored = score_dataframe(df, params)
+    scored = score_dataframe(df, params, norm)
     out = args.out or re.sub(r"\.tsv$", "", args.input) + "_earnScored.tsv"
     scored.to_csv(out, sep="\t", index=False)
     print(f"wrote {out}  ({len(scored)} rows)")
     sc = scored["EarningScore"]
-    print(f"EarningScore: min {sc.min()}  median {sc.median()}  max {sc.max()}  "
-          f">0: {(sc > 0).sum()}  >=3: {(sc >= 3).sum()}")
+    print(f"EarningScore (frozen, live gate reads this): min {sc.min()}  "
+          f"median {sc.median()}  max {sc.max()}  >0: {(sc > 0).sum()}  "
+          f">=4: {(sc >= 4).sum()}")
+    ns = scored["EarnScoreNorm"]
+    print(f"EarnScoreNorm (rebuilt 0-1): min {ns.min():.3f}  median "
+          f"{ns.median():.3f}  max {ns.max():.3f}  >=0.5: {(ns >= 0.5).sum()}")
 
 
 if __name__ == "__main__":

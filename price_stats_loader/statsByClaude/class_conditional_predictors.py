@@ -11,12 +11,12 @@ Answers two questions:
 
 Columns are auto-oriented: any column whose full-corpus AUC at the primary
 threshold is < 0.5 is negated everywhere and labeled `col(inv)` (this catches
-FinMarBa_indecisive and FinancialBERT_negative without a hardcoded list).
+FinMarBa_ind_hd and FinancialB_neg_hd without a hardcoded list).
 After orientation a within-class AUC < 0.5 means the signal REVERSES inside
 that class. Class movers below --min-pos flag the cell `~` (unreliable).
 
-A TP/FP section breaks four fixed triggers (live gate positive>=0.8,
-FLANG-BERT_positive>=0.95, FinMarBa_indecisive<=0.1,
+A TP/FP section breaks four fixed triggers (live gate Prosus_pos_hd>=0.8,
+FLANG_pos_hd>=0.95, FinMarBa_ind_hd<=0.1,
 nocoref_neutral_filter>=0.5) down per class — same firing semantics as
 false_positive_count.py.
 
@@ -38,27 +38,27 @@ from scipy.stats import rankdata
 TARGET_DEFAULT = "fromPR_High(%)"
 
 COLUMNS_DEFAULT = [
-    "FinMarBa_indecisive",
-    "positive",
-    "FLANG-BERT_positive",
-    "FLANG-ELECTRA_sentiment_score",
-    "Trading-Hero_sentiment_score",
-    "DeBERTa_positive",
-    "sentiment_score",
-    "ModernBERT_positive",
+    "FinMarBa_ind_hd",
+    "Prosus_pos_hd",
+    "FLANG_pos_hd",
+    "FLElectra_ss_hd",
+    "TradeHero_ss_hd",
+    "DeBERTa_pos_hd",
+    "Prosus_ss_hd",
+    "ModernB_pos_hd",
     "nocoref_neutral_filter",
-    "distilroberta_sentiment_score",
-    "finbert-tone_sentiment_score",
-    "RoBERTa_sentiment_score",
-    "LouMcD-SDict_sentiment_score",
-    "FinancialBERT_negative",
+    "DistilRo_ss_hd",
+    "FinTone_ss_hd",
+    "RoBERTa_ss_hd",
+    "LouMcD_ss_hd",
+    "FinancialB_neg_hd",
 ]
 
 # (column, cutoff, fire_low) — fire_low=True fires on value <= cutoff.
 TRIGGERS_DEFAULT = [
-    ("positive", 0.8, False),
-    ("FLANG-BERT_positive", 0.95, False),
-    ("FinMarBa_indecisive", 0.1, True),
+    ("Prosus_pos_hd", 0.8, False),
+    ("FLANG_pos_hd", 0.95, False),
+    ("FinMarBa_ind_hd", 0.1, True),
     ("nocoref_neutral_filter", 0.5, False),
 ]
 
@@ -68,7 +68,7 @@ COND_RE = re.compile(r"^\s*(.+?)\s*(>=|<=)\s*([-+0-9.eE]+)\s*$")
 
 
 def parse_trigger(spec, columns):
-    """'FinMarBa_indecisive<=0.1' -> ('FinMarBa_indecisive', 0.1, True)."""
+    """'FinMarBa_ind_hd<=0.1' -> ('FinMarBa_ind_hd', 0.1, True)."""
     m = COND_RE.match(spec)
     if not m:
         sys.exit(f"bad trigger {spec!r}; expected 'COLUMN>=VALUE' or "
@@ -119,7 +119,7 @@ def main():
     ap.add_argument("--columns", nargs="+", default=COLUMNS_DEFAULT)
     ap.add_argument("--triggers", nargs="+", default=None, metavar="SPEC",
                     help="trigger specs for the per-class TP/FP table, e.g. "
-                         "'positive>=0.8' 'FinMarBa_indecisive<=0.1'. "
+                         "'Prosus_pos_hd>=0.8' 'FinMarBa_ind_hd<=0.1'. "
                          "Default: the four headline triggers.")
     ap.add_argument("--report-suffix", default="",
                     help="appended to the report filename; use it when running "

@@ -34,8 +34,8 @@ Library usage:
 
     load_model()                      # optional pre-warm
     result = analyze_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.82, "negative": 0.03, "neutral": 0.15,
-    #  "sentiment_score": 0.79, "label": "positive", "inference_ms": 92.4}
+    # {"headline": "...", "pos": 0.82, "neg": 0.03, "neu": 0.15,
+    #  "ss": 0.79, "lab": "positive", "ms": 92.4}
 """
 
 import argparse
@@ -276,17 +276,17 @@ def analyze_headline(
 
     Returns (default labels):
         {
-            "headline":        str,
-            "positive":        float,
-            "negative":        float,
-            "neutral":         float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax label
-            "inference_ms":    float,   # tokenize + forward + decode wall time
+            "headline": str,
+            "pos":      float,
+            "neg":      float,
+            "neu":      float,
+            "ss":       float,   # positive - negative
+            "lab":      str,     # argmax label
+            "ms":       float,   # tokenize + forward + decode wall time
         }
 
-    With custom labels, the three fixed keys and sentiment_score are replaced
-    by a "scores" dict keyed by label.
+    With custom labels, the three fixed keys and `ss` are replaced by a "scores"
+    dict keyed by label (CLI-only; the batch scorers never take that branch).
     """
     load_model(model_dir)
 
@@ -295,14 +295,20 @@ def analyze_headline(
     scores = _inferencer.predict(headline, labels)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). `scores` is
+    # keyed by the caller's label strings and is mapped explicitly rather than
+    # update()d, so `lab` keeps yielding a full word. `ms` unifies what this file
+    # called `inference_ms` with the other headliners' `elapsed_ms`.
     result: Dict = {"headline": headline}
     if labels == DEFAULT_LABELS:
-        result.update(scores)
-        result["sentiment_score"] = round(scores["positive"] - scores["negative"], 4)
+        result["pos"] = scores["positive"]
+        result["neg"] = scores["negative"]
+        result["neu"] = scores["neutral"]
+        result["ss"]  = round(scores["positive"] - scores["negative"], 4)
     else:
         result["scores"] = scores
-    result["label"]        = max(scores, key=scores.get)
-    result["inference_ms"] = round(elapsed_ms, 1)
+    result["lab"] = max(scores, key=scores.get)
+    result["ms"]  = round(elapsed_ms, 1)
     return result
 
 
@@ -353,7 +359,7 @@ def _run_benchmark(headline: str, labels: Optional[List[str]], repeats: int) -> 
 
     timings = []
     for _ in range(repeats):
-        timings.append(analyze_headline(headline, labels)["inference_ms"])
+        timings.append(analyze_headline(headline, labels)["ms"])
 
     t = np.array(timings)
     print(json.dumps({

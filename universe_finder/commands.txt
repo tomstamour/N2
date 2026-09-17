@@ -15,3 +15,16 @@ python3 trade_frequency_addOn.py \
 python3 pipeline_daily.py --max-float 50 --limit 100
 python3 ./daily_universe_pipeline-2.py --max-float 50  #--limit 4000
 
+
+####
+python3 trade_frequency_and_size_backfill_AddON.py --input ../price_stats_loader/outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip_11EncBodyScored_11EncScored_mktstate_SIback_noDupCol_FinBERTScored.tsv \
+--date-col ArrivalDate \
+--days-prior 1 \
+--port 4002 \
+--log log-09-02
+
+
+
+
+
+

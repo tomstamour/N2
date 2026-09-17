@@ -26,9 +26,9 @@ Library usage (hyphenated filename needs importlib):
     spec.loader.exec_module(mod)
 
     result = mod.score_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.91, "neutral": 0.07,
-    #  "negative": 0.02, "sentiment_score": 0.89, "label": "positive",
-    #  "elapsed_ms": 12.3}
+    # {"headline": "...", "pos": 0.91, "neu": 0.07,
+    #  "neg": 0.02, "ss": 0.89, "lab": "positive",
+    #  "ms": 12.3}
 """
 
 import argparse
@@ -245,12 +245,12 @@ def score_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     Returns:
         {
             "headline":        str,
-            "positive":        float,
-            "neutral":         float,
-            "negative":        float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax of the three classes
-            "elapsed_ms":      float,   # tokenize + forward wall time
+            "pos":             float,
+            "neu":             float,
+            "neg":             float,
+            "ss":              float,   # positive - negative
+            "lab":             str,     # argmax of the three classes
+            "ms":              float,   # tokenize + forward wall time
         }
     """
     load_model(model_dir)
@@ -259,12 +259,13 @@ def score_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     label = max(LABEL_ORDER, key=lambda k: scores[k])
     return {
         "headline":        headline,
-        "positive":        scores["positive"],
-        "neutral":         scores["neutral"],
-        "negative":        scores["negative"],
-        "sentiment_score": scores["sentiment_score"],
-        "label":           label,
-        "elapsed_ms":      scores["elapsed_ms"],
+        # Unified 2026-08-09 key names; internals keep full words (see FinMarBa).
+        "pos": scores["positive"],
+        "neu": scores["neutral"],
+        "neg": scores["negative"],
+        "ss":  scores["sentiment_score"],
+        "lab": label,
+        "ms":  scores["elapsed_ms"],
     }
 
 

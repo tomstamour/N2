@@ -67,7 +67,8 @@ CSV_URL = (
 )
 DICT_VERSION = "1993-2025"
 
-# CSV column name → output key
+# CSV column name → internal category name. These full words stay: they key the
+# `counts` / `matched` / `proportions` dicts and read far better in `matched_words`.
 CATEGORIES = {
     "Negative":     "negative",
     "Positive":     "positive",
@@ -76,6 +77,18 @@ CATEGORIES = {
     "Strong_Modal": "strong_modal",
     "Weak_Modal":   "weak_modal",
     "Constraining": "constraining",
+}
+
+# Internal category name → unified output key (2026-08-09). Applied only to the
+# seven flat count keys of the public result; see score_headline.
+CATEGORY_KEYS = {
+    "negative":     "neg",
+    "positive":     "pos",
+    "uncertainty":  "unc",
+    "litigious":    "lit",
+    "strong_modal": "smod",
+    "weak_modal":   "wmod",
+    "constraining": "cons",
 }
 
 TOKEN_RE = re.compile(r"[A-Z]+")
@@ -190,20 +203,24 @@ def score_headline(headline: str, dict_file: Path = DICT_FILE) -> Dict:
     Returns:
         {
             "headline":        str,
-            "negative":        int,    # matched-word counts per LM category
-            "positive":        int,
-            "uncertainty":     int,
-            "litigious":       int,
-            "strong_modal":    int,
-            "weak_modal":      int,
-            "constraining":    int,
-            "proportions":     dict,   # count / total_tokens per category
-            "matched_words":   dict,   # category -> matched words (non-empty only)
-            "total_tokens":    int,
-            "sentiment_score": float,  # (pos - neg) / (pos + neg), 0.0 if no hits
-            "label":           str,    # positive / negative / neutral
-            "elapsed_ms":      float,  # tokenize + lookup wall time
+            "neg":             int,    # matched-word counts per LM category
+            "pos":             int,
+            "unc":             int,
+            "lit":           int,
+            "smod":          int,
+            "wmod":          int,
+            "cons":          int,
+            "proportions":   dict,   # count / total_tokens per category
+            "matched_words": dict,   # category -> matched words (non-empty only)
+            "total_tokens":  int,
+            "ss":            float,  # (pos - neg) / (pos + neg), 0.0 if no hits
+            "lab":           str,    # positive / negative / neutral
+            "ms":            float,  # tokenize + lookup wall time
         }
+
+    The two nested dicts (`proportions`, `matched_words`) keep the FULL category
+    names as their inner keys: they are never flattened into columns, and
+    `matched_words` reads far better as {"litigious": [...]} than {"lit": [...]}.
     """
     load_model(dict_file)
 
@@ -228,15 +245,18 @@ def score_headline(headline: str, dict_file: Path = DICT_FILE) -> Dict:
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     total = len(tokens)
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). Only the
+    # seven flat COUNT keys are shortened, via CATEGORY_KEYS; the nested dicts below
+    # stay keyed by full category name because they never become columns.
     result: Dict = {"headline": headline}
-    result.update(counts)
-    result["proportions"]     = {k: round(c / total, 4) if total else 0.0
-                                 for k, c in counts.items()}
-    result["matched_words"]   = {k: v for k, v in matched.items() if v}
-    result["total_tokens"]    = total
-    result["sentiment_score"] = round(sentiment_score, 4)
-    result["label"]           = label
-    result["elapsed_ms"]      = round(elapsed_ms, 3)
+    result.update({CATEGORY_KEYS[k]: c for k, c in counts.items()})
+    result["proportions"]   = {k: round(c / total, 4) if total else 0.0
+                               for k, c in counts.items()}
+    result["matched_words"] = {k: v for k, v in matched.items() if v}
+    result["total_tokens"]  = total
+    result["ss"]            = round(sentiment_score, 4)
+    result["lab"]           = label
+    result["ms"]            = round(elapsed_ms, 3)
     return result
 
 

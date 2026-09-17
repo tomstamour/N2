@@ -4,8 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
+⚠ **Column names changed on 2026-08-09** — every sentiment column across the repo
+now follows `{Model}_{channel}_{hd|bd}` (`Prosus_ss_hd`, `FinMarBa_ind_hd`,
+`FLANG_pos_bd`, `kw15_proba_bd`, …). The scripts here were updated with it, so they
+expect the NEW names; an unmigrated corpus must be run through
+`../../tools/Encoder_Models/rename_encoder_cols.py` first (header rewrite only, no
+value changes). Two structural consequences for anything written here:
+head/body is now a terminal `_hd`/`_bd` **suffix** rather than a `_Body_` **infix**
+(so `BODY_MARKER` splitting is gone), and the channel is an **infix** rather than a
+suffix (so `endswith("_sentiment_score")` became `endswith(("_ss_hd", "_ss_bd"))`).
+See `../../tools/Encoder_Models/CLAUDE.md` for the full convention.
+
 This directory holds a single self-contained statistics task: rank the 6
-FinBERT-derived sentiment columns (`sentiment_score`, `neutral_filter`,
+FinBERT-derived sentiment columns (`Prosus_ss_hd`, `neutral_filter`,
 `confidence_weighted`, `net_score`, `top_k`, `positional`) on how well each —
 and each 2- and 3-column combination — predicts a binary "big mover" event
 defined as `DailyHigh(%) >= threshold` (default 20). The script

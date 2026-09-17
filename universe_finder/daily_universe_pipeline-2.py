@@ -116,7 +116,7 @@ _OUTPUT_STEM = "stocks_universe"
 # Float_M / MarketCap_M applied BEFORE IBKR fetches; price applied after.
 # Strict: NaN in any criterion = drop.
 _FILTER_MAX_FLOAT_M = 50.0    # Float_M must be < 50 M shares
-_FILTER_MAX_MCAP_M  = 40.0    # MarketCap_M must be < 40 M
+_FILTER_MAX_MCAP_M  = 50.0    # MarketCap_M must be < 50 M
 _FILTER_MAX_PRICE   = 6.00    # LastDailyClosePrice must be < $6.00
 
 # The trade-size addon module has a literal '.' in its filename
@@ -333,6 +333,77 @@ def _run_concurrent(ib, symbols, coro_factory, is_empty, nan_value, label, args)
     return results
 
 
+def _fetch_borrow(ib, symbols, qualified, args) -> dict:
+    """Step 3.6 — the borrow map {SYMBOL: {fee, rebate, available, ...}}.
+
+    Two halves, because IBKR serves them through different mechanisms:
+
+      * fee + rebate come from FEE_RATE / REBATE_RATE daily bars, i.e. ordinary
+        historical requests — so they go through _run_concurrent and inherit its
+        reconnect/disconnect semantics and NaN fill. Concurrency is its own knob
+        (default 4, the same rung of the ladder that tamed the Error 162/366
+        slot-exhaustion cascade) because this adds ~2 requests per symbol.
+      * shortable shares come from a market-data subscription (generic tick
+        236), which is not request/response and cannot go through
+        _run_concurrent; ibkr_borrow_addOn batches and cancels those itself.
+
+    Contracts are reused from Step 2, exactly as Step 3 does: a symbol that
+    failed to qualify there short-circuits rather than paying for a re-qualify.
+    See ibkr_borrow_addOn.py for why this replaced the two dead web sources.
+    """
+    import ibkr_borrow_addOn as borrow  # noqa: E402
+
+    nan = float("nan")
+    sym_to_contract = dict(zip(symbols, qualified))
+    n_qualified = sum(1 for c in qualified if c is not None)
+    log.info(f"Step 3.6/3 — fetching borrow fee/rebate for {n_qualified} "
+             f"qualified symbols (concurrency={args.borrow_concurrency}) …")
+
+    borrow_sem = asyncio.Semaphore(args.borrow_concurrency)
+
+    async def _borrow_one(symbol):
+        contract = sym_to_contract.get(symbol)
+        if contract is None:
+            return (nan, nan, nan)
+        return await borrow.fetch_borrow_async(
+            ib, str(symbol), borrow_sem,
+            args.borrow_timeout, args.borrow_retries,
+            contract=contract,
+        )
+
+    rates = _run_concurrent(
+        ib, symbols,
+        coro_factory=_borrow_one,
+        is_empty=lambda r: r[0] != r[0],      # fee is NaN
+        nan_value=(nan, nan, nan),
+        label="borrow fetch",
+        args=args,
+    )
+    n_fee = sum(1 for r in rates if r[0] == r[0])
+    log.info(f"  borrow: fee for {n_fee}/{n_qualified}, "
+             f"rebate for {sum(1 for r in rates if r[1] == r[1])}")
+
+    contracts = [c for c in qualified if c is not None]
+    avail = borrow.fetch_shortable_shares(ib, contracts)
+    log.info(f"  borrow: shortable shares for {len(avail)}/{len(contracts)}")
+
+    # Record tonight's snapshot BEFORE computing the deltas — avail_metrics
+    # indexes 5 sessions back from the newest entry, which is only correct when
+    # the newest entry is tonight. append_avail_snapshot returns the updated
+    # history for exactly that reason.
+    history_path = str(_DATA_DIR / "borrow_avail_history.tsv")
+    history = borrow.append_avail_snapshot(
+        history_path, borrow.session_date(), avail)
+
+    borrow_map = borrow.build_borrow_map(symbols, rates, avail, history)
+    n_delta = sum(1 for e in borrow_map.values()
+                  if e['avail_delta_5d_pct'] is not None)
+    log.info(f"  borrow: {len(borrow_map)} symbols with any borrow data; "
+             f"{n_delta} with an availability delta (needs "
+             f"{borrow.BORROW_DELTA_SESSIONS}+ sessions in the store).")
+    return borrow_map
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch NASDAQ symbol list with floats, IBKR close prices, and trade frequency."
@@ -429,7 +500,40 @@ def main() -> None:
                         help="Step 8: skip the per-symbol iBorrowDesk calls "
                              "(~0.8 s each). Faster, but CTB_FeeDelta5d / "
                              "Borrow_AvailDelta5dPct / Borrow_UtilProxy stay "
-                             "blank and SqueezeScore loses those components.")
+                             "blank and SqueezeScore loses those components. "
+                             "Has no effect unless --no-ibkr-borrow is also "
+                             "set: the IBKR-API borrow fetch (Step 3.6) "
+                             "bypasses iBorrowDesk entirely.")
+    parser.add_argument("--no-ibkr-borrow", action="store_true",
+                        help="Skip Step 3.6, the IBKR borrow fetch (FEE_RATE / "
+                             "REBATE_RATE daily bars + shortable shares via "
+                             "generic tick 236). Step 8 then falls back to the "
+                             "legacy web sources — both of which are dead "
+                             "(iBorrowDesk 403s since 2026-07-22; the "
+                             "shortstock FTP has never been reachable), so "
+                             "the seven borrow columns will be blank.")
+    parser.add_argument("--borrow-concurrency", type=int, default=4,
+                        metavar="N",
+                        help="Max in-flight IBKR requests for Step 3.6. "
+                             "Default 4, matching the --freq-concurrency rung "
+                             "that tamed the Error 162/366 slot-exhaustion "
+                             "cascade; this step adds ~2 historical requests "
+                             "per symbol, so raising it risks reopening that.")
+    parser.add_argument("--borrow-timeout", type=int, default=60,
+                        metavar="SEC",
+                        help="Per-request timeout for the Step 3.6 rate bars. "
+                             "Default 60 for the same reason the cron passes "
+                             "--freq-timeout 60: measured tail latency on these "
+                             "rate bars reaches 24 s against a median of ~6 s, "
+                             "and at 30 s that tail times out (REBATE_RATE lost "
+                             "2 of 20 symbols at concurrency 4). Retries are 0, "
+                             "so a generous timeout is the cheap side of the "
+                             "trade.")
+    parser.add_argument("--borrow-retries", type=int, default=0, metavar="N",
+                        help="Per-request retries for Step 3.6; default 0 for "
+                             "the same reason as --freq-retries — a symbol "
+                             "with no borrow-rate history won't grow one on a "
+                             "retry.")
     args = parser.parse_args()
 
     # Legacy --concurrency seeds whichever per-step knob the user didn't set.
@@ -502,6 +606,10 @@ def main() -> None:
     eth_results: list      = [nan] * total
     rth_size_results: list = [nan] * total
     eth_size_results: list = [nan] * total
+    # Step 3.6's output. Empty means "no borrow data" all the way through to
+    # Step 8, which is the same shape a failed/skipped fetch produces — so any
+    # exit path still yields a complete file.
+    borrow_by_symbol: dict = {}
 
     # ── Steps 2+3: single IBKR connection for both fetches ───────────────────
     log.info(f"Step 2/3 — fetching IBKR close prices from {args.host}:{args.port} "
@@ -649,6 +757,25 @@ def main() -> None:
         elif not cutoff_ok:
             log.warning(f"Step 3.5/3 — skipping retry: too close to 03:59 ET "
                         f"Gateway restart cutoff (now {now_et:%H:%M}).")
+
+        # ── Step 3.6: borrow market (fee / rebate / shortable shares) ─────────
+        # Must run HERE, inside the IBKR block: the connection is closed in the
+        # `finally` below, long before Step 8 consumes this. Placed after the
+        # Step 3.5 retry so a borrow failure can never cost the ITI data, and
+        # wrapped in its own try/except so it degrades to blank columns rather
+        # than aborting the run (crash-safety invariants 1 and 2 unchanged).
+        if args.no_ibkr_borrow:
+            log.info("Step 3.6/3 — --no-ibkr-borrow: skipping the borrow fetch.")
+        elif not cutoff_ok:
+            log.warning("Step 3.6/3 — skipping borrow fetch: too close to the "
+                        f"03:59 ET Gateway restart (now {now_et:%H:%M}).")
+        else:
+            try:
+                borrow_by_symbol = _fetch_borrow(ib, symbols, qualified, args)
+            except Exception as exc:
+                log.exception(f"Step 3.6 (borrow) failed: {exc!r} — the seven "
+                              f"borrow columns will be blank; everything else "
+                              f"is unaffected.")
     except Exception as exc:
         # Belt-and-braces: anything that leaks out of Step 2/3 should still
         # let us write a (mostly-NaN) output file rather than lose
@@ -904,9 +1031,12 @@ def main() -> None:
     # ── Step 8 — append short-interest / squeeze metrics in place ───────────
     # ../ShortInterrest/ShortInterrest_AddON.enrich_dataframe appends the 24
     # SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/SqueezeFlags/SqueezeScore/
-    # SI_DataCoverage columns (free web sources only — FINRA, IBKR shortstock
-    # FTP, iBorrowDesk, Nasdaq Reg SHO; no IBKR API connection) → the final
-    # 38-column file. Same read-back-as-strings pattern as Step 6 so the
+    # SI_DataCoverage columns (FINRA + Nasdaq Reg SHO over the web) → the final
+    # 38-column file. The seven borrow columns are NOT web-sourced any more:
+    # both of the addon's borrow sources died (iBorrowDesk 403s since
+    # 2026-07-22; the shortstock FTP never worked here), so Step 3.6 fetched
+    # them from the IBKR connection and `borrow_by_symbol` carries them in.
+    # Same read-back-as-strings pattern as Step 6 so the
     # imputers' formatting of the existing columns is preserved byte-for-byte.
     # Best-effort like Steps 4/6/7: the sources are flaky external services,
     # so any failure logs and leaves the 14-column file valid on disk. The
@@ -926,12 +1056,18 @@ def main() -> None:
                                keep_default_na=False)
             n_cols_before = len(disk.columns)
             disk = _si.enrich_dataframe(
-                disk, skip_borrow_history=args.skip_borrow_history)
+                disk, skip_borrow_history=args.skip_borrow_history,
+                ibkr_borrow=None if args.no_ibkr_borrow else borrow_by_symbol)
             disk.to_csv(output_path, sep="\t", index=False)
             covered = int((disk["SI_DataCoverage"] != "none").sum())
+            # Report borrow coverage separately: SI_DataCoverage is satisfied by
+            # FINRA/SVR/RegSHO alone, so it stayed at 100% for the five weeks
+            # the borrow leg was silently contributing nothing.
+            with_borrow = int((disk["Borrow_Source"] != "").sum())
             log.info(f"Step 8 — appended {len(disk.columns) - n_cols_before} "
                      f"SI columns (coverage: {covered}/{len(disk)} rows with "
-                     f"any data) → {output_path.name}")
+                     f"any data; borrow: {with_borrow}/{len(disk)}) "
+                     f"→ {output_path.name}")
         except Exception as exc:
             log.exception(f"Step 8 (short-interest) failed: {exc!r} — the "
                           f"14-column file on disk is unaffected; re-run "

@@ -8,8 +8,8 @@ blue, everything else black.
 Example:
     plot_sentiment_AND-logics.py \\
         --input outputs/05_PRstats_..._FromPRhigh.tsv \\
-        --and-operand FLANG-BERT_positive '>=' 0.7 \\
-        --and-operand kw15_head_proba 0.6
+        --and-operand FLANG_pos_hd '>=' 0.7 \\
+        --and-operand kw15_proba_hd 0.6
 """
 import argparse
 import difflib
@@ -182,7 +182,7 @@ def main() -> None:
         action="append",
         nargs="+",
         metavar="COL [OP] VALUE",
-        help="repeatable condition, e.g. --and-operand FLANG-BERT_positive '>=' 0.7 "
+        help="repeatable condition, e.g. --and-operand FLANG_pos_hd '>=' 0.7 "
              "(operator defaults to '>' when omitted)",
     )
     parser.add_argument("--y-column", default=DEFAULT_Y_COLUMN,

@@ -5,19 +5,19 @@ The 11-encoder body pass (`BodyScore11encoders`) was run on
 `..._11EncScored.tsv`, which branched off the pipeline BEFORE the keyword
 scoring and the FineClass/BroadClass pass. So the body file carries:
 
-  * the 70 new `<enc>_Body_<channel>` columns   <- the only thing we want
+  * the 70 new `<enc>_<channel>_bd` columns   <- the only thing we want
   * a STALE copy of the 28 keyword columns (model_proba filled on 2712 rows
     only, i.e. the 594 recent rows still unscored)
   * no BroadClass / FineClass at all
 
 The canonical file `..._Classed_kwScored.tsv` has the opposite profile. So this
 merges one way only: canonical wins every shared column, the body file
-contributes exclusively its `_Body_` columns. Anything else would silently
+contributes exclusively its `_bd` columns. Anything else would silently
 regress the keyword scoring.
 
 Both files are the same 3306 rows in the same order with a unique `ID`, so the
 join is checked rather than guessed: identical ID sets, identical ID order, and
-no `_Body_` column may collide with an existing canonical column.
+no `_bd` column may collide with an existing canonical column.
 
 Pure numpy / pandas.
 
@@ -37,7 +37,9 @@ BODY_DEFAULT = ("../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_"
 OUT_DEFAULT = ("../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_"
                "11EncScored_Classed_kwScored_BodyEnc.tsv")
 
-BODY_MARKER = "_Body_"
+# 2026-08-09: body columns end in `_bd` (terminal suffix) instead of
+# carrying a `_Body_` infix. Same 70 columns, same values.
+BODY_SUFFIX = "_bd"
 
 
 def main():
@@ -69,9 +71,9 @@ def main():
         sys.exit(f"{key} order/content differs between the two files; this "
                  f"script only handles the aligned case")
 
-    body_cols = [c for c in body.columns if BODY_MARKER in c]
+    body_cols = [c for c in body.columns if c.endswith(BODY_SUFFIX)]
     if not body_cols:
-        sys.exit(f"no columns containing {BODY_MARKER!r} found in the body file")
+        sys.exit(f"no columns ending in {BODY_SUFFIX!r} found in the body file")
     collisions = [c for c in body_cols if c in can.columns]
     if collisions:
         sys.exit(f"body columns already present in canonical: {collisions}")

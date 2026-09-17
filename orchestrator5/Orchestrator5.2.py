@@ -6,11 +6,15 @@ import logging
 import threading
 import socket
 import time
+import re
+import difflib
+import operator
 import importlib.util as _ilu
 import joblib
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 import glob
 from pathlib import Path
@@ -59,11 +63,11 @@ load_finmarba_model     = _finmarba_mod.load_model
 
 # ── FLANG-BERT import (3rd headline model, 2026-07-29) ───────────────────────
 # avinasht/FLANG-BERT_flang-bert (ONNX INT8) — its `sentiment_score`
-# (positive − negative) is the STANDALONE 3rd trade leg (see _evaluate_trigger).
+# (positive − negative) is exposed to the rules file as `FLANG_score`.
 # This is the SAME module that produced the offline FLANG-BERT_sentiment_score
 # column via tools/Encoder_Models/HeadScore11encoders.py, so the live score equals
-# an offline rescore of the same headline — which is what the >= FLANG_SCORE_MIN
-# cutoff was calibrated on. Do NOT edit the headliner or its
+# an offline rescore of the same headline — which is what every FLANG_score cut in
+# orchestrator_trigger_rules.txt was calibrated on. Do NOT edit the headliner or its
 # flangbert_sentiment_onnx/ artifacts; both are frozen.
 # Two collisions to be aware of: this module's public fn is `analyze_headline`
 # (the SAME name already bound to FinBERT above) and its loader is likewise named
@@ -205,171 +209,43 @@ CLERK_PORT             = n2_config.get_int(_CFG, 'CLERK_PORT', 8765)
 CLERK_TIMEOUT_SEC      = 5       # per-message TCP send/recv timeout
 CLERK_ARM_WAIT_SEC     = 20      # max wait on the arm future before sending sentiment
 
-# Trade-trigger gate (STEP 1b) — an OR of FIVE branches as of 2026-08-03. A row trades
-# when ANY ONE of them holds:
-#   1. CORE      — the five-way AND defined immediately below (2026-08-01)
-#   2. EARNINGS  — FineClass/EarningScore/kw15_body (2026-08-02; block further down)
-#   3. KwBodySolo — kw15_body  >= KW15_BODY_SOLO_MIN alone         (08-03; block below)
-#   4. FLANGSolo  — FLANG score >= FLANG_SOLO_MIN alone            (08-03; block below)
-#   5. FinBERTSolo— positive   >= SENTIMENT_POSITIVE_SOLO_MIN alone(08-03; block below)
-#
-# THIS block defines branch 1 only. It is an AND over ALL FIVE conditions — the trade
-# fires on this branch only when EVERY one holds (2026-08-01; version-control.txt #4):
-#   FinBERT    `positive`        >= SENTIMENT_POSITIVE_MIN
-#   FinMarBa   `indecisive`      <= FMB_INDECISIVE_MAX     (the only ceiling)
-#   ge15 body  `model_proba`     >= KW15_BODY_MIN
-#   ge15 head  `model_proba`     >= KW15_HEAD_MIN
-#   FLANG-BERT `sentiment_score` >= FLANG_SCORE_MIN
-# The three LEGS (headline = FinBERT+FMB, keyword = body+head, FLANG) survive as names
-# in ClerkSentiment, but since each leg is itself an AND, "all three legs" and "all five
-# conditions" are the SAME boolean function — within this branch the legs are a
-# grouping, not alternatives.
-#
-# ⚠ The 2026-08-03 solo branches SUBSUME this one wherever they hold, because they read
-# THREE of these same five scores at strictly tighter cuts. This branch (and the earnings
-# one) is therefore only DECISIVE in the band below every solo cut: kw15_body in [0.50,
-# 0.70), FLANG in [0.96, 0.975), positive in [0.8, 0.935). FMB `indecisive` and kw15_head
-# are the two with no solo twin, i.e. the only ones that can still veto. The five below were
-# calibrated when this AND was the whole gate; that calibration describes the branch, not
-# the gate, from 2026-08-03 on.
-#
-# ⚠ MISSING scores. A None (model error / scorer timeout) makes only its OWN condition
-# false — but within this AND branch that single false blocks it entirely, and with four
-# branches now running a dead model no longer shows up as a silent tape at all. That is
-# why _evaluate_trigger returns `missing_blocked` and the caller logs a WARNING when a
-# MISSING score is the ONLY thing standing between the row and a fire; from 2026-08-03
-# that alarm also fires whenever kw15_body or FLANG is None, since each of those alone
-# is a whole branch.
-# The wire protocol to the clerk stays "OK"/"BAD"; the trigger source is in the TSV only
-# — ClerkSentiment (fired leg names joined with "_" in the fixed order Keyword,
-# FinBERT_FMB, FLANG, Earnings, KwBodySolo, FLANGSolo, FinBERTSolo) and the Trigger column, which
-# drops a level below the legs and records YES/NO plus a PASS/FAIL/MISSING token per
-# CONDITION with its score and the threshold in force, so a row shows WHICH condition
-# failed and by how much.
-#
-# Calibration of the AND gate AND all five thresholds (2026-08-01), on
-# price_stats_loader/outputs/
-#   06_PRstats_2026-06-22-2026-07-30_11EncBodyHeadScored_kwScored_FinBERT.tsv
-# (1055 labelled rows; the full-coverage FinBERT_positive / FinMarBa_indecisive cols):
-#                                     fires         P@>=30%  lift    recall
-#   OLD  OR  0.6/0.13/0.60/0.65/0.97   267 (25.3%)   32.6%   1.90x   48.1%
-#   NEW  AND 0.8/0.14/0.50/0.50/0.96    26 ( 2.5%)   46.2%   2.69x    6.6%
-# At the >=15% target the AND gate runs 80.8% precision / 2.51x lift. The retuned
-# thresholds are matched TO the AND: loosening kw15 to 0.50/0.50 and FLANG to 0.96 more
-# than doubles the fire count vs AND-with-the-old-thresholds (11 -> 26) at essentially
-# unchanged precision, while FinBERT tightens 0.6 -> 0.8. Deliberate trade: ~1 trade/day
-# at a much higher hit rate, accepting the large recall drop.
-# ⚠ n=26 — 46.2% carries roughly a +/-19pp CI and is post-selection (the thresholds were
-# chosen against this same file). Treat it as an operating point, not a measurement.
-#
-# ⚠ 2026-07-28 keyword-leg REPLACEMENT (historical — explains OLD TSVs). `Keyword` in
-# ClerkSentiment means a DIFFERENT rule before and after that date. Was: body combo
-# `model_proba_PLUS_kw_mult_nb` >= 0.67 from the biased-label model. Now: the
-# corrected-label ge15 body+headline pair. Its 0.60/0.65 operating point (75 fires,
-# 57.3% precision, 3.18x lift on the 777-row VAL holdout) is SUPERSEDED by the
-# 2026-08-01 calibration above — the cuts are now 0.50/0.50 and the body+head PAIR no
-# longer fires on its own (though from 2026-08-03 the body channel alone does, at 0.70).
-# Original derivation: price_stats_loader/statsByClaude/
-# July28_SentimentScore_stats_report.md §5.1-5.4.
-#
-# ⚠ 2026-07-29 FLANG leg ADDED (historical — explains OLD TSVs). ClerkSentiment gained
-# the labels FLANG, Keyword_FLANG, FinBERT_FMB_FLANG and Keyword_FinBERT_FMB_FLANG from
-# that date, and the TSV grew the 7 FLANG_* columns (31 -> 38). The 2026-08-01 AND left
-# only the last of those four reachable; the 08-02 and 08-03 branches reopened the
-# vocabulary and added Earnings, KwBodySolo and FLANGSolo to it.
-SENTIMENT_POSITIVE_MIN = 0.8     # FinBERT `positive` floor
-FMB_INDECISIVE_MAX     = 0.14    # FinMarBa `indecisive` ceiling (the only <= condition)
-KW15_BODY_MIN          = 0.50    # ge15 BODY model_proba floor
-KW15_HEAD_MIN          = 0.50    # ge15 HEADLINE model_proba floor
-# FLANG-BERT headline sentiment_score (= positive − negative) floor. Was a STANDALONE
-# leg at 0.97, calibrated 2026-07-28 on 04_PRstats_2026-05-04-2026-07-23_..._FromPRhigh
-# .tsv (3434 rows): 304 fires (8.9%) at 46.1% precision / 1.81x lift, of which 191
-# (5.6% of all rows) were fires the FinBERT+FinMarBa leg missed at the same precision —
-# that marginal number is what justified OR-ing it in. Both facts are MOOT from
-# 2026-08-01: it is now one AND-ed condition among five, so its standalone precision no
-# longer describes anything the gate does. The BODY twin was measured and REJECTED
-# (precision flat 0.90 -> 0.98, 33-35%, ~1.3x lift — saturated ⇒ useless as a gate);
-# headline only. Retune HERE.
-FLANG_SCORE_MIN        = 0.96
-KW_SCORE_WAIT_SEC      = 10      # max wait on the kw-score future before STEP 1b
-                                 # (~4 ms typical — a hung scorer must never
-                                 # delay the trade decision beyond this)
-FLANG_SCORE_WAIT_SEC   = 10      # same ceiling for the FLANG future (~6.6 ms measured)
+# ── Trade-trigger gate (STEP 1b) ─────────────────────────────────────────────
+# THE GATE IS NOT IN THIS FILE. Every rule and every threshold lives in
+#     orchestrator5/orchestrator_trigger_rules.txt
+# read ONCE at startup by _load_trigger_rules(), BEFORE any model is loaded. A
+# missing / empty / malformed file is a HARD FAIL — there is deliberately no
+# built-in fallback gate and no skip-the-bad-line: a trading process must never
+# run a gate nobody wrote, and a typo must never silently delete a branch while
+# the tape still looks alive.
+# ⚠ Read at STARTUP ONLY. Editing that file does NOT change a running process.
+#   The `[Gate] ACTIVE` block in logs/ is the authoritative record of what a given
+#   process holds. `Orchestrator5.2.py --check-rules` parses + echoes and exits.
+# Semantics: ordinary rules are OR-ed (any one firing trades), conditions within a
+#   rule are AND-ed, a None value ALWAYS fails its condition. A `REQUIRE <Name>: ...`
+#   line is a PRECONDITION, AND-ed over the whole gate: it never fires, it only
+#   permits, so the gate is (every REQUIRE holds) AND (any ordinary rule fires).
+#   ⚠ A REQUIRE condition therefore FAILS CLOSED — a dead scorer behind one stops all
+#   trading, not one branch. See _evaluate_trigger.
+# Calibration, dates, corpora and the history of every cut: orchestrator5/CLAUDE.md
+#   §"Clerk handshake" and orchestrator5/version-control.txt. The ⚠ warnings a human
+#   RETUNING the gate must read — above all: do NOT add a `FinMarBa_ind_hd <= x` rule
+#   that fires alone, it is direction-agnostic and traded a reverse split — live in
+#   the header of the rules file, which is where the edit actually happens.
+TRIGGER_RULES_FILE = str(Path(__file__).resolve().parent / 'orchestrator_trigger_rules.txt')
 
-# ── EARNINGS LEG (2026-08-02) — a SECOND trade branch, OR-ed with the five-way AND ──
-# ⚠ This partially undoes the 2026-08-01 "pure AND" switch. The five conditions above
-# are UNTOUCHED and still form one complete branch; what changed is that a row can now
-# also fire on:
-#       FineClass == 'Earnings_Results' AND EarningScore >= 4 AND kw15_body >= 0.50
-# so the gate is `core_and OR earnings_leg`. Note kw15_body is SHARED with the AND
-# branch (same condition, same local); kw15_head, FinBERT, FMB and FLANG are NOT
-# required by this leg.
-#
-# Why a separate branch instead of more AND conditions: the five-way AND is
-# structurally BLIND to earnings PRs. Earnings_text_structures_report.md §4 measured
-# the gate's own FinBERT headline score at test AUC 0.297 on earnings PRs — ANTI-
-# predictive — because winners and duds share near-identical headlines ("X Reports Q1
-# 2026 Financial Results"); the separating numbers are in the BODY.
-#
-# Calibrated 2026-08-02 on tools/Earning_Scorer/PRstats_2026-05-04-2026-07-30_
-# EarningResults_earnScored.tsv (518 labelled Earnings_Results rows, base rate 7.1%
-# on the >=30% target), with kw15_body recomputed by the frozen ge15 body pipeline:
-#     current five-way AND on those rows :  3 fires,  0.0% precision  (blind, as above)
-#     EarningScore>=4 AND kw15_body>=0.50: 36 fires, 47.2% precision, 6.6x lift
-#     test block only (>=2026-06-20, n=79, base 13.9%): 7 fires, 42.9%, 3.1x lift
-# OVERLAP WITH THE AND BRANCH IS EXACTLY ZERO — this leg is purely additive: ~0.71
-# extra trades/day at the same precision bar the AND branch holds (46.2%).
-# Cut choice: precision is FLAT below 4 (>=1 .321, >=2 .314, >=3 .339) and steps up at
-# 4 (.472) — 4 is the knee, and matches the report's own defensible operating point.
-# ⚠ n=36 ⇒ wide error bars, and EarningScore is a RANKING CUT, not a calibrated
-# probability: the >=30% base rate itself moved 3.7% (May) -> ~15-20% (Jun/Jul).
-# ⚠ EarningScore is INTEGER POINTS (observed −7…+9, median 0), NOT a 0-1 score — a
-# threshold like 0.4 would silently mean ">= 1" (36.5% of earnings PRs at 32%
-# precision). Retune HERE; the params behind the points are frozen in
-# tools/Earning_Scorer/earn_score_params.json (calibrated 2026-08-01).
-EARN_CLASS          = 'Earnings_Results'  # the only FineClass this leg accepts
-EARN_SCORE_MIN      = 4                   # EarningScore POINTS floor (integer, see above)
-EARN_SCORE_WAIT_SEC = 10                  # ceiling on the earn future, as KW/FLANG
+# Ceilings on the scoring futures, so a hung model can never delay the trade
+# decision. Not gate thresholds — these stay in code.
+KW_SCORE_WAIT_SEC    = 10        # kw future (~4 ms typical)
+FLANG_SCORE_WAIT_SEC = 10        # FLANG future (~6.6 ms measured)
+EARN_SCORE_WAIT_SEC  = 10        # earnings future
 
-# ── SOLO LEGS (2026-08-03) — THREE standalone branches, OR-ed beside the two above ───
-#   is_ok = core_and OR earnings_leg OR kw15_body >= KW15_BODY_SOLO_MIN
-#                                    OR flang     >= FLANG_SOLO_MIN
-#                                    OR positive  >= SENTIMENT_POSITIVE_SOLO_MIN
-# Each is ONE condition and fires the trade ALONE — no confirmation from any other model.
-# Every one re-reads a score the CORE branch already consumes, at a STRICTLY TIGHTER cut
-# (0.70 > 0.50, 0.975 > 0.96, 0.935 > 0.8). Two consequences follow and are worth stating
-# plainly:
-#   - Each c_*_solo IMPLIES its core twin, so a solo fire never contradicts the core
-#     branch, it just doesn't wait for the other four conditions.
-#   - The five-way AND and the earnings leg are only DECISIVE in the band BELOW every
-#     solo cut — kw15_body in [0.50, 0.70), FLANG in [0.96, 0.975), positive in
-#     [0.8, 0.935). Outside it a single score trades. FMB `indecisive` and kw15_head are
-#     the two core conditions with NO solo twin, i.e. the only ones that can still veto.
-# Nothing was removed or retuned: every row that fired before still fires — purely
-# additive, at each step.
-# ⚠ UNLIKE EVERY OTHER CUT IN THIS FILE, all three were specified by the operator on
-# 2026-08-03 and were NOT calibrated against a labelled corpus. No fires/precision/lift
-# number backs any of them. For scale, from the calibrations recorded above: FLANG
-# standalone at 0.97 fired 8.9% of 3434 rows at 46.1% precision (>=15%) / 24.3% (>=30%),
-# and the ge15 body channel alone ran ~41% precision at 0.60 — i.e. BELOW the AND
-# branch's 46.2% @>=30%. Measured fire rate on live tape rather than a labelled corpus:
-# the AND-era ~2.5% (~1 trade/day) -> ~15% with these three (209 rows,
-# 2026-07-29..08-03). Retune HERE.
-#
-# ⚠ DO NOT ADD AN `indecisive <= x` SOLO LEG. It was implemented on 2026-08-03 as a
-# fourth solo branch (FMB_INDECISIVE_SOLO_MAX = 0.115) and REMOVED the same day, before
-# it ever ran live. Reason: FinMarBa's classes are negative/indecisive/positive, so a LOW
-# `indecisive` means "confident" — in EITHER DIRECTION. Inside the core AND that is
-# harmless because FinBERT positive >= 0.8 pins the sign alongside it; STANDALONE nothing
-# does, and the leg trades confidently-BAD news. Not hypothetical: on the 2026-07-29 tape
-# it fired WETO "Wetour Robotics Announces Share Consolidation" — a REVERSE SPLIT — on
-# indecisive=0.0961 with FMB_label='positive', while BOTH other headline models
-# disagreed (FinBERT positive 0.150, FLANG sentiment_score -0.8037). It was also by far
-# the loosest cut measured, 44/552 rows (8.0%) vs 2.9% / 2.4% / 1.3% for the three legs
-# below. If it is ever revisited, it needs a DIRECTION condition beside it.
-KW15_BODY_SOLO_MIN          = 0.70   # ge15 BODY model_proba — alone (core cut 0.50)
-FLANG_SOLO_MIN              = 0.975  # FLANG sentiment_score — alone (core cut 0.96)
-SENTIMENT_POSITIVE_SOLO_MIN = 0.935  # FinBERT positive      — alone (core cut 0.80)
+# ⚠ A SCORING-path constant, NOT a gate threshold. _classify_and_score_earnings
+# skips the earnings extractor entirely unless FineClass is this, which is why
+# EarningScore is None on ~81% of rows (and prints `NA`, not `MISSING`). That skip
+# must keep working even if the rules file never mentions Earnings_Results, so this
+# is deliberately not derived from the rules. The GATE's use of the class lives in
+# orchestrator_trigger_rules.txt.
+EARN_CLASS = 'Earnings_Results'
 
 # Baseline lookups from the daily universe TSV.
 TRADE_SIZE_SENTINEL  = 44444.0   # trade-mole treats this (or <=0/missing) as "no baseline"
@@ -423,7 +299,10 @@ EARN_SCORE_WORKERS        = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEDUP_MAX_IDS = 50_000  # FIFO cap on the per-day seen-article-ID stash (leak guard)
-CONTENT_DEDUP_MAX_KEYS = 10_000  # FIFO cap on the content-fingerprint stash (leak guard)
+# FIFO cap on the content-fingerprint stash (leak guard). The key is per-TICKER
+# since 2026-08-12, so an article consumes up to MAX_TICKERS_PER_ARTICLE entries
+# rather than 1 — doubled from 10_000 to keep the original day's headroom.
+CONTENT_DEDUP_MAX_KEYS = 20_000
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -486,9 +365,21 @@ _seen_day = None
 
 # Content-level dedup: RTPR sometimes re-publishes the same article under a
 # NEW ID (PRZO 2026-07-06 227ms apart; FOFO 2026-07-07 ~12min apart), so the
-# ID dedup above misses it. key = (normalized headline, sorted ticker tuple)
-# → arrival_dt of first sighting; any same-day hit is dropped. Same lock-free
+# ID dedup above misses it. key = (normalized headline, ONE ticker) →
+# arrival_dt of first sighting; any same-day hit drops that ticker, and an
+# article whose every ticker is a hit is dropped whole. Same lock-free
 # single-thread + per-day-clear + insertion-order-FIFO regime as _seen_ids.
+#
+# ⚠ The key was (normalized headline, sorted ticker TUPLE) until 2026-08-12,
+# when four re-publishes fired the gate twice in one day (NEXR, BBLG, FABC,
+# EXYN — three of them opening two clerk sessions on the same symbol). The
+# headline always matched; the TICKER LIST did not, because the re-publish
+# adds or drops the warrant (NEXR / NEXR+NEXRW, BBLG / BBLG+BBLGW) or a
+# co-mentioned partner (FABC / FABC+KOPN). Whole-article keying can never see
+# those as the same article; per-ticker keying does, because the ticker that
+# matters is in both copies. It also handles the partner case exactly right —
+# the re-publish's FABC is dropped while KOPN, already handled on the first
+# copy, is left alone.
 _seen_content: dict = {}
 
 
@@ -538,70 +429,73 @@ _clerk_executor = ThreadPoolExecutor(max_workers=CLERK_WORKERS, thread_name_pref
 
 def analyze_finbert(news_dict: dict) -> dict:
     """FinBERT headline sentiment analysis. Runs once per article, in parallel
-    with analyze_finmarba (separate thread pools, ONNX inference releases the GIL)."""
+    with analyze_finmarba (separate thread pools, ONNX inference releases the GIL).
+
+    This is `Prosus` in the unified column convention (ProsusAI/finbert) — the one
+    headliner living outside tools/Encoder_Models/, and the one whose TSV columns
+    were UNPREFIXED until 2026-08-09."""
     result = analyze_headline(news_dict['Headline'])
     logger.info(
-        f"[FinBERT] {news_dict['Symbol']} → {result['label'].upper()} "
-        f"(score={result['sentiment_score']:.4f})"
+        f"[FinBERT] {news_dict['Symbol']} → {result['lab'].upper()} "
+        f"(score={result['ss']:.4f})"
     )
     return {
-        'positive':        result['positive'],
-        'negative':        result['negative'],
-        'neutral':         result['neutral'],
-        'sentiment_score': result['sentiment_score'],
-        'label':           result['label'],
+        'pos': result['pos'],
+        'neg': result['neg'],
+        'neu': result['neu'],
+        'ss':  result['ss'],
+        'lab': result['lab'],
     }
 
 
 def analyze_finmarba(news_dict: dict) -> dict:
     """FinMarBa (baptle/FinBERT_market_based) headline sentiment. Runs once per
-    article, in parallel with analyze_finbert. Its `indecisive` value is the
-    second condition of the headline trade leg; the full distribution is stored in
-    the TSV FMB_* columns for offline re-analysis."""
+    article, in parallel with analyze_finbert. Its `ind` value is the second
+    condition of the headline trade leg; the full distribution is stored in the TSV
+    FinMarBa_*_hd columns for offline re-analysis."""
     result = score_finmarba_headline(news_dict['Headline'])
     logger.info(
-        f"[FinMarBa] {news_dict['Symbol']} → {result['label'].upper()} "
-        f"(indecisive={result['indecisive']:.4f})"
+        f"[FinMarBa] {news_dict['Symbol']} → {result['lab'].upper()} "
+        f"(indecisive={result['ind']:.4f})"
     )
     return {
-        'positive':        result['positive'],
-        'indecisive':      result['indecisive'],
-        'negative':        result['negative'],
-        'sentiment_score': result['sentiment_score'],
-        'label':           result['label'],
+        'pos': result['pos'],
+        'ind': result['ind'],
+        'neg': result['neg'],
+        'ss':  result['ss'],
+        'lab': result['lab'],
     }
 
 
 def analyze_flang(news_dict: dict) -> dict:
     """FLANG-BERT (avinasht/FLANG-BERT_flang-bert) headline sentiment. Runs once
     per article, in parallel with the other two headline models. Its
-    `sentiment_score` (positive − negative) must clear FLANG_SCORE_MIN for the trade
-    to fire — one of the five AND-ed gate conditions since 2026-08-01 (it was a
-    STANDALONE leg that fired on its own until then). The full distribution is stored
-    in the TSV FLANG_* columns for offline re-analysis.
+    `sentiment_score` (positive − negative) reaches the gate as the rules-file field
+    `FLANG_score`; the whole distribution is stored in the TSV FLANG_* columns for
+    offline re-analysis.
 
     Scores EXACTLY news_dict['Headline'], the same string the other two headline
     models get, so the live value equals an offline HeadScore11encoders rescore of
     the TSV's Headline column (where the threshold was calibrated)."""
     result = score_flang_headline(news_dict['Headline'])
     logger.info(
-        f"[FLANG] {news_dict['Symbol']} → {result['label'].upper()} "
-        f"(score={result['sentiment_score']:.4f}) in {result['inference_ms']:.1f}ms"
+        f"[FLANG] {news_dict['Symbol']} → {result['lab'].upper()} "
+        f"(score={result['ss']:.4f}) in {result['ms']:.1f}ms"
     )
     return {
-        'positive':        result['positive'],
-        'neutral':         result['neutral'],
-        'negative':        result['negative'],
-        'sentiment_score': result['sentiment_score'],
-        'label':           result['label'],
-        # NOTE: this module names its timing key `inference_ms`, unlike FinMarBa's
-        # `elapsed_ms` — normalised here so the TSV writer stays uniform.
-        'inference_ms':    result['inference_ms'],
+        'pos': result['pos'],
+        'neu': result['neu'],
+        'neg': result['neg'],
+        'ss':  result['ss'],
+        'lab': result['lab'],
+        # `ms` is uniform across all three headline models since 2026-08-09; this
+        # module used to be the odd one out, naming its timing key `inference_ms`.
+        'ms':  result['ms'],
     }
 
 
-_KW_NONE_RESULT = {'kw15_body_proba': None, 'kw15_head_proba': None,
-                   'KwScoreCompletedAt': None}
+_KW_NONE_RESULT = {'kw15_proba_bd': None, 'kw15_proba_hd': None,
+                   'kw15_at': None}
 
 
 def _kw15_prep(text: str, max_words: int | None) -> str:
@@ -642,12 +536,14 @@ def _score_keywords(news_dict: dict) -> dict:
         body_p = float(round(float(body_p), 6))
         head_p = float(round(float(head_p), 6))
         logger.info(f"[KwScore] id={news_id} sym={news_dict.get('Symbol')}: "
-                    f"kw15_body={body_p:.6f} kw15_head={head_p:.6f} "
+                    f"kw15_proba_bd={body_p:.6f} kw15_proba_hd={head_p:.6f} "
                     f"in {elapsed_ms:.1f}ms")
         return {
-            'kw15_body_proba': body_p,
-            'kw15_head_proba': head_p,
-            'KwScoreCompletedAt': c3.format_millis_time(c3.now_fixed()),
+            # `_bd`/`_hd` put the scored channel in the same terminal position as
+            # every encoder column, so the rules file and the TSV share one name.
+            'kw15_proba_bd': body_p,
+            'kw15_proba_hd': head_p,
+            'kw15_at': c3.format_millis_time(c3.now_fixed()),
         }
     except Exception as exc:
         logger.error(f"[KwScore] id={news_id}: scorer error: {exc}", exc_info=True)
@@ -660,9 +556,16 @@ _EARN_NONE_RESULT = {'FineClass': None, 'EarningScore': None, 'EarnBreakdown': N
 def _classify_and_score_earnings(news_dict: dict, primary_symbol: str) -> dict:
     """Catalyst class for every PR + the earnings rule score for the ones that are
     Earnings_Results. Runs once per article on the earnscore worker. Never raises:
-    any error returns the all-None dict, which simply makes the earnings leg false
-    (the five-way AND branch is unaffected — this leg is OR-ed beside it, so a dead
-    earnings scorer costs the new trades but never blocks the old ones).
+    any error returns None scores, which simply makes the earnings leg false — a dead
+    earnings SCORER costs the new trades but never blocks the old ones.
+
+    ⚠ That promise is why the except below KEEPS `fine` when classification already
+    succeeded and only the extractor/scorer blew up. Since the class whitelist landed
+    (2026-08-17) FineClass feeds a REQUIRE precondition, so returning None there would
+    close the WHOLE gate — turning "the earnings scorer crashed" into "this row cannot
+    trade at all", which is precisely what the sentence above rules out. A genuinely
+    unknown class (the future timed out in _collect_and_log) is a different thing and
+    correctly stays None.
 
     Scores EXACTLY the string that lands in the TSV Body cell
     (clean_inline_text(body_raw)) — the same string _score_keywords sees — so an
@@ -676,6 +579,7 @@ def _classify_and_score_earnings(news_dict: dict, primary_symbol: str) -> dict:
     model here, so on a 2-ticker PR the second ticker inherits the first's
     denominator. Deliberate — MAX_TICKERS_PER_ARTICLE is 2 and 2-ticker PRs are rare."""
     news_id = news_dict.get('ID')
+    fine = None                     # survives into the except below — see the docstring
     try:
         body_cell = c3.clean_inline_text(news_dict.get('body_raw') or '')
         headline  = news_dict['Headline']
@@ -685,7 +589,12 @@ def _classify_and_score_earnings(news_dict: dict, primary_symbol: str) -> dict:
         # without a shim dict (news_dict's body key is `body_raw`, not Body/body).
         # The lead-only window matters: about-us / safe-harbor boilerplate deeper in
         # the text is full of false triggers.
-        fine, _broad = classify_pr(headline)
+        # headline=True unlocks PrClassifier.HEADLINE_RULES (the loose "reports
+        # revenue/earnings" rule, added 2026-08-07). It MUST stay off for the body
+        # call: over 1500 chars of prose that rule promotes law-firm notices,
+        # analyst coverage and cash-distribution PRs into Earnings_Results, which is
+        # exactly the class this function gates a real trade on.
+        fine, _broad = classify_pr(headline, headline=True)
         if fine == 'Other':
             fine, _broad = classify_pr(body_cell[:PRCLASS_BODY_LEAD_CHARS])
 
@@ -733,255 +642,798 @@ def _classify_and_score_earnings(news_dict: dict, primary_symbol: str) -> dict:
         }
     except Exception as exc:
         logger.error(f"[EarnScore] id={news_id}: scorer error: {exc}", exc_info=True)
-        return dict(_EARN_NONE_RESULT)
+        # KEEP the class if classification already got that far — it is a separate step
+        # from scoring, and since 2026-08-17 FineClass feeds a REQUIRE precondition, so
+        # wiping it here would close the whole gate on a row CORE would have traded.
+        # `fine` is None only when classify_pr itself failed, which IS an unknown class.
+        return {'FineClass': fine, 'EarningScore': None, 'EarnBreakdown': None}
+
+
+# ─── Trigger rules: the file format, the field table, and the parser ──────────
+#
+# The gate itself is data. Everything between here and _evaluate_trigger exists to
+# turn orchestrator_trigger_rules.txt into a tuple of _Rule, ONCE at startup, so
+# that the per-row gate is dict lookups and pre-resolved callables — no parsing, no
+# string dispatch and no threshold formatting on the trade-critical path.
+#
+# NO eval(). A rule line is split into (field, op, value) triples that are checked
+# against the whitelists below; an operator is resolved to a callable at load time.
+# There is no code path that executes text from the file. (Two of those callables are
+# module-level defs rather than `operator` builtins — see _op_in. The guarantee never
+# rested on their being builtins: it rests on the operator being looked up in a CLOSED
+# whitelist keyed by the literal text, and the callable being bound ONCE at parse time.)
+
+
+def _op_in(value, choices) -> bool:
+    """`value in choices`, in the argument order every other _OPS entry uses.
+
+    `operator.contains(a, b)` is `b in a` — reversed — so this thin wrapper is what
+    keeps _cond_true a single uniform `cond.fn(lhs, cond.rhs)` call with no
+    per-operator branch on the trade-critical path. `choices` is the frozenset built
+    at PARSE time; this does no parsing and no allocation."""
+    return value in choices
+
+
+def _op_not_in(value, choices) -> bool:
+    return value not in choices
+
+
+_OPS = {'>=': operator.ge, '<=': operator.le, '>': operator.gt,
+        '<': operator.lt, '==': operator.eq, '!=': operator.ne,
+        'in': _op_in, 'not in': _op_not_in}
+# The relation that is TRUE of a row that FAILED its condition — what the Trigger
+# cell prints on a FAIL. Same key set as _OPS deliberately: an operator added to one
+# and not the other is a KeyError at load, never a silently wrong Trigger cell.
+_OP_NEG = {'>=': '<', '<': '>=', '<=': '>', '>': '<=', '==': '!=', '!=': '==',
+           'in': 'not in', 'not in': 'in'}
+# How an operator RENDERS inside a Trigger token. Identity for the six comparisons —
+# they are single symbols and juxtapose unambiguously (`0.9100>=0.80`). The two WORD
+# operators cannot: `MA in {...}` would put spaces inside a token, and tokens are
+# space-separated. Same key set as the two above, for the same reason those two share
+# one. (ASCII alternative, if a terminal ever mangles these: '~' / '!~'.)
+_OP_CELL = {'>=': '>=', '<=': '<=', '>': '>', '<': '<', '==': '==', '!=': '!=',
+            'in': '∈', 'not in': '∉'}          # ∈ / ∉
+# The shared-key-set promise above, enforced instead of merely asserted. `raise`, not
+# `assert`: python -O strips asserts, and this is the guard that stops a half-added
+# operator from rendering a wrong Trigger cell.
+if not (_OPS.keys() == _OP_NEG.keys() == _OP_CELL.keys()):
+    raise RuntimeError(
+        "_OPS / _OP_NEG / _OP_CELL must share one operator key set — "
+        f"{sorted(_OPS)} / {sorted(_OP_NEG)} / {sorted(_OP_CELL)}")
+
+_KIND_NUM = 'float'   # the six comparisons; renders 4 dp. `in`/`not in` REJECTED.
+_KIND_INT = 'int'     # the six comparisons; renders as an integer, REJECTS 0.4
+_KIND_STR = 'str'     # == != in `not in` only, case-insensitive; renders bare
+
+
+class _FieldSpec(NamedTuple):
+    """One addressable field: where its value comes from and how it behaves."""
+    kind:    str            # _KIND_NUM / _KIND_INT / _KIND_STR
+    source:  str            # which dict _evaluate_trigger reads it out of
+    key:     str            # the key inside that dict
+    lo:      float          # documented range, for the out-of-range WARN only
+    hi:      float          # (None disables the check)
+    alarm:   bool           # does a None here arm the dead-scorer WARNING?
+    na_when: object = None  # fn(vals) -> True when absence is BY DESIGN, not a fault
+
+
+class _Cond(NamedTuple):
+    """One compiled `<field> <op> <value>`. `rhs` is coerced and `thr_str` rendered
+    at PARSE time, and `fn` is resolved at PARSE time, so evaluating this per row is
+    one dict lookup plus one call."""
+    field:   str    # canonical name — ALSO the Trigger-cell token name
+    op:      str
+    rhs:     object  # float | int | lowercased str | frozenset[str] (in / not in)
+    thr_str: str     # threshold as the Trigger cell should print it
+    val_fmt: str     # '.4f' | 'd' | None(bare str), from spec.kind
+    fn:      object  # _OPS[op]
+    spec:    _FieldSpec
+
+
+# A rule's KIND. An ordinary rule is one of the OR-ed branches: when its conditions all
+# hold it FIRES the clerk. A REQUIRE rule is a PRECONDITION — it never fires anything,
+# it only PERMITS, and every one of them is AND-ed over the whole gate. So:
+#     gate = (every REQUIRE rule holds) AND (any one ordinary rule holds)
+_RULE_FIRE    = 'fire'
+_RULE_REQUIRE = 'require'
+# What a rule GROUP prints as its verdict in the Trigger cell, per kind. A REQUIRE
+# group deliberately does NOT print YES/NO: a REQUIRE rule that holds has not fired
+# anything, and reusing YES would compound the misreading this kind already introduces
+# (a `CORE:YES` group can now sit in a cell whose OVERALL verdict is NO — see
+# _evaluate_trigger). BLOCK is also the grep handle for "why did this not trade?":
+#     grep -c ':BLOCK\[' tables/news_output_*.tsv
+_RULE_VERDICT = {_RULE_FIRE:    ('YES',   'NO'),
+                 _RULE_REQUIRE: ('ALLOW', 'BLOCK')}
+
+
+class _Rule(NamedTuple):
+    name:   str     # lands in the TSV ClerkSentiment cell — FIRE rules only
+    conds:  tuple   # tuple[_Cond, ...] — AND-ed, file order preserved
+    lineno: int
+    text:   str     # rebuilt FROM conds for the [Gate] ACTIVE echo
+    kind:   str = _RULE_FIRE   # _RULE_FIRE | _RULE_REQUIRE. LAST, and defaulted, so
+                               # the 4-positional construction still works.
+
+
+def _earnscore_na(vals: dict) -> bool:
+    """True when a missing EarningScore is BY DESIGN rather than a fault.
+
+    _classify_and_score_earnings skips the extractor entirely unless FineClass is
+    EARN_CLASS, so EarningScore is None on ~81% of rows (measured: 315/390 on the
+    2026-08-03..08-07 tape). That absence is not a dead scorer, so it prints
+    `EarningScore:NA`, never MISSING, and never arms the BLOCKED-BY-MISSING alarm —
+    otherwise the one row where the scorer really died would be buried under three
+    hundred innocent ones.
+
+    A None FineClass is NOT NA: that means the classifier itself failed, which is
+    exactly what the alarm is for."""
+    fc = vals.get('FineClass')
+    return fc is not None and str(fc).strip().lower() != EARN_CLASS.lower()
+
+
+# Every field a rule may name. Adding a model output here is all it takes to make it
+# addressable from the rules file — there is deliberately no second table to update
+# (the Trigger cell prints these same names, so a token can be pasted back into a
+# rule). `alarm` is False for the row fields: a symbol missing from today's universe
+# TSV is a universe gap, not a dead model, and must not raise the dead-scorer alarm.
+#
+# Since 2026-08-09 these names ARE the daily TSV column names, under the unified
+# `{Model}_{channel}_{hd|bd}` convention shared with the offline batch scorers in
+# tools/Encoder_Models/. That is what retired the old _TSV_ALIASES table: there is no
+# longer a TSV spelling and a rules spelling to translate between, so a column read
+# off a header can be pasted straight into a rule.
+_TRIGGER_FIELDS = {
+    # ProsusAI FinBERT headline  (`Prosus` in the unified column convention)
+    'Prosus_pos_hd':     _FieldSpec(_KIND_NUM, 'finbert', 'pos', 0.0,  1.0, True),
+    'Prosus_neu_hd':     _FieldSpec(_KIND_NUM, 'finbert', 'neu', 0.0,  1.0, True),
+    'Prosus_neg_hd':     _FieldSpec(_KIND_NUM, 'finbert', 'neg', 0.0,  1.0, True),
+    'Prosus_ss_hd':      _FieldSpec(_KIND_NUM, 'finbert', 'ss',  -1.0, 1.0, True),
+    'Prosus_lab_hd':     _FieldSpec(_KIND_STR, 'finbert', 'lab', None, None, True),
+    # FinMarBa headline — `ind` is NOT a neutral probability: a low value means
+    # confident in EITHER direction, which is why no rule may use it alone.
+    'FinMarBa_pos_hd':   _FieldSpec(_KIND_NUM, 'fmb', 'pos', 0.0,  1.0, True),
+    'FinMarBa_ind_hd':   _FieldSpec(_KIND_NUM, 'fmb', 'ind', 0.0,  1.0, True),
+    'FinMarBa_neg_hd':   _FieldSpec(_KIND_NUM, 'fmb', 'neg', 0.0,  1.0, True),
+    'FinMarBa_ss_hd':    _FieldSpec(_KIND_NUM, 'fmb', 'ss',  -1.0, 1.0, True),
+    'FinMarBa_lab_hd':   _FieldSpec(_KIND_STR, 'fmb', 'lab', None, None, True),
+    # FLANG-BERT headline
+    'FLANG_pos_hd':      _FieldSpec(_KIND_NUM, 'flang', 'pos', 0.0,  1.0, True),
+    'FLANG_neu_hd':      _FieldSpec(_KIND_NUM, 'flang', 'neu', 0.0,  1.0, True),
+    'FLANG_neg_hd':      _FieldSpec(_KIND_NUM, 'flang', 'neg', 0.0,  1.0, True),
+    'FLANG_ss_hd':       _FieldSpec(_KIND_NUM, 'flang', 'ss',  -1.0, 1.0, True),
+    'FLANG_lab_hd':      _FieldSpec(_KIND_STR, 'flang', 'lab', None, None, True),
+    # ge15 keyword pipelines
+    'kw15_proba_bd':     _FieldSpec(_KIND_NUM, 'kw', 'kw15_proba_bd', 0.0, 1.0, True),
+    'kw15_proba_hd':     _FieldSpec(_KIND_NUM, 'kw', 'kw15_proba_hd', 0.0, 1.0, True),
+    # PR classifier + earnings scorer
+    'FineClass':         _FieldSpec(_KIND_STR, 'earn', 'FineClass',    None, None, True),
+    'EarningScore':      _FieldSpec(_KIND_INT, 'earn', 'EarningScore', -20,  20,   True,
+                                    _earnscore_na),
+    # The row itself (this ticker, from today's universe TSV)
+    'Float':             _FieldSpec(_KIND_NUM, 'row', 'Float',             0.0, None, False),
+    'MktCap':            _FieldSpec(_KIND_NUM, 'row', 'MktCap',            0.0, None, False),
+    'LastDailyClose':    _FieldSpec(_KIND_NUM, 'row', 'LastDailyClose',    0.0, None, False),
+    'itiBaseline':       _FieldSpec(_KIND_NUM, 'row', 'itiBaseline',       0.0, None, False),
+    'tradeSizeBaseline': _FieldSpec(_KIND_NUM, 'row', 'tradeSizeBaseline', 0.0, None, False),
+    'Exchange':          _FieldSpec(_KIND_STR, 'row', 'Exchange',    None, None, False),
+    'Symbol':            _FieldSpec(_KIND_STR, 'row', 'Symbol',      None, None, False),
+    'TickerCount':       _FieldSpec(_KIND_INT, 'row', 'TickerCount', 1,    2,    False),
+}
+
+# Names used by builds BEFORE the 2026-08-09 column unification, kept ONLY to make
+# the error message better when someone pastes a rule out of an old rules file or an
+# old TSV header. They are never accepted as valid input: one name per field is what
+# lets a Trigger token be pasted back into a rule unchanged.
+_LEGACY_FIELD_NAMES = {
+    'kw15_body':             'kw15_proba_bd',
+    'kw15_head':             'kw15_proba_hd',
+    'kw15_body_proba':       'kw15_proba_bd',
+    'kw15_head_proba':       'kw15_proba_hd',
+    'FLANG_score':           'FLANG_ss_hd',
+    'FLANG_sentiment_score': 'FLANG_ss_hd',
+    'FLANG_positive':        'FLANG_pos_hd',
+    'FLANG_neutral':         'FLANG_neu_hd',
+    'FLANG_negative':        'FLANG_neg_hd',
+    'FLANG_label':           'FLANG_lab_hd',
+    'FMB_score':             'FinMarBa_ss_hd',
+    'FMB_sentiment_score':   'FinMarBa_ss_hd',
+    'FMB_indecisive':        'FinMarBa_ind_hd',
+    'FMB_positive':          'FinMarBa_pos_hd',
+    'FMB_negative':          'FinMarBa_neg_hd',
+    'FMB_label':             'FinMarBa_lab_hd',
+    'FinBERT_positive':      'Prosus_pos_hd',
+    'FinBERT_neutral':       'Prosus_neu_hd',
+    'FinBERT_negative':      'Prosus_neg_hd',
+    'FinBERT_score':         'Prosus_ss_hd',
+    'FinBERT_label':         'Prosus_lab_hd',
+    'positive':              'Prosus_pos_hd',
+    'negative':              'Prosus_neg_hd',
+    'neutral':               'Prosus_neu_hd',
+    'sentiment_score':       'Prosus_ss_hd',
+    'label':                 'Prosus_lab_hd',
+}
+
+# `REQUIRE` may be spelled in any case and separated from the rule name by any run of
+# whitespace, exactly like `AND`. It is stripped BEFORE the ':' partition, so every
+# downstream name check (alnum, no underscore, reserved, duplicate) still sees a bare
+# name and needs no special case. The `\s+` matters: `REQUIRE:` with no space is NOT a
+# prefix — it is a rule NAMED require, which _RESERVED_RULE_NAMES rejects rather than
+# letting it parse as an ordinary rule that merely looks like a precondition.
+# The `|$` catches a bare `REQUIRE` line so it gets the dedicated "nothing after it"
+# error rather than a confusing "found no ':'". Neither alternative matches a rule
+# genuinely named e.g. `REQUIREMENT:`, which still parses as an ordinary rule.
+_REQUIRE_PREFIX_RE = re.compile(r'^REQUIRE(?:\s+|$)', re.IGNORECASE)
+
+_RESERVED_RULE_NAMES = {'bad', 'skipped', 'require'}
+
+# The compiled gate. Assigned ONCE by _load_trigger_rules() from main(), before any
+# worker thread exists, and never mutated after — same publication regime as
+# _earn_params / the kw pipelines, so the pools read them without a lock.
+_trigger_rules:  tuple = ()   # tuple[_Rule, ...] — OR-ed
+_trigger_fields: tuple = ()   # tuple[(name, _FieldSpec)] — the DISTINCT fields read
+
+
+def _parse_trigger_rules(path: str) -> tuple:
+    """orchestrator_trigger_rules.txt -> tuple[_Rule, ...].
+
+    Raises ValueError, message prefixed `<basename>:<lineno>: `, on ANYTHING wrong:
+    there is no partial parse and no skipped line. The caller turns that into a
+    RuntimeError that stops the process — a typo must never silently narrow the gate.
+    """
+    fname = os.path.basename(path)
+
+    def err(msg: str, lineno=None) -> ValueError:
+        where = f"{fname}:{lineno}" if lineno else fname
+        return ValueError(f"{where}: {msg}")
+
+    try:
+        raw_lines = Path(path).read_text(encoding='utf-8').splitlines()
+    except FileNotFoundError:
+        raise err(f"not found at {path} — the trade gate has no rules") from None
+    except Exception as exc:
+        raise err(f"cannot read {path}: {exc}") from None
+
+    rules, seen = [], {}
+    for lineno, raw in enumerate(raw_lines, 1):
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+
+        kind = _RULE_FIRE
+        m = _REQUIRE_PREFIX_RE.match(line)
+        if m:
+            kind = _RULE_REQUIRE
+            line = line[m.end():].strip()
+            if not line:
+                raise err("'REQUIRE' with nothing after it — write "
+                          "'REQUIRE <RuleName>: <cond> AND <cond> ...'", lineno)
+
+        name, sep, body = line.partition(':')
+        if not sep:
+            shape = ("'REQUIRE <RuleName>: <cond> AND <cond> ...'"
+                     if kind == _RULE_REQUIRE else
+                     "'<RuleName>: <cond> AND <cond> ...'")
+            raise err(f"expected {shape}, found no ':' in {line!r}", lineno)
+        name = name.strip()
+        if not name:
+            raise err("empty rule name before ':'", lineno)
+        if not name.isalnum() or not name[0].isalpha():
+            raise err(f"rule name {name!r} must be letters and digits only and start "
+                      f"with a letter. Fired rule names are joined with '_' into the "
+                      f"TSV ClerkSentiment cell, so a '_' in a name would make that "
+                      f"cell ambiguous (the same spelling rule applies to REQUIRE "
+                      f"names, so every group name in the Trigger cell reads alike)",
+                      lineno)
+        if name.lower() in _RESERVED_RULE_NAMES:
+            raise err(f"rule name {name!r} is reserved (ClerkSentiment writes 'BAD' "
+                      f"when no rule fires, and 'skipped:*' when the ticker was never "
+                      f"armed; 'REQUIRE <Name>: ...' — with a space — marks a "
+                      f"precondition)", lineno)
+        if name.lower() in seen:
+            raise err(f"duplicate rule name {name!r} (first defined on line "
+                      f"{seen[name.lower()]}). Ordinary and REQUIRE rules share ONE "
+                      f"name space: both print as a group in the Trigger cell",
+                      lineno)
+
+        body = body.strip()
+        if not body:
+            raise err(f"rule {name!r} has no conditions after ':'", lineno)
+        # A trailing 'AND' leaves no whitespace after it, so the split below cannot
+        # see it and the last condition would fail with a confusing "needs a number".
+        # (A LEADING or DOUBLED 'AND' is caught in _parse_condition, where the stray
+        # token lands in the field position.)
+        if re.search(r'\s+AND$', body, flags=re.IGNORECASE):
+            raise err(f"rule {name!r} ends with a trailing 'AND' — every 'AND' must "
+                      f"join two conditions", lineno)
+
+        conds = []
+        for chunk in re.split(r'\s+AND\s+', body, flags=re.IGNORECASE):
+            chunk = chunk.strip()
+            if not chunk:
+                raise err(f"rule {name!r} has an empty condition (check for a stray "
+                          f"or doubled 'AND')", lineno)
+            conds.append(_parse_condition(chunk, name, lineno, err, fname))
+
+        text = ' AND '.join(f"{c.field} {c.op} {c.thr_str}" for c in conds)
+        rules.append(_Rule(name, tuple(conds), lineno, text, kind))
+        seen[name.lower()] = lineno
+
+    if not rules:
+        raise err("no rules found (every line is blank or a comment) — the gate "
+                  "would never fire")
+    if not any(r.kind == _RULE_FIRE for r in rules):
+        raise err(f"only REQUIRE rule(s) found "
+                  f"({', '.join(r.name for r in rules)}) — a REQUIRE line is a "
+                  f"PRECONDITION: it permits, it never fires. The gate needs at least "
+                  f"one ordinary '<RuleName>: <cond> ...' line or nothing can trade")
+    return tuple(rules)
+
+
+def _parse_condition(chunk: str, rule_name: str, lineno: int, err, fname: str) -> _Cond:
+    """One `<field> <op> <value>` -> _Cond. Splits on the first two runs of
+    whitespace only, so a STRING value may contain spaces."""
+    parts = chunk.split(None, 2)
+    if len(parts) != 3:
+        raise err(f"expected '<field> <op> <value>', got {chunk!r}", lineno)
+    field, op, val = parts[0], parts[1], parts[2].strip()
+
+    # A doubled or leading 'AND' survives the split above (the second one has no
+    # whitespace before it, so it is not a separator) and lands here in the FIELD
+    # position. Say what actually happened rather than "unknown field 'AND'".
+    if field.upper() == 'AND':
+        raise err(f"rule {rule_name!r} has an empty condition (check for a stray "
+                  f"or doubled 'AND')", lineno)
+
+    # `not in` is the only TWO-WORD operator, and the split above cannot see it: the
+    # operator position is always the second whitespace token, so `not` lands there
+    # with the real `in` at the head of the value. Glue it back BEFORE _OPS is
+    # consulted — otherwise the difflib suggester below would offer `!=` for `not`.
+    # `in` / `not in` are case-folded to their canonical spelling exactly as `AND` is,
+    # so _OPS, _Rule.text and the Trigger cell all speak one spelling. Note the elif
+    # rather than a blanket .lower(): a typo like `Ge` must still reach the error
+    # message spelled the way the human typed it.
+    if op.lower() == 'not':
+        rest = val.split(None, 1)
+        if len(rest) != 2 or rest[0].lower() != 'in':
+            raise err(f"unknown operator 'not' for field {field!r} — the only "
+                      f"two-word operator is 'not in'", lineno)
+        op, val = 'not in', rest[1].strip()
+    elif op.lower() == 'in':
+        op = 'in'
+
+    spec = _TRIGGER_FIELDS.get(field)
+    if spec is None:
+        modern = _LEGACY_FIELD_NAMES.get(field)
+        if modern:
+            raise err(f"unknown field {field!r} — did you mean {modern!r}? "
+                      f"({field!r} is a pre-2026-08-09 name; field names now follow "
+                      f"the unified {{Model}}_{{channel}}_{{hd|bd}} column "
+                      f"convention)", lineno)
+        near = difflib.get_close_matches(field, list(_TRIGGER_FIELDS), n=3, cutoff=0.4)
+        if near:
+            raise err(f"unknown field {field!r} — did you mean: "
+                      f"{', '.join(near)}?", lineno)
+        raise err(f"unknown field {field!r} — no similar field name; see the "
+                  f"'Fields' table in the header of this file for the full list",
+                  lineno)
+
+    if op not in _OPS:
+        near = difflib.get_close_matches(op, list(_OPS), n=1, cutoff=0.3)
+        hint = f" — did you mean {near[0]!r}?" if near else ""
+        raise err(f"unknown operator {op!r} for field {field!r}{hint}. Valid "
+                  f"operators: {', '.join(_OPS)}", lineno)
+
+    if spec.kind == _KIND_STR:
+        if op in ('in', 'not in'):
+            return _parse_in_list(field, op, val, lineno, err, spec)
+        if op not in ('==', '!='):
+            raise err(f"operator {op!r} is not allowed on string field {field!r} — "
+                      f"string fields support ==, !=, in and not in", lineno)
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1].strip()
+        if not val:
+            raise err(f"field {field!r} has an empty value after {op!r}", lineno)
+        # rhs lowercased for a case-insensitive compare; thr_str keeps what was typed.
+        return _Cond(field, op, val.lower(), val, None, _OPS[op], spec)
+
+    # `in` / `not in` are set membership over STRING values, and stay that way. On a
+    # numeric field they would need a second render format and a float-equality story
+    # for no present demand; the mirror-image restriction ("string fields take only ==
+    # and !=") is already this file's established shape.
+    if op in ('in', 'not in'):
+        raise err(f"operator {op!r} is not allowed on {spec.kind} field {field!r} — "
+                  f"'in'/'not in' are set membership over STRING values. Numeric "
+                  f"fields take >= <= > < == != (write a range, or a second rule)",
+                  lineno)
+
+    if spec.kind == _KIND_INT:
+        if not re.fullmatch(r'[+-]?\d+', val):
+            extra = ("" if field != 'EarningScore' else
+                     " '>= 4' means four points; '>= 0.4' would silently have meant"
+                     " '>= 1'")
+            raise err(f"field {field!r} is INTEGER POINTS (observed -7..+9), got "
+                      f"{val!r} — write a whole number.{extra}", lineno)
+        rhs = int(val)
+        thr_str, val_fmt = str(rhs), 'd'
+    else:
+        try:
+            rhs = float(val)
+        except ValueError:
+            raise err(f"field {field!r} needs a number, got {val!r}", lineno) from None
+        thr_str, val_fmt = _fmt_thr(rhs), '.4f'
+
+    if spec.lo is not None and rhs < spec.lo:
+        logger.warning("[Gate] %s:%d: rule %r compares %s %s %s, but %s never goes "
+                       "below %s — check this threshold",
+                       fname, lineno, rule_name, field, op, val, field, spec.lo)
+    if spec.hi is not None and rhs > spec.hi:
+        logger.warning("[Gate] %s:%d: rule %r compares %s %s %s, but %s never goes "
+                       "above %s — check this threshold",
+                       fname, lineno, rule_name, field, op, val, field, spec.hi)
+
+    return _Cond(field, op, rhs, thr_str, val_fmt, _OPS[op], spec)
+
+
+def _parse_in_list(field: str, op: str, val: str, lineno: int, err, spec) -> _Cond:
+    """`<field> in a, b, c` -> a _Cond whose rhs is a frozenset of lowercased values.
+
+    The list is comma-separated. Surrounding braces are OPTIONAL on input and always
+    present on output, so the `[Gate] ACTIVE` echo — which rebuilds each rule from its
+    compiled conditions — renders `FineClass in {a,b,c}`, which can be pasted straight
+    back into the rules file. Elements may be quoted, like any string value.
+
+    EVERY degenerate list is a hard error rather than a silently smaller set. That is
+    the whole point: each of these mistakes SHRINKS the set, and a whitelist that
+    quietly lost an element is a gate nobody wrote."""
+    body = val.strip()
+    if len(body) >= 2 and body[0] == '{' and body[-1] == '}':
+        body = body[1:-1].strip()
+    if not body:
+        raise err(f"field {field!r} has an empty list after {op!r} — write "
+                  f"'{field} {op} <value>, <value>, ...'", lineno)
+
+    items, seen = [], {}
+    for raw in body.split(','):
+        item = raw.strip()
+        if len(item) >= 2 and item[0] == item[-1] and item[0] in ('"', "'"):
+            item = item[1:-1].strip()
+        if not item:
+            raise err(f"field {field!r} has an EMPTY element in its {op!r} list "
+                      f"{val!r} — check for a doubled or a trailing ','", lineno)
+        if any(ch.isspace() for ch in item):
+            raise err(f"field {field!r} has a list element {item!r} containing a "
+                      f"space — an {op!r} list is comma-separated and its values may "
+                      f"not contain whitespace. DID YOU FORGET A COMMA? (Use == for a "
+                      f"single value that really does contain one.)", lineno)
+        if item.lower() in seen:
+            raise err(f"field {field!r} lists {item!r} twice in its {op!r} list "
+                      f"(first at position {seen[item.lower()]}; the compare is "
+                      f"case-insensitive, so 'MA' and 'ma' are the same value)",
+                      lineno)
+        seen[item.lower()] = len(items) + 1
+        items.append(item)
+
+    # thr_str is built from the ORDERED, AS-TYPED items, NEVER from the frozenset:
+    # frozenset iteration order varies with PYTHONHASHSEED, which would make the
+    # [Gate] ACTIVE echo and the Trigger cell differ between two processes running the
+    # identical file. Braces + no spaces keep the whole rendering one token.
+    thr_str = '{' + ','.join(items) + '}'
+    return _Cond(field, op, frozenset(i.lower() for i in items), thr_str, None,
+                 _OPS[op], spec)
+
+
+def _load_trigger_rules(path: str = None) -> None:
+    """Parse the rules file into the module globals. Raises RuntimeError on any
+    problem — the same hard-fail class as the model pre-warm self-checks, and for the
+    same reason: a trading process must not run a gate nobody wrote."""
+    global _trigger_rules, _trigger_fields
+    path = path or TRIGGER_RULES_FILE
+    try:
+        rules = _parse_trigger_rules(path)
+    except ValueError as exc:
+        raise RuntimeError(f"{exc} — refusing to start") from None
+
+    # The DISTINCT fields any rule reads, in first-appearance order. _evaluate_trigger
+    # extracts exactly these once per row, rather than once per condition.
+    fields, order = {}, []
+    for rule in rules:
+        for cond in rule.conds:
+            if cond.field not in fields:
+                fields[cond.field] = cond.spec
+                order.append(cond.field)
+    # EarningScore's na_when reads FineClass, so FineClass must be extracted whenever
+    # EarningScore is referenced — even by a rule that never tests it. One line here
+    # is what makes the NA verdict total.
+    if 'EarningScore' in fields and 'FineClass' not in fields:
+        fields['FineClass'] = _TRIGGER_FIELDS['FineClass']
+        order.append('FineClass')
+
+    _trigger_rules  = rules
+    _trigger_fields = tuple((n, fields[n]) for n in order)
+
+    # A rule that reads EarningScore without pinning FineClass can effectively never
+    # fire, because the scorer only ever runs on EARN_CLASS rows. Not fatal — a rule
+    # may legitimately be narrower — but it is almost always a mistake.
+    for rule in rules:
+        names = {c.field: c for c in rule.conds}
+        if 'EarningScore' not in names:
+            continue
+        fc = names.get('FineClass')
+        # `== Earnings_Results` and `in {Earnings_Results}` pin the class equally well.
+        # (The `==` arm is safe against a frozenset rhs: a str never equals a set.)
+        pinned = fc is not None and (
+            (fc.op == '==' and fc.rhs == EARN_CLASS.lower()) or
+            (fc.op == 'in' and fc.rhs == frozenset({EARN_CLASS.lower()})))
+        if not pinned:
+            logger.warning(
+                "[Gate] %s:%d: rule %r tests EarningScore but does not require "
+                "FineClass == %s. The earnings scorer only runs on that class, so "
+                "EarningScore is None on ~81%% of rows and this rule can almost "
+                "never fire.", os.path.basename(path), rule.lineno, rule.name,
+                EARN_CLASS)
+
+
+def _log_active_gate() -> None:
+    """Echo the WHOLE gate once, at startup.
+
+    The rules are read at startup ONLY, so a process started before an edit keeps the
+    OLD gate until it is restarted — and nothing else in the log says which one is
+    live (the TSV header has been identical across gate changes since 2026-08-02).
+    This block is the cheapest way to answer "which gate is this process running?"
+    from logs/ alone; it is the reason it exists.
+
+    Each rule is rebuilt FROM ITS COMPILED CONDITIONS, never echoed from the raw
+    line, so a parse that differs from what the human meant is visible right here.
+
+    ⚠ With no REQUIRE rule loaded this block is byte-identical to the pre-2026-08-17
+    one, deliberately: that is what lets a `diff` of two --check-rules runs prove the
+    REQUIRE refactor changed no behaviour."""
+    fires = [r for r in _trigger_rules if r.kind == _RULE_FIRE]
+    reqs  = [r for r in _trigger_rules if r.kind == _RULE_REQUIRE]
+    if reqs:
+        logger.info("[Gate] ACTIVE — %d PRECONDITION(s) AND (OR of %d rule(s)) from "
+                    "%s (read ONCE at startup; edit + RESTART to change). A row "
+                    "trades when EVERY REQUIRE line holds AND ANY ONE ordinary rule's "
+                    "conditions ALL hold; a REQUIRE line that fails closes the gate "
+                    "however many ordinary rules held.",
+                    len(reqs), len(fires), TRIGGER_RULES_FILE)
+    else:
+        logger.info("[Gate] ACTIVE — OR of %d rule(s) from %s (read ONCE at startup; "
+                    "edit + RESTART to change). A row trades when ANY rule's "
+                    "conditions ALL hold.", len(fires), TRIGGER_RULES_FILE)
+    for i, rule in enumerate(reqs, 1):
+        logger.info("[Gate]   REQUIRE (%d) %s: %s", i, rule.name, rule.text)
+    for i, rule in enumerate(fires, 1):
+        logger.info("[Gate]   (%d) %s: %s", i, rule.name, rule.text)
+    # Which loaded rules read which scorer — DERIVED, so it stays true after any edit.
+    # A model that no rule reads is still scored on every PR: it burns the
+    # trade-critical path for nothing, and a reader of logs/ would assume it still
+    # gates trades. That is worth a WARNING.
+    for src, label in (('finbert', 'FinBERT'), ('fmb', 'FinMarBa'),
+                       ('flang', 'FLANG-BERT'), ('kw', 'ge15 keyword'),
+                       ('earn', 'PrClassifier/earnings'), ('row', 'universe row')):
+        used = sorted({f"{r.name}{' (REQUIRE)' if r.kind == _RULE_REQUIRE else ''}"
+                       for r in _trigger_rules
+                       for c in r.conds if c.spec.source == src})
+        if used:
+            logger.info("[Gate]   %s feeds rule(s): %s", label, ', '.join(used))
+        elif src != 'row':
+            logger.warning("[Gate]   %s is scored on EVERY PR but NO rule reads it — "
+                           "it costs latency and gates nothing", label)
 
 
 # ─── Trade-trigger gate ───────────────────────────────────────────────────────
 
 def _fmt_thr(v: float) -> str:
-    """A gate threshold for the Trigger cell: 2 dp when that round-trips exactly
-    (true for the five core cuts → 0.80 / 0.14 / 0.50 / 0.50 / 0.96, and for the
-    0.70 solo cut), otherwise %g. So FLANG_SOLO_MIN renders as 0.975 rather than a
-    misleadingly-rounded 0.97, and a retune to 0.625 renders as 0.625."""
+    """A threshold parsed from orchestrator_trigger_rules.txt, as the Trigger cell
+    should print it: 2 dp when that round-trips exactly, otherwise %g. So a 0.975 cut
+    renders in full rather than as a misleadingly-rounded 0.97, and a retune to 0.625
+    renders as 0.625.
+
+    Called at LOAD time only — the result is cached in _Cond.thr_str, so no threshold
+    is ever formatted on the per-row path."""
     s = f"{v:.2f}"
     return s if float(s) == v else f"{v:g}"
 
 
-def _cond_token(name: str, value, threshold, ok: bool, is_floor: bool,
-                val_fmt: str = '.4f', thr_fmt: str | None = None) -> str:
+def _cond_token(name: str, value, thr_str: str, op: str, ok: bool,
+                val_fmt: str = '.4f') -> str:
     """One `name:VERDICT(score op threshold)` token of the Trigger cell.
 
     `ok` is passed IN rather than recomputed here — that is what makes it
     impossible for the TSV cell to disagree with the gate that actually fired.
-    The printed operator is always the relation that is TRUE of the row: `>=`/`<=`
-    on a pass, its negation `<`/`>` on a fail. A None score (model error / future
-    timeout) renders as a bare MISSING, so a dead scorer never looks like a model
-    that merely scored low. Scores are display-rounded to 4 dp — the PASS/FAIL
+    The printed operator is always the relation that is TRUE of the row: the rule's
+    own operator on a pass, its negation from _OP_NEG on a fail (so a `>=` cut prints
+    `<` when it failed, and the `<=` ceiling prints `>`). A None score (model error /
+    future timeout) renders as a bare MISSING, so a dead scorer never looks like a
+    model that merely scored low. Scores are display-rounded to 4 dp — the PASS/FAIL
     token, not the number, is authoritative.
 
-    `val_fmt`/`thr_fmt` exist for the earnings condition alone, whose score is
-    integer POINTS, not a probability: it renders `earn:PASS(5>=4)` instead of a
-    misleading `earn:PASS(5.0000>=4.00)`. Everything else keeps the 4 dp / _fmt_thr
-    defaults."""
+    `thr_str` arrives PRE-RENDERED from _Cond, which is why this function cannot be
+    handed a threshold of the wrong type: coercion happens once, at parse time.
+    `val_fmt` follows the field's kind — 'd' for an integer-valued field like
+    EarningScore (`EarningScore:PASS(5>=4)`, not a misleading `5.0000>=4.00`), None
+    for a string field, 4 dp for everything else.
+
+    A set-membership condition renders with the ∈ / ∉ glyph and the WHOLE list, never
+    truncated: `FineClass:PASS(MA∈{MA,Partnership,...})`. Truncating it would break the
+    "a row stays self-describing across a retune" property this cell exists for."""
     if value is None:
         return f"{name}:MISSING"
-    op = ('>=' if ok else '<') if is_floor else ('<=' if ok else '>')
-    thr = format(threshold, thr_fmt) if thr_fmt else _fmt_thr(threshold)
-    return f"{name}:{'PASS' if ok else 'FAIL'}({format(value, val_fmt)}{op}{thr})"
+    shown = (str(value).strip() if val_fmt is None else
+             format(int(value), 'd') if val_fmt == 'd' else
+             format(value, val_fmt))
+    # _OP_CELL, not the raw op: `in`/`not in` are WORDS and would put spaces inside a
+    # token. The relation printed is always the one that is TRUE of this row — the
+    # rule's own operator on a pass, its negation on a fail.
+    return (f"{name}:{'PASS' if ok else 'FAIL'}"
+            f"({shown}{_OP_CELL[op if ok else _OP_NEG[op]]}{thr_str})")
+
+
+def _cond_true(cond: _Cond, value) -> bool:
+    """Evaluate ONE compiled condition against a NON-None value.
+
+    Never raises. A value the operator cannot handle — an unexpected type out of a
+    model, a non-numeric string where a number was promised — FAILS, exactly as a
+    None does. This is the trade-critical path and it must not throw.
+
+    A word operator (`in` / `not in`) needs no branch here: _OPS hands back a callable
+    with the same (lhs, rhs) argument order as every comparison, and its rhs is the
+    frozenset built at parse time — so set membership is the same single call."""
+    try:
+        if cond.spec.kind == _KIND_STR:
+            return bool(cond.fn(str(value).strip().lower(), cond.rhs))
+        return bool(cond.fn(float(value), cond.rhs))
+    except (TypeError, ValueError):
+        return False
 
 
 def _evaluate_trigger(finbert_val: dict, finmarba_val: dict, flang_val: dict,
-                      kw_val: dict, earn_val: dict) -> tuple:
-    """STEP-1b gate. Since 2026-08-03 it is an OR of FIVE branches:
+                      kw_val: dict, earn_val: dict, row_vals: dict,
+                      rules: tuple = None) -> tuple:
+    """STEP-1b trade gate. Returns `(is_ok, label, detail, missing_blocked)`.
 
-      CORE branch — the 2026-08-01 five-way AND, every condition required, unchanged:
-        FinBERT    positive        >= SENTIMENT_POSITIVE_MIN
-        FinMarBa   indecisive      <= FMB_INDECISIVE_MAX   (the only ceiling)
-        ge15 body  model_proba     >= KW15_BODY_MIN
-        ge15 head  model_proba     >= KW15_HEAD_MIN
-        FLANG-BERT sentiment_score >= FLANG_SCORE_MIN
+    THE RULES ARE NOT IN THIS FILE. They are parsed from
+    orchestrator_trigger_rules.txt by _load_trigger_rules() ONCE at startup into
+    `_trigger_rules`. This docstring describes the MECHANISM and deliberately does
+    NOT restate the rules: a docstring that repeats external thresholds is guaranteed
+    to rot the first time somebody edits that file, which is the exact failure mode
+    this design exists to remove. To see the gate a given process actually ran, read
+    the `[Gate] ACTIVE` block in its log — the rules are read at startup, so a running
+    process keeps its gate until restarted.
 
-      EARNINGS branch (2026-08-02) — three conditions, also all required:
-        PrClassifier FineClass     == EARN_CLASS ('Earnings_Results')
-        EarningScore (POINTS, int) >= EARN_SCORE_MIN
-        ge15 body  model_proba     >= KW15_BODY_MIN   ← the SAME c_body local
+    Semantics:
+      - Ordinary rules are OR-ed: one FIRES when its conditions ALL hold.
+      - REQUIRE rules are PRECONDITIONS, AND-ed over the whole gate. They never fire
+        and never reach ClerkSentiment; they only permit. So
+            is_ok = (every REQUIRE rule holds) AND (any ordinary rule fires)
+      - Conditions within any rule are AND-ed.
+      - A `None` value ALWAYS fails its condition — never passes, never raises. On a
+        REQUIRE condition that closes the WHOLE gate (fail closed), which is why the
+        `missing_blocked` alarm below matters more than it used to.
+      - String fields compare case-insensitively, and `in`/`not in` test membership of
+        a set fixed at parse time.
+    `rules` is injectable so an offline replay can score a candidate rule set without
+    touching module state; it defaults to the loaded gate.
 
-      THREE SOLO branches (2026-08-03) — ONE condition each, each firing unaided:
-        KwBodySolo   ge15 body  model_proba     >= KW15_BODY_SOLO_MIN       (0.70)
-        FLANGSolo    FLANG-BERT sentiment_score >= FLANG_SOLO_MIN           (0.975)
-        FinBERTSolo  FinBERT    positive        >= SENTIMENT_POSITIVE_SOLO_MIN (0.935)
+    `label` -> the TSV ClerkSentiment cell: fired rule names joined with '_', else
+      'BAD'. The names come from the file, so this vocabulary is the operator's.
+      A row a REQUIRE rule blocked reads 'BAD' like any other non-fire; `detail`'s
+      `:BLOCK[` group is what tells the two apart.
 
-        is_ok = core_and OR earnings_leg OR kwbody_solo_leg OR flang_solo_leg
-                        OR finbert_solo_leg
+    `detail` -> the TSV Trigger cell: `YES|NO | ` then one group per rule,
+      `<RuleName>:<verdict>[<token> <token> ...]`, where the verdict is YES/NO for an
+      ordinary rule and ALLOW/BLOCK for a REQUIRE rule, e.g.
 
-      There is deliberately NO `indecisive <= x` solo branch — see the SOLO LEGS
-      comment block at the top of the file before adding one.
+        NO | ClassWhitelist:BLOCK[FineClass:FAIL(Other∉{MA,Partnership,...})]
+             CORE:NO[Prosus_pos_hd:PASS(0.9100>=0.80) FinMarBa_ind_hd:FAIL(0.2>0.14)
+             ...] EARNINGS:NO[FineClass:FAIL(Other!=Earnings_Results) EarningScore:NA
+             kw15_proba_bd:PASS(0.5500>=0.50)]
+             KwBodySolo:NO[kw15_proba_bd:FAIL(0.5500<0.70)]
 
-    Returns (is_ok, label, detail, missing_blocked).
+      EVERY rule prints on EVERY row, including rows that fired, so the TSV stays a
+      complete offline replay input — a candidate retune can be scored from tables/
+      alone. Each token carries the score AND the threshold it was judged against, so
+      a row stays self-describing across a retune. A token is PASS, FAIL, MISSING (the
+      score was None — model error or future timeout) or NA (absent BY DESIGN; see
+      _earnscore_na).
 
-    The earnings branch exists because the core AND is structurally blind to earnings
-    PRs — its FinBERT headline score measured test AUC 0.297 there (anti-predictive):
-    winners and duds share the same headline, the numbers are in the body. On 518
-    labelled Earnings_Results rows the core AND fired 3x at 0% precision while this
-    leg fires 36x at 47.2%, with ZERO overlap. See the EARNINGS LEG comment block at
-    the top of this file for the full calibration.
+      ⚠ A `:YES` GROUP NO LONGER IMPLIES THE ROW FIRED. Before 2026-08-17 a cell
+      starting `NO |` meant every group read `:NO`. Now an ordinary rule can hold while
+      a REQUIRE rule blocks the gate, so `NO | ClassWhitelist:BLOCK[...] CORE:YES[...]`
+      is a normal, correct cell. Read the LEADING verdict for what the row did; read
+      the groups for why. Anything counting fires by grepping `:YES` is wrong.
 
-    The three SOLO branches re-read scores the core branch already uses, at STRICTLY
-    TIGHTER cuts, so each c_*_solo IMPLIES its core twin and they SUBSUME the core
-    branch wherever they hold: the five-way AND and the earnings leg are only decisive
-    in the band below every solo cut — kw15_body in [0.50, 0.70), FLANG in [0.96,
-    0.975), positive in [0.8, 0.935). FMB `indecisive` and kw15_head are the two core
-    conditions with no solo twin, i.e. the only ones that can still veto.
-    ⚠ Their cuts are operator-specified (2026-08-03) and, alone among the thresholds in
-    this file, are NOT backed by a corpus calibration — see the SOLO LEGS comment block,
-    which also records why a fourth `indecisive <= x` solo leg was written and then
-    removed the same day (direction-agnostic: a low `indecisive` means "confident",
-    either way, with nothing to pin the sign the way FinBERT positive does in the AND).
+    `missing_blocked` -> feeds a WARNING and nothing else; it can never affect
+      trading. True when the row did NOT fire and some rule was blocked by a MISSING
+      score ALONE: every one of that rule's evaluable conditions passed, and at least
+      one alarming field was None. This one expression generalizes the three
+      hand-written terms it replaced. It is exact for a multi-condition rule, and for
+      a single-condition rule "all evaluable passed" is vacuous — which makes the
+      alarm loud by design, because a dead model there removes an entire branch while
+      the tape still looks alive. It is deliberately a STRICT SUPERSET in one case the
+      old code missed: a dead PR classifier (FineClass None) on a row whose other
+      earnings conditions passed now warns, where before `c_class` was False and the
+      alarm stayed silent.
+      ⚠ Since 2026-08-17 a REQUIRE rule arms it too, and that is the loudest case in
+      the file: a dead PR classifier fails the class whitelist, which closes the whole
+      gate, so this WARNING fires on EVERY row until it is fixed. That volume IS the
+      signal — the alarm is now the only thing distinguishing "trading has stopped"
+      from "a quiet news day".
 
-    `label` joins the fired leg names with '_' in the fixed order ('Keyword',
-    'FinBERT_FMB', 'FLANG', 'Earnings', 'KwBodySolo', 'FLANGSolo', 'FinBERTSolo'),
-    gated on `is_ok`, NOT on a non-empty `fired` — a row can have one leg true and still
-    not fire (e.g. Keyword alone), and labelling it 'Keyword' would contradict the gate.
-    THAT GUARD IS STILL LOAD-BEARING even though the solo legs made most single-leg
-    cases firing ones. The label names exactly which legs held, so it is fully
-    informative again; the vocabulary is far wider than the AND-era
-    'Keyword_FinBERT_FMB_FLANG'/'BAD' pair, e.g. 'KwBodySolo', 'FLANG_FLANGSolo',
-    'FinBERTSolo', 'Earnings'. Because every solo cut is strictly tighter than its core
-    twin, each solo name implies its twin's condition: 'KwBodySolo' implies c_body
-    (hence 'Keyword' whenever kw15_head passes), 'FLANGSolo' can NEVER appear without
-    'FLANG', and 'FinBERTSolo' implies c_fin (hence 'FinBERT_FMB' whenever FMB agrees).
+    ⚠ Trigger-cell format history, for anyone parsing old TSVs: 5 flat tokens =
+      2026-08-01, 7 = 08-02, 10 = 08-03. From 2026-08-07 the cell is rule-GROUPED and
+      the presence of '[' identifies this build. Token names are now the rules-file
+      field names (`Prosus_pos_hd`, not `FinBERT`) — which since 2026-08-09 are also
+      the TSV column names, so a token can be pasted straight back into a rule.
+      From 2026-08-17 an `ALLOW`/`BLOCK` group verdict (and the ∈/∉ glyph) identifies
+      the build, and a `:YES` group can appear in a `NO` cell."""
+    if rules is None:
+        rules = _trigger_rules
+    sources = {'finbert': finbert_val, 'fmb': finmarba_val, 'flang': flang_val,
+               'kw': kw_val, 'earn': earn_val, 'row': row_vals}
+    # ONE extraction pass over the DISTINCT fields any rule reads, rather than one per
+    # condition — a score shared by several rules is fetched once.
+    vals = {name: sources[spec.source].get(spec.key)
+            for name, spec in _trigger_fields}
 
-    `missing_blocked` is the dead-model alarm: True when this row did NOT fire and the
-    only thing standing between it and a fire was a None score — every evaluable CORE
-    condition passed but a model/future returned nothing, OR a scored-eligible earnings
-    PR (class + kw15_body OK) has a None EarningScore, OR — since 2026-08-03 — ANY of
-    kw15_body / FLANG / positive is None at all, because a solo branch has exactly ONE
-    condition and a missing score is therefore the whole of what blocked it. The caller
-    logs it at WARNING. That third term makes the alarm markedly louder by design: with
-    five branches a dead model no longer halts trading, so it is even less visible in
-    the fire count, while every one of those three scores now backs a branch that trades
-    unaided. `indecisive` is NOT in that term — it backs no solo branch, so the core
-    term above is the right scope for it.
+    fired, groups, blocked = [], [], False
+    required_ok = True
+    for rule in rules:
+        rule_ok = all_evaluable_passed = True
+        rule_missing = False
+        toks = []
+        for cond in rule.conds:
+            value = vals.get(cond.field)
+            if value is None:
+                rule_ok = False
+                if cond.spec.na_when is not None and cond.spec.na_when(vals):
+                    # Absent BY DESIGN. Not a fault, so it does not arm the alarm and
+                    # does not count as "an evaluable condition that failed".
+                    toks.append(f"{cond.field}:NA")
+                else:
+                    toks.append(f"{cond.field}:MISSING")
+                    if cond.spec.alarm:
+                        rule_missing = True
+                continue
+            ok = _cond_true(cond, value)
+            if not ok:
+                rule_ok = all_evaluable_passed = False
+            toks.append(_cond_token(cond.field, value, cond.thr_str, cond.op, ok,
+                                    cond.val_fmt))
+        if rule_ok:
+            # A REQUIRE rule that holds has not FIRED anything — it has only permitted.
+            # It never enters `fired`, so it never reaches ClerkSentiment.
+            if rule.kind == _RULE_FIRE:
+                fired.append(rule.name)
+        else:
+            if rule.kind == _RULE_REQUIRE:
+                required_ok = False
+            # Reached by BOTH kinds: a precondition blocked by a dead scorer alone is
+            # exactly the case the alarm exists for, and it now stops the whole gate.
+            if rule_missing and all_evaluable_passed:
+                blocked = True
+        yes_word, no_word = _RULE_VERDICT[rule.kind]
+        groups.append(f"{rule.name}:{yes_word if rule_ok else no_word}"
+                      f"[{' '.join(toks)}]")
 
-    `detail` is the TSV `Trigger` cell (added 2026-07-29): the YES/NO verdict plus a
-    PASS/FAIL/MISSING token per CONDITION, so a row shows WHICH one failed and by how
-    much. It grew by appending only — the five core tokens keep their position and
-    order, `earn`/`class` were appended 2026-08-02 and the three solo tokens 2026-08-03
-    — so a parser written for the 5- or 7-token format still works. TEN tokens now:
-        YES | FinBERT:PASS(0.8231>=0.80) FMB:PASS(0.0512<=0.14) \
-kw15_body:PASS(0.7300>=0.50) kw15_head:FAIL(0.4412<0.50) FLANG:FAIL(0.6210<0.96) \
-earn:NA class:Product_Update kw15_body_solo:PASS(0.7300>=0.70) \
-FLANG_solo:FAIL(0.6210<0.975) FinBERT_solo:FAIL(0.8231<0.935)
-    The three solo tokens deliberately REPRINT the kw15_body / FLANG / FinBERT scores
-    against their own cuts, so the row records both thresholds it was judged against and
-    stays self-describing across a retune of either. `FMB` remains the ONLY `<=` token.
-    `earn` is the one token in POINTS, not a probability, and the one with a fourth
-    verdict: `earn:NA` on a row whose class is known and simply isn't Earnings_Results
-    (deliberately not scored — the common case), leaving `earn:MISSING` to mean what
-    MISSING means everywhere else, a score that should exist and doesn't.
-    All outputs come from the SAME per-condition booleans below, so the cell can never
-    disagree with the gate.
-
-    ⚠ The gate was an OR-of-three-legs through 2026-07-31, a pure AND on 2026-08-01, a
-    two-branch OR from 2026-08-02 and this five-branch OR from 2026-08-03; 'Keyword'
-    means a DIFFERENT rule before/after 2026-07-28, and the FLANG labels only exist from
-    2026-07-29 — see the gate comment blocks near the top of this file before comparing
-    historical TSVs. The TSV header does NOT distinguish the 08-02 and 08-03 builds
-    (still 42 cols); the Trigger cell's token count does — 7 = 08-02, 10 = this build.
-    (9- and 11-token variants existed only inside the 2026-08-03 editing session and
-    never wrote a live row.)"""
-    positive   = finbert_val.get('positive')
-    indecisive = finmarba_val.get('indecisive')
-    kw_body    = kw_val.get('kw15_body_proba')
-    kw_head    = kw_val.get('kw15_head_proba')
-    flang      = flang_val.get('sentiment_score')
-    fine_class = earn_val.get('FineClass')
-    earn_score = earn_val.get('EarningScore')
-    # Per-CONDITION verdicts, computed once and used for the gate, the legs AND the
-    # Trigger cell — so none of the three can drift from the others.
-    c_fin   = positive   is not None and positive   >= SENTIMENT_POSITIVE_MIN
-    c_fmb   = indecisive is not None and indecisive <= FMB_INDECISIVE_MAX
-    c_body  = kw_body    is not None and kw_body    >= KW15_BODY_MIN
-    c_head  = kw_head    is not None and kw_head    >= KW15_HEAD_MIN
-    c_fla   = flang      is not None and flang      >= FLANG_SCORE_MIN
-    c_class = fine_class == EARN_CLASS
-    c_earn  = earn_score is not None and earn_score >= EARN_SCORE_MIN
-    # 2026-08-03 solo cuts — the SAME three scores as c_body/c_fla/c_fin, read at strictly
-    # tighter cuts, so each of these IMPLIES its core twin. There is deliberately NO
-    # `indecisive` solo cut: see the SOLO LEGS block (it is direction-agnostic).
-    c_body_solo = kw_body  is not None and kw_body  >= KW15_BODY_SOLO_MIN
-    c_fla_solo  = flang    is not None and flang    >= FLANG_SOLO_MIN
-    c_fin_solo  = positive is not None and positive >= SENTIMENT_POSITIVE_SOLO_MIN
-    headline_leg = c_fin  and c_fmb
-    keyword_leg  = c_body and c_head
-    flang_leg    = c_fla
-    # NOTE c_body is SHARED with keyword_leg — one condition, one local, two branches.
-    earnings_leg = c_class and c_earn and c_body
-    # The three 2026-08-03 solo branches: one condition each, each fires on its own.
-    kwbody_solo_leg  = c_body_solo
-    flang_solo_leg   = c_fla_solo
-    finbert_solo_leg = c_fin_solo
-    # Appended, never reordered — every pre-existing label keeps its prefix and order.
-    fired = [name for name, ok in (('Keyword',     keyword_leg),
-                                   ('FinBERT_FMB', headline_leg),
-                                   ('FLANG',       flang_leg),
-                                   ('Earnings',    earnings_leg),
-                                   ('KwBodySolo',  kwbody_solo_leg),
-                                   ('FLANGSolo',   flang_solo_leg),
-                                   ('FinBERTSolo', finbert_solo_leg)) if ok]
-    # Core AND (2026-08-01). Equivalent to `headline_leg and keyword_leg and flang_leg`
-    # — each leg is itself an AND — but spelled over the five conditions because that
-    # is the rule as calibrated.
-    core_and = c_fin and c_fmb and c_body and c_head and c_fla
-    # The OR over all five branches — 2026-08-02 added earnings, 2026-08-03 the three solo
-    # legs. Every branch is added BESIDE the core AND, never inside it, so anything that
-    # fired under an earlier build still fires under this one.
-    is_ok = (core_and or earnings_leg or kwbody_solo_leg or flang_solo_leg
-             or finbert_solo_leg)
-    # A None score is the ONLY thing blocking this row: every condition that could be
-    # evaluated passed, but at least one model/future gave nothing back. One term per
-    # branch; `not is_ok` because a row another branch already traded has nothing blocked.
-    _vals  = (positive, indecisive, kw_body, kw_head, flang)
-    _conds = (c_fin, c_fmb, c_body, c_head, c_fla)
-    core_missing = (any(v is None for v in _vals)
-                    and all(c for c, v in zip(_conds, _vals) if v is not None))
-    # Earnings twin: a known-Earnings_Results row whose kw15_body passed but whose
-    # EarningScore came back None — the earnings scorer is dead, not the news quiet.
-    earn_missing = c_class and c_body and earn_score is None
-    # Solo twin. A solo branch is a SINGLE condition, so "every evaluable condition
-    # passed" degenerates to "the one score is missing" — which makes this term much
-    # louder than the other two: a dead scorer now WARNs on EVERY row rather than only on
-    # rows where the other models happened to agree. That volume IS the signal; all three
-    # of these scores back a branch that can trade unaided, so losing one silently removes
-    # a whole branch while the tape still looks alive. `indecisive` is deliberately NOT
-    # here — it backs no solo branch, so core_missing above is the right scope for it.
-    solo_missing = kw_body is None or flang is None or positive is None
-    missing_blocked = (not is_ok) and (core_missing or earn_missing or solo_missing)
-    # is_floor=False for FMB alone — `indecisive` is a CEILING, the only <= condition.
-    detail = ' '.join(
-        _cond_token(name, value, threshold, ok, is_floor)
-        for name, value, threshold, ok, is_floor in (
-            ('FinBERT',   positive,   SENTIMENT_POSITIVE_MIN, c_fin,  True),
-            ('FMB',       indecisive, FMB_INDECISIVE_MAX,     c_fmb,  False),
-            ('kw15_body', kw_body,    KW15_BODY_MIN,          c_body, True),
-            ('kw15_head', kw_head,    KW15_HEAD_MIN,          c_head, True),
-            ('FLANG',     flang,      FLANG_SCORE_MIN,        c_fla,  True)))
-    # `earn` prints as integer POINTS ('5>=4'), hence the format overrides. NA rather
-    # than MISSING when the class is known and simply isn't Earnings_Results: the
-    # scorer was deliberately skipped, not broken. That distinction is the whole point
-    # of the token — ~85% of rows are non-earnings, and MISSING on all of them would
-    # drown out the one row where the scorer actually died. MISSING is therefore left
-    # to mean exactly what it means everywhere else: the score should exist and does
-    # not (an Earnings_Results row that failed to score, or a dead worker whose
-    # FineClass is None too).
-    if earn_score is None and fine_class is not None and not c_class:
-        detail += ' earn:NA'
-    else:
-        detail += ' ' + _cond_token('earn', earn_score, EARN_SCORE_MIN, c_earn, True,
-                                    val_fmt='d', thr_fmt='d')
-    # The class is categorical, not a threshold comparison, so it gets a plain token
-    # rather than a PASS/FAIL one — it doubles as the FineClass record in the log line.
-    detail += f" class:{fine_class if fine_class else 'MISSING'}"
-    # The three 2026-08-03 solo cuts, APPENDED for the same reason `earn`/`class` were: the
-    # seven tokens before them keep their position, so a 5- or 7-token parser still works.
-    # They print the SAME three scores as the kw15_body / FLANG / FinBERT tokens above
-    # against a DIFFERENT threshold, which is the point — the row records both cuts it was
-    # judged against, and stays self-describing when either is retuned. Plain
-    # probabilities and floors, so no format overrides; _fmt_thr renders 0.975 and 0.935
-    # exactly rather than rounding them to 2 dp. There is no FMB_solo token — that leg was
-    # removed the day it was written (see the SOLO LEGS block).
-    detail += ' ' + _cond_token('kw15_body_solo', kw_body, KW15_BODY_SOLO_MIN,
-                                c_body_solo, True)
-    detail += ' ' + _cond_token('FLANG_solo', flang, FLANG_SOLO_MIN, c_fla_solo, True)
-    detail += ' ' + _cond_token('FinBERT_solo', positive, SENTIMENT_POSITIVE_SOLO_MIN,
-                                c_fin_solo, True)
-    # `fired` alone is NOT the condition here: a row can still have a leg true and not
-    # fire, and labelling it after that leg would contradict the gate. The 2026-08-03
-    # solo branches NARROWED this window but did not close it — e.g. kw15_body 0.55
-    # (Keyword true with kw15_head, below the 0.70 solo cut), FLANG under 0.96, FinBERT
-    # under 0.935, not an earnings PR: `fired` reads ['Keyword'] and the gate says BAD.
+    # THE GATE: every precondition AND any one ordinary rule.
+    is_ok = required_ok and bool(fired)
+    missing_blocked = (not is_ok) and blocked
+    # ⚠ LOAD-BEARING since 2026-08-17, after being merely defensive from 08-07 to then.
+    # `fired` holds RULE names, so is_ok == bool(fired) held by construction while every
+    # rule was a firing rule. A REQUIRE rule does NOT imply a fire: a row whose CORE
+    # conditions all held but whose whitelist blocked it has a NON-EMPTY `fired` and
+    # is_ok False, and without this guard ClerkSentiment would read `CORE_FLANGSolo` on
+    # a row that never traded — which replay_gate.py and every fired_* analysis would
+    # then count as a fire. This is the "day a rule kind appears that does NOT imply a
+    # fire" the pre-08-17 comment here was written for.
+    # (It was load-bearing once before, too: pre-08-07 `fired` held LEG names — Keyword
+    # / FinBERT_FMB / FLANG — that were sub-parts of the CORE branch and could be true
+    # with nothing firing at all, on 23.8% of the 08-03..08-07 tape.)
     label = '_'.join(fired) if is_ok else 'BAD'
-    return is_ok, label, f"{'YES' if is_ok else 'NO'} | {detail}", missing_blocked
+    return (is_ok, label,
+            f"{'YES' if is_ok else 'NO'} | {' '.join(groups)}", missing_blocked)
 
 
 # ─── Clerk senders (TCP/JSON to clerk-1.1.py) ────────────────────────────────
@@ -1042,30 +1494,46 @@ _TSV_COLUMNS = [
     'Headline', 'Body', 'Author',
     'Float', 'MktCap', 'Exchange',
     'LastDailyClose', 'itiBaseline', 'tradeSizeBaseline',
-    'FinBERTCompletedAt',
-    'positive', 'negative', 'neutral', 'sentiment_score', 'label',
-    'FMB_time',
-    'FMB_positive', 'FMB_indecisive', 'FMB_negative', 'FMB_sentiment_score', 'FMB_label',
-    # FLANG-BERT block (2026-07-29). Only FLANG_sentiment_score feeds the gate; the
-    # rest are for offline re-analysis. These map 1:1 onto the offline FLANG-BERT_*
-    # columns emitted by tools/Encoder_Models/HeadScore11encoders.py.
-    # FLANG_time = completion timestamp (FMB_time convention); FLANG_ms = the
-    # model's own inference_ms duration.
-    'FLANG_time',
-    'FLANG_positive', 'FLANG_neutral', 'FLANG_negative', 'FLANG_sentiment_score',
-    'FLANG_label', 'FLANG_ms',
+    # ── Sentiment blocks. Since 2026-08-09 every score column follows the unified
+    # `{Model}_{channel}_{hd|bd}` convention, IDENTICAL to what the offline batch
+    # scorers in tools/Encoder_Models/ emit — so a live row and an offline rescore
+    # of the same headline now share column names, not just values.
+    # `_hd` = the scored text was the Headline. `_at_hd` is a COMPLETION TIMESTAMP,
+    # `_ms_hd` the model's own inference DURATION — the old FLANG_time / FLANG_ms
+    # pair conflated those two ideas by name.
+    # ProsusAI FinBERT — these five were UNPREFIXED (`positive`, `label`, …) before
+    # 2026-08-09, the last columns in the file with no model in their name.
+    'Prosus_at_hd',
+    'Prosus_pos_hd', 'Prosus_neg_hd', 'Prosus_neu_hd', 'Prosus_ss_hd', 'Prosus_lab_hd',
+    # FinMarBa. `ind` is deliberately NOT `neu`: a low value means confident in
+    # EITHER direction, so it must never be read as an ordinary neutral probability.
+    'FinMarBa_at_hd',
+    'FinMarBa_pos_hd', 'FinMarBa_ind_hd', 'FinMarBa_neg_hd', 'FinMarBa_ss_hd',
+    'FinMarBa_lab_hd',
+    # FLANG-BERT (2026-07-29). Only FLANG_ss_hd feeds the gate; the rest are for
+    # offline re-analysis.
+    'FLANG_at_hd',
+    'FLANG_pos_hd', 'FLANG_neu_hd', 'FLANG_neg_hd', 'FLANG_ss_hd',
+    'FLANG_lab_hd', 'FLANG_ms_hd',
     'ClerkSentiment',
-    'kw15_body_proba', 'kw15_head_proba', 'KwScoreCompletedAt',
-    # Trigger (2026-07-29) — the gate's own account of itself: YES/NO plus a
-    # PASS/FAIL/MISSING token per condition with the score and the threshold it was
-    # compared against. Built by _evaluate_trigger from the same booleans the gate
-    # fires on. NOT a duplicate of ClerkSentiment: that one records the fired LEGS
-    # and is overwritten with 'skipped:*' when the ticker was never armed, whereas
-    # Trigger is populated on EVERY row (the gate runs before the arm branch), and
-    # it resolves a leg into its underlying models. Appended LAST on purpose —
-    # every pre-existing column keeps its index. Its TOKEN COUNT is also the only
-    # thing that distinguishes the 08-02 build (7) from the 08-03 one (9), since the
-    # solo branches added no columns and so leave this header identical.
+    'kw15_proba_bd', 'kw15_proba_hd', 'kw15_at',
+    # Trigger (2026-07-29) — the gate's own account of itself, built by
+    # _evaluate_trigger from the same booleans the gate fires on. Since 2026-08-07 it
+    # is RULE-GROUPED: YES/NO, then one `<RuleName>:<YES|NO>[<tokens>]` group per
+    # loaded rule, every rule printed on every row (which is what keeps this TSV a
+    # complete offline replay input). Tokens are PASS/FAIL/MISSING/NA with the score
+    # and the threshold it was judged against. NOT a duplicate of ClerkSentiment: that
+    # one records the fired RULES and is overwritten with 'skipped:*' when the ticker
+    # was never armed, whereas Trigger is populated on EVERY row (the gate runs before
+    # the arm branch) and resolves a rule into its underlying models.
+    # ⚠ READING OLD TSVs: the cell was a FLAT token list until 08-07 and its token
+    # COUNT identified the build (5 = 08-01, 7 = 08-02, 10 = 08-03). From 08-07 the
+    # presence of '[' identifies it, and the group count follows the rules file, not
+    # the release date. Gate changes have not touched this header since 08-02, so 42
+    # columns spans every gate from then on.
+    # ⚠ Since 2026-08-09 the token NAMES are the unified column names too
+    # (`Prosus_pos_hd:PASS(...)`, not `FinBERT_positive:PASS(...)`) — which is the
+    # cheapest way to tell a pre- from a post-rename row apart from the header.
     'Trigger',
     # Earnings block (2026-08-02) — appended LAST for the same reason. FineClass is the
     # PrClassifier catalyst class, written on EVERY row. EarningScore (integer POINTS,
@@ -1076,6 +1544,16 @@ _TSV_COLUMNS = [
     # which is what makes an EarningScore auditable without the 25 earn_* feature cols.
     'FineClass', 'EarningScore', 'EarnBreakdown',
 ]
+# ⚠ 2026-08-09 — COLUMN COUNT UNCHANGED (42), NAMES ALL CHANGED. Every sentiment
+# column was renamed to the unified `{Model}_{channel}_{hd|bd}` convention shared
+# with tools/Encoder_Models/. This is the inverse of the 2026-08-07 refactor, which
+# changed the gate without touching the header: here the header changes and the gate
+# does not (verified: 391/391 rows of the 08-03..08-09 tape produce identical fire
+# decisions and identical fired-rule labels). A file whose header still reads
+# `positive` / `FMB_indecisive` / `kw15_body_proba` was written by an older build —
+# migrate it with tools/Encoder_Models/rename_encoder_cols.py rather than re-scoring.
+# Because the arity is identical on both sides, a half-migrated file CANNOT be caught
+# by a column count: only the names distinguish them.
 
 
 def _append_to_tsv(completed_dict: dict) -> None:
@@ -1322,9 +1800,32 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         logger.error(f"[EarnScore] {symbol}: earn future failed/timed out for id={news_id}: {exc}")
         earn_val = dict(_EARN_NONE_RESULT)
 
-    # 3) Trade gate (core five-way AND OR earnings leg) → decision + label + Trigger cell
+    # 2c) Per-ticker universe fields, resolved ONCE. They feed BOTH the gate (row
+    #     fields are addressable from orchestrator_trigger_rules.txt) and
+    #     completed_dict below — each _lookup_* takes _iti_df_lock and does a pandas
+    #     mask scan, so they are read here exactly once and reused rather than looked
+    #     up again when the row is built. Exchange keeps its payload-first /
+    #     universe-fallback order. TickerCount counts EVERY ticker the article named,
+    #     not just the in-universe ones.
+    #     Two harmless side effects of resolving these before the gate instead of
+    #     after: _lookup_baseline_iti's "missing/invalid — using default" WARNING now
+    #     prints before this row's [Gate] line, and _is_rth_now() is evaluated a few
+    #     ms earlier.
+    row_vals = {
+        'Symbol':            symbol,
+        'Float':             _lookup_float(symbol),
+        'MktCap':            _lookup_mktcap(symbol),
+        'Exchange':          news_dict.get('Exchange') or _lookup_exchange(symbol),
+        'LastDailyClose':    _lookup_last_close(symbol),
+        'itiBaseline':       _lookup_baseline_iti(symbol),
+        'tradeSizeBaseline': _lookup_baseline_trade_size(symbol),
+        'TickerCount':       len(tickers),
+    }
+
+    # 3) Trade gate from orchestrator_trigger_rules.txt — every REQUIRE precondition
+    #    AND an OR of the ordinary rules → decision + label + Trigger cell
     is_ok, trigger_label, trigger_detail, missing_blocked = _evaluate_trigger(
-        finbert_val, finmarba_val, flang_val, kw_val, earn_val)
+        finbert_val, finmarba_val, flang_val, kw_val, earn_val, row_vals)
     # Log every gate input against its threshold, so a rejection can be diagnosed from
     # the log alone. This is the SAME string that lands in the TSV Trigger cell, so the
     # log can never drift from the row.
@@ -1355,34 +1856,34 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
         'Headline':           news_dict['Headline'],
         'Body':               c3.clean_inline_text(news_dict.get('body_raw') or ''),
         'Author':             news_dict.get('Author', ''),
-        'Float':              _lookup_float(symbol),
-        'MktCap':             _lookup_mktcap(symbol),
-        'Exchange':           news_dict.get('Exchange') or _lookup_exchange(symbol),
-        'LastDailyClose':     _lookup_last_close(symbol),
-        'itiBaseline':        _lookup_baseline_iti(symbol),
-        'tradeSizeBaseline':  _lookup_baseline_trade_size(symbol),
-        'FinBERTCompletedAt': finbert_completed_at,
-        'positive':           finbert_val.get('positive'),
-        'negative':           finbert_val.get('negative'),
-        'neutral':            finbert_val.get('neutral'),
-        'sentiment_score':    finbert_val.get('sentiment_score'),
-        'label':              finbert_val.get('label'),
-        'FMB_time':             fmb_completed_at,
-        'FMB_positive':         finmarba_val.get('positive'),
-        'FMB_indecisive':       finmarba_val.get('indecisive'),
-        'FMB_negative':         finmarba_val.get('negative'),
-        'FMB_sentiment_score':  finmarba_val.get('sentiment_score'),
-        'FMB_label':            finmarba_val.get('label'),
-        'FLANG_time':             flang_completed_at,
-        'FLANG_positive':         flang_val.get('positive'),
-        'FLANG_neutral':          flang_val.get('neutral'),
-        'FLANG_negative':         flang_val.get('negative'),
-        'FLANG_sentiment_score':  flang_val.get('sentiment_score'),
-        'FLANG_label':            flang_val.get('label'),
-        'FLANG_ms':               flang_val.get('inference_ms'),
-        'kw15_body_proba': kw_val.get('kw15_body_proba'),
-        'kw15_head_proba': kw_val.get('kw15_head_proba'),
-        'KwScoreCompletedAt':          kw_val.get('KwScoreCompletedAt'),
+        'Float':              row_vals['Float'],
+        'MktCap':             row_vals['MktCap'],
+        'Exchange':           row_vals['Exchange'],
+        'LastDailyClose':     row_vals['LastDailyClose'],
+        'itiBaseline':        row_vals['itiBaseline'],
+        'tradeSizeBaseline':  row_vals['tradeSizeBaseline'],
+        'Prosus_at_hd':   finbert_completed_at,
+        'Prosus_pos_hd':  finbert_val.get('pos'),
+        'Prosus_neg_hd':  finbert_val.get('neg'),
+        'Prosus_neu_hd':  finbert_val.get('neu'),
+        'Prosus_ss_hd':   finbert_val.get('ss'),
+        'Prosus_lab_hd':  finbert_val.get('lab'),
+        'FinMarBa_at_hd':  fmb_completed_at,
+        'FinMarBa_pos_hd': finmarba_val.get('pos'),
+        'FinMarBa_ind_hd': finmarba_val.get('ind'),
+        'FinMarBa_neg_hd': finmarba_val.get('neg'),
+        'FinMarBa_ss_hd':  finmarba_val.get('ss'),
+        'FinMarBa_lab_hd': finmarba_val.get('lab'),
+        'FLANG_at_hd':  flang_completed_at,
+        'FLANG_pos_hd': flang_val.get('pos'),
+        'FLANG_neu_hd': flang_val.get('neu'),
+        'FLANG_neg_hd': flang_val.get('neg'),
+        'FLANG_ss_hd':  flang_val.get('ss'),
+        'FLANG_lab_hd': flang_val.get('lab'),
+        'FLANG_ms_hd':  flang_val.get('ms'),
+        'kw15_proba_bd': kw_val.get('kw15_proba_bd'),
+        'kw15_proba_hd': kw_val.get('kw15_proba_hd'),
+        'kw15_at':       kw_val.get('kw15_at'),
         # Set here, not in the clerk branches below: the gate verdict is recorded on
         # every row even when the ticker is never armed.
         'Trigger':                     trigger_detail,
@@ -1446,32 +1947,32 @@ def _collect_and_log(news_dict: dict, tickers: list, symbol: str,
     print(f"  Headline                     : {completed_dict['Headline']}")
     print(f"  Body (preview)               : {body_cell[:100]}")
     print(f"  Author                       : {completed_dict['Author']}")
-    print(f"  FinBERT label                : {completed_dict['label']}")
-    print(f"  sentiment_score              : {completed_dict['sentiment_score']}")
-    print(f"  positive                     : {completed_dict['positive']}")
-    print(f"  negative                     : {completed_dict['negative']}")
-    print(f"  neutral                      : {completed_dict['neutral']}")
+    print(f"  Prosus_lab_hd                : {completed_dict['Prosus_lab_hd']}")
+    print(f"  Prosus_ss_hd                 : {completed_dict['Prosus_ss_hd']}")
+    print(f"  Prosus_pos_hd                : {completed_dict['Prosus_pos_hd']}")
+    print(f"  Prosus_neg_hd                : {completed_dict['Prosus_neg_hd']}")
+    print(f"  Prosus_neu_hd                : {completed_dict['Prosus_neu_hd']}")
     print(f"  Float                        : {completed_dict['Float']}")
     print(f"  Exchange                     : {completed_dict['Exchange']}")
     print(f"  LastDailyClose               : {completed_dict['LastDailyClose']}")
     print(f"  itiBaseline                  : {completed_dict['itiBaseline']}")
     print(f"  tradeSizeBaseline            : {completed_dict['tradeSizeBaseline']}")
-    print(f"  FinBERTCompletedAt           : {completed_dict['FinBERTCompletedAt']}")
-    print(f"  FMB_indecisive               : {completed_dict['FMB_indecisive']}")
-    print(f"  FMB_positive                 : {completed_dict['FMB_positive']}")
-    print(f"  FMB_negative                 : {completed_dict['FMB_negative']}")
-    print(f"  FMB_label                    : {completed_dict['FMB_label']}")
-    print(f"  FMB_time                     : {completed_dict['FMB_time']}")
-    print(f"  FLANG_sentiment_score        : {completed_dict['FLANG_sentiment_score']}")
-    print(f"  FLANG_positive               : {completed_dict['FLANG_positive']}")
-    print(f"  FLANG_negative               : {completed_dict['FLANG_negative']}")
-    print(f"  FLANG_neutral                : {completed_dict['FLANG_neutral']}")
-    print(f"  FLANG_label                  : {completed_dict['FLANG_label']}")
-    print(f"  FLANG_ms                     : {completed_dict['FLANG_ms']}")
-    print(f"  FLANG_time                   : {completed_dict['FLANG_time']}")
-    print(f"  kw15_body_proba             : {completed_dict['kw15_body_proba']}")
-    print(f"  kw15_head_proba             : {completed_dict['kw15_head_proba']}")
-    print(f"  KwScoreCompletedAt           : {completed_dict['KwScoreCompletedAt']}")
+    print(f"  Prosus_at_hd                 : {completed_dict['Prosus_at_hd']}")
+    print(f"  FinMarBa_ind_hd              : {completed_dict['FinMarBa_ind_hd']}")
+    print(f"  FinMarBa_pos_hd              : {completed_dict['FinMarBa_pos_hd']}")
+    print(f"  FinMarBa_neg_hd              : {completed_dict['FinMarBa_neg_hd']}")
+    print(f"  FinMarBa_lab_hd              : {completed_dict['FinMarBa_lab_hd']}")
+    print(f"  FinMarBa_at_hd               : {completed_dict['FinMarBa_at_hd']}")
+    print(f"  FLANG_ss_hd                  : {completed_dict['FLANG_ss_hd']}")
+    print(f"  FLANG_pos_hd                 : {completed_dict['FLANG_pos_hd']}")
+    print(f"  FLANG_neg_hd                 : {completed_dict['FLANG_neg_hd']}")
+    print(f"  FLANG_neu_hd                 : {completed_dict['FLANG_neu_hd']}")
+    print(f"  FLANG_lab_hd                 : {completed_dict['FLANG_lab_hd']}")
+    print(f"  FLANG_ms_hd                  : {completed_dict['FLANG_ms_hd']}")
+    print(f"  FLANG_at_hd                  : {completed_dict['FLANG_at_hd']}")
+    print(f"  kw15_proba_bd                : {completed_dict['kw15_proba_bd']}")
+    print(f"  kw15_proba_hd                : {completed_dict['kw15_proba_hd']}")
+    print(f"  kw15_at                      : {completed_dict['kw15_at']}")
     print(f"  FineClass                    : {completed_dict['FineClass']}")
     print(f"  EarningScore                 : {completed_dict['EarningScore']}")
     print(f"  EarnBreakdown                : {completed_dict['EarnBreakdown']}")
@@ -1543,15 +2044,45 @@ def _on_row_built(data: dict, row: dict, arrival_dt) -> None:
         logger.info(f"[Row] id={art_id}: {len(tickers)} tickers > {MAX_TICKERS_PER_ARTICLE} — dropped")
         return
 
-    # Content dedup — same headline+tickers the same day is an RTPR re-publish
-    # under a new ID (PRZO 2026-07-06, FOFO 2026-07-07) → drop like an ID dup.
-    fp = (' '.join(headline.lower().split()), tuple(sorted(tickers)))
-    prev = _seen_content.get(fp)
-    if prev is not None:
-        logger.info(f"[Row] id={art_id}: duplicate content (headline+tickers seen "
-                    f"{(arrival_dt - prev).total_seconds():.1f}s ago) — skipped")
+    # Content dedup — the same headline for the same TICKER on the same day is an
+    # RTPR re-publish under a new ID (PRZO 2026-07-06, FOFO 2026-07-07) → drop
+    # that ticker like an ID dup. Keyed per ticker rather than per article since
+    # 2026-08-12 because a re-publish routinely carries a DIFFERENT ticker list
+    # (warrant added/dropped, partner added) — see the _seen_content note above.
+    #
+    # Runs AFTER the ticker-count filter on purpose: an article naming > 2
+    # tickers is spam whatever the dedup state, so that filter must keep seeing
+    # the original list.
+    hl_norm = ' '.join(headline.lower().split())
+    fresh, dupes = [], []
+    for symbol in tickers:
+        prev = _seen_content.get((hl_norm, symbol))
+        if prev is None:
+            fresh.append(symbol)
+        else:
+            dupes.append(f"{symbol} ({(arrival_dt - prev).total_seconds():.1f}s ago)")
+    if not fresh:
+        logger.info(f"[Row] id={art_id}: duplicate content (headline already seen for "
+                    f"every ticker: {', '.join(dupes)}) — skipped")
         return
-    _seen_content[fp] = arrival_dt
+    if dupes:
+        # Partial overlap. The article brings a ticker we have not handled today,
+        # but if none of those is in-universe there is nothing left to act on —
+        # this is the common re-publish shape, where the copy that arrives second
+        # is the one carrying the warrant (BBLG / BBLG+BBLGW). Arming already
+        # skips the warrant, but the fan-out's all-out-of-universe fallback would
+        # write a junk warrant-only row into the calibration corpus. Drop it.
+        # Guarded on `dupes` so a genuinely new article keeps today's behaviour,
+        # fallback row included.
+        if not any(s in _inscope_set for s in fresh):
+            logger.info(f"[Row] id={art_id}: duplicate content for {', '.join(dupes)}; "
+                        f"remaining {fresh} all out-of-universe — skipped")
+            return
+        logger.info(f"[Row] id={art_id}: duplicate content for {', '.join(dupes)} — "
+                    f"those tickers dropped, continuing with {fresh}")
+        tickers = fresh
+    for symbol in fresh:
+        _seen_content[(hl_norm, symbol)] = arrival_dt
     while len(_seen_content) > CONTENT_DEDUP_MAX_KEYS:
         _seen_content.pop(next(iter(_seen_content)))
 
@@ -1750,6 +2281,20 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # The gate, BEFORE any model loads. Deliberately first: the rules file is the one
+    # artifact a human hand-edits, so it is the one most likely to be wrong, and
+    # paying ~30 s of ONNX + joblib loading only to learn you typed `kw15_body`
+    # is a bad loop at 06:00 before the open. The models are frozen artifacts that
+    # change almost never; this file changes weekly. Nothing in the parse needs a
+    # model. Raises RuntimeError and stops the process on any problem.
+    _load_trigger_rules(TRIGGER_RULES_FILE)
+    # Terse now, full echo after pre-warm — so the gate is on the record even if a
+    # model load dies before we reach the [Gate] ACTIVE block.
+    logger.info("[Gate] Loaded %d rule(s) from %s: %s", len(_trigger_rules),
+                TRIGGER_RULES_FILE,
+                ', '.join(f"{r.name}{' (REQUIRE)' if r.kind == _RULE_REQUIRE else ''}"
+                          for r in _trigger_rules))
+
     # Pre-warm ALL THREE headline models + a smoke inference each so the first real
     # PR pays no session/tokenizer init or first-call kernel-JIT cost on any model.
     logger.info("Pre-loading FinBERT-headliner model...")
@@ -1785,10 +2330,11 @@ def main():
         if not (0.0 <= float(_v) <= 1.0):
             raise RuntimeError(f"ge15 {_name} pipeline returned {_v!r}, not a "
                                "probability; refusing to start")
-    logger.info("ge15 keyword pipelines ready (smoke: body=%.6f head=%.6f; "
-                "core branch needs body>=%s AND head>=%s, and body>=%s fires alone).",
-                _smoke_body, _smoke_head, _fmt_thr(KW15_BODY_MIN),
-                _fmt_thr(KW15_HEAD_MIN), _fmt_thr(KW15_BODY_SOLO_MIN))
+    # A MODEL smoke test — it can no longer assert anything about the gate, since the
+    # cuts these scores are judged against live in the rules file and there may be any
+    # number of them. Which rules read this model is echoed by _log_active_gate().
+    logger.info("ge15 keyword pipelines ready (smoke: body=%.6f head=%.6f).",
+                _smoke_body, _smoke_head)
 
     # Earnings leg: load the calibrated score params ONCE (never in the hot path — the
     # default path re-reads the JSON per call) and HARD-FAIL on any problem. Same
@@ -1801,7 +2347,12 @@ def main():
     _smoke_hl = "Acme Corp Reports Second Quarter 2026 Financial Results"
     _smoke_body_txt = ("Revenue grew 60% year-over-year to $24.3 million. "
                        "The company reported record quarterly revenue.")
-    _smoke_class, _ = classify_pr(_smoke_hl)
+    # headline=True, to match how _classify_and_score_earnings actually calls it
+    # below. Without it this smoke-tested the BODY path against a headline, which
+    # stopped being equivalent on 2026-08-14: Earnings_Results is now headline-only
+    # (PrClassifier.BODY_EXCLUDED_CLASSES), because 7 of the 9 rows the body path
+    # ever put in this live-gated class were wrong.
+    _smoke_class, _ = classify_pr(_smoke_hl, headline=True)
     if _smoke_class != EARN_CLASS:
         raise RuntimeError(f"PrClassifier returned {_smoke_class!r} for a canonical "
                            f"earnings headline, expected {EARN_CLASS!r}; refusing to start")
@@ -1813,27 +2364,12 @@ def main():
         raise RuntimeError(f"earning_scorer returned {_smoke_score!r} on a PR with "
                            "explicit revenue growth; expected a positive int score — "
                            "refusing to start")
-    logger.info("PR classifier + earnings scorer ready (smoke: class=%s score=%d [%s]; "
-                "leg needs FineClass==%s AND EarningScore>=%d AND kw15_body>=%s).",
-                _smoke_class, _smoke_score, _smoke_brk, EARN_CLASS, EARN_SCORE_MIN,
-                _fmt_thr(KW15_BODY_MIN))
+    logger.info("PR classifier + earnings scorer ready (smoke: class=%s score=%d [%s]).",
+                _smoke_class, _smoke_score, _smoke_brk)
 
-    # Echo the WHOLE gate once, every branch with the thresholds actually in force. The
-    # constants are module-level and read at import, so a process that was started before
-    # a retune keeps the OLD gate until it is restarted — and nothing else in the log
-    # says which one is live (the TSV header is identical across the 08-02 and 08-03
-    # builds). This line is the cheapest way to answer "which gate is this process
-    # running?" from logs/ alone.
-    logger.info("[Gate] ACTIVE — OR of 5 branches: "
-                "(1) CORE FinBERT>=%s AND FMB<=%s AND kw15_body>=%s AND kw15_head>=%s "
-                "AND FLANG>=%s | (2) EARNINGS class==%s AND earn>=%d AND kw15_body>=%s | "
-                "(3) KwBodySolo kw15_body>=%s | (4) FLANGSolo FLANG>=%s | "
-                "(5) FinBERTSolo positive>=%s",
-                _fmt_thr(SENTIMENT_POSITIVE_MIN), _fmt_thr(FMB_INDECISIVE_MAX),
-                _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_HEAD_MIN),
-                _fmt_thr(FLANG_SCORE_MIN), EARN_CLASS, EARN_SCORE_MIN,
-                _fmt_thr(KW15_BODY_MIN), _fmt_thr(KW15_BODY_SOLO_MIN),
-                _fmt_thr(FLANG_SOLO_MIN), _fmt_thr(SENTIMENT_POSITIVE_SOLO_MIN))
+    # Echo the WHOLE gate: every rule, with the thresholds actually in force, rebuilt
+    # from the compiled conditions. See _log_active_gate().
+    _log_active_gate()
 
     # Load the universe (plain membership — no float filter). _iti_df also backs the
     # Float/MktCap/Exchange/close/ITI/tradeSize lookups for the TSV + clerk arm. The
@@ -1886,4 +2422,13 @@ def main():
 
 
 if __name__ == '__main__':
+    if '--check-rules' in sys.argv:
+        # Parse + echo orchestrator_trigger_rules.txt, then exit. No models, no
+        # sockets, no universe read: ~1 s. This is the fast edit/verify loop for the
+        # rules file, and the mitigation that keeps a typo from turning the
+        # refuse-to-start policy into a trading outage. Exit 0 means the gate echoed
+        # here is exactly the gate O5.2 would run.
+        _load_trigger_rules(TRIGGER_RULES_FILE)
+        _log_active_gate()
+        sys.exit(0)
     main()

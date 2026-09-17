@@ -55,8 +55,14 @@ BLOCKLIST = {
     "ArrivalTime", "ArrivalDate", "Created", "CurlTime", "OrchTime",
     "body_duration_ms", "body_sentiment",
 }
-BLOCK_SUFFIXES = ("CompletedAt", "_elapsed_ms")
+# Timing and completion-stamp columns are never predictors. `_at_hd`/`_ms_hd` are
+# the unified 2026-08-09 names; the older spellings are kept so this still works
+# against a corpus that has not been migrated.
+BLOCK_SUFFIXES = ("CompletedAt", "_elapsed_ms",
+                  "_at_hd", "_at_bd", "_ms_hd", "_ms_bd", "kw15_at")
 
+# "label" is the pre-2026-08-09 bare FinBERT column; the unified names end in
+# `_lab_hd` / `_lab_bd` and are caught by the suffix test in split_candidates().
 CATEGORICAL_BASE = ["label", "Author", "Exchange", "boilerplate_category",
                     "FineClass", "BroadClass"]
 
@@ -98,7 +104,8 @@ def detect_columns(df, target, min_n):
     """Split columns into (numeric candidates, categorical candidates)."""
     categorical = [c for c in df.columns
                    if not is_blocked(c, target)
-                   and (c in CATEGORICAL_BASE or c.endswith("_label"))]
+                   and (c in CATEGORICAL_BASE
+                        or c.endswith(("_label", "_lab_hd", "_lab_bd")))]
     numeric = []
     for col in df.columns:
         if is_blocked(col, target) or col in categorical:

@@ -42,18 +42,20 @@ DEFAULT_TOL = 0.05
 
 # display name -> script file, scoring function, model dir (existence check only).
 # "exact": deterministic scorer, compared with zero tolerance.
+# Model names are the unified 2026-08-09 column tokens, shared with
+# HeadScore11encoders.MODELS — keep the two in step; the names are the contract.
 MODELS = {
-    "FinMarBa":      {"script": "FinMarBa_headliner.py",      "fn": "score_headline",   "model_dir": "finmarba_onnx"},
-    "FLANG-BERT":    {"script": "FLANG-BERT_headliner.py",    "fn": "analyze_headline", "model_dir": "flangbert_sentiment_onnx"},
-    "FLANG-ELECTRA": {"script": "FLANG-ELECTRA_headliner.py", "fn": "analyze_headline", "model_dir": "flang_electra_onnx"},
-    "RoBERTa":       {"script": "RoBERTa_headliner.py",       "fn": "score_headline",   "model_dir": "roberta_sentiment_onnx"},
-    "ModernBERT":    {"script": "ModernBERT_headliner.py",    "fn": "analyze_headline", "model_dir": "modernbert_zeroshot_onnx"},
-    "DeBERTa":       {"script": "DeBERTa_headliner.py",       "fn": "analyze_headline", "model_dir": "deberta_zeroshot_onnx"},
-    "finbert-tone":  {"script": "finbert-tone_headliner.py",  "fn": "score_headline",   "model_dir": "finbert_tone_onnx"},
-    "FinancialBERT": {"script": "FinancialBERT_headliner.py", "fn": "score_headline",   "model_dir": "financialbert_onnx"},
-    "distilroberta": {"script": "distilroberta_headliner.py", "fn": "score_headline",   "model_dir": "distilroberta_financial_onnx"},
-    "Trading-Hero":  {"script": "Trading-Hero_headliner.py",  "fn": "score_headline",   "model_dir": "trading_hero_onnx"},
-    "LouMcD-SDict":  {"script": "LouMcD-SDict_headliner.py",  "fn": "score_headline",   "model_dir": "loumcd_sdict", "exact": True},
+    "FinMarBa":   {"script": "FinMarBa_headliner.py",      "fn": "score_headline",   "model_dir": "finmarba_onnx"},
+    "FLANG":      {"script": "FLANG-BERT_headliner.py",    "fn": "analyze_headline", "model_dir": "flangbert_sentiment_onnx"},
+    "FLElectra":  {"script": "FLANG-ELECTRA_headliner.py", "fn": "analyze_headline", "model_dir": "flang_electra_onnx"},
+    "RoBERTa":    {"script": "RoBERTa_headliner.py",       "fn": "score_headline",   "model_dir": "roberta_sentiment_onnx"},
+    "ModernB":    {"script": "ModernBERT_headliner.py",    "fn": "analyze_headline", "model_dir": "modernbert_zeroshot_onnx"},
+    "DeBERTa":    {"script": "DeBERTa_headliner.py",       "fn": "analyze_headline", "model_dir": "deberta_zeroshot_onnx"},
+    "FinTone":    {"script": "finbert-tone_headliner.py",  "fn": "score_headline",   "model_dir": "finbert_tone_onnx"},
+    "FinancialB": {"script": "FinancialBERT_headliner.py", "fn": "score_headline",   "model_dir": "financialbert_onnx"},
+    "DistilRo":   {"script": "distilroberta_headliner.py", "fn": "score_headline",   "model_dir": "distilroberta_financial_onnx"},
+    "TradeHero":  {"script": "Trading-Hero_headliner.py",  "fn": "score_headline",   "model_dir": "trading_hero_onnx"},
+    "LouMcD":     {"script": "LouMcD-SDict_headliner.py",  "fn": "score_headline",   "model_dir": "loumcd_sdict", "exact": True},
 }
 
 # Fixed probe set: FLANG-BERT's export probes plus the known quirk-triggers from
@@ -71,7 +73,10 @@ GOLDEN_HEADLINES = {
 }
 
 # Keys excluded from golden storage/comparison (machine-dependent or redundant).
-VOLATILE_KEYS = {"headline", "elapsed_ms", "inference_ms"}
+# `ms` is the unified 2026-08-09 timing key; before that the headliners disagreed
+# between `elapsed_ms` and `inference_ms`, so both are still listed — a golden file
+# captured on either vocabulary stays readable.
+VOLATILE_KEYS = {"headline", "ms", "elapsed_ms", "inference_ms"}
 
 
 def _load_module(script_name: str):
@@ -89,7 +94,10 @@ def _clean(result: Dict) -> Dict:
 
 
 def _timing_ms(result: Dict) -> float:
-    return float(result.get("elapsed_ms", result.get("inference_ms", math.nan)))
+    # Every headliner returns `ms` since 2026-08-09; the two legacy spellings are
+    # kept as fallbacks so this still reports a number against an older checkout.
+    return float(result.get("ms",
+                 result.get("elapsed_ms", result.get("inference_ms", math.nan))))
 
 
 def _flatten(obj, prefix="") -> Dict[str, object]:

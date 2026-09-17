@@ -365,11 +365,24 @@ class SharedIBClient(EWrapper, EClient):
     def openOrder(self, orderId, contract, order, orderState):
         # INFO, not DEBUG: on a silent "Inactive" entry (rejected-orders-findings
         # PART B) warningText/completedStatus is the only reason IBKR ever sends.
-        logger.info("client %d openOrder %d %s %s status=%s completed=%s warn=%r",
+        logger.info("client %d openOrder %d %s %s lmt=%s status=%s completed=%s warn=%r",
                     self.client_id, orderId, order.action, order.orderType,
+                    getattr(order, "lmtPrice", ""),
                     orderState.status,
                     getattr(orderState, "completedStatus", ""),
                     getattr(orderState, "warningText", "") or "")
+        # x-wing 3.0 tracks the ask by re-pricing the entry, and openOrder carries
+        # the only copy of the price IBKR is ACTUALLY working — orderStatus never
+        # reports one, so a 2161 cap is otherwise invisible to x-wing. getattr-
+        # guarded: this clerk still loads x-wing-2.1, which has no on_open_order.
+        s = self.session
+        if s is not None:
+            cb = getattr(s.xwing, "on_open_order", None)
+            if cb is not None:
+                try:
+                    cb(orderId, getattr(order, "lmtPrice", None), orderState.status)
+                except Exception as e:
+                    logger.error("on_open_order routing failed: %s", e, exc_info=True)
 
     def execDetails(self, reqId, contract, execution):
         logger.debug("client %d exec %s %s @ %.4f", self.client_id,

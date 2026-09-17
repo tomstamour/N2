@@ -222,7 +222,62 @@ SURGE_ITI_COLLAPSE_MIN_TRADES_5S = 3
 # (max +0.78% before its -2.3% SELL) and SMCI — still the thinnest margin in the
 # rule set; tune here first if a similar FP reappears.
 # 2026-07-30: 0.01 -> 0.012 (kills the GV neg at +1.199%; no pos E-fire below +5.3%).
-SURGE_FLOW_MIN_DOLLAR_RATE_5S = 10.0
+# A "Rule G" for MODERATE relative acceleration was built and REJECTED on
+# 2026-08-08 — do not re-propose it without new evidence. Motivation was AZI
+# 2026-08-07, which ran ~6.8x its baseline trade rate at ~0.75 s absolute ITI:
+# between Rule D's absolute 0.28 s bar and Rule B/C's 100x/1550x relative bars,
+# so nothing was watching that shape. Tested as
+# `accel_{1,2,5}s_vs_hist_baseline >= G AND price_change >= 1.2%`, swept
+# G in {3,5,8,12,20} x window {1,2,5} on the corrected 07-09..07-30 corpus:
+#   * WITH the price condition it is first-to-fire in 1 file of 44 and moves
+#     nothing (16/16 pos, 12/20 neg, median TTF 0.25 s at every setting) — the
+#     directional term makes it a near-subset of Rule E.
+#   * WITHOUT it, every threshold from 3x to 40x fires 20/20 neg and 8/8 neu.
+#     A bare relative cut fires on everything; this is the same wall Rule C hit,
+#     and it is why C sits at 1550 rather than at a "reasonable" multiple.
+# Structural reason it could not have helped: the OR was already at 16/16 recall,
+# and an ADDED branch can only increase negative fires, never kill them.
+# Numbers: mole-outputs/surge-predictor-analysis-2026-08-08-*.md
+#
+# 2026-08-11: 10.0 -> 3.0. Driven by PLAG 2026-08-11 07:30 (FLANGSolo-gated PR,
+# mole-outputs/trade-mole-table_PLAG_2026-08-11_07-30-01.csv). Its whole 149 s
+# watch produced TWO fills — 1 lot MID @0.6016, then 18 lots BUY @0.62 — and
+# nothing else in the rule set was within 35x of firing (B 1.31 vs 100, C 2.59 vs
+# 1550, D 9.76 s vs 0.28, F 1.31 vs 100; A blocked outright at quote_updates_10s=3
+# vs 11). Rule E was the ONLY near miss: its price leg passed at +3.06% while
+# dollar_rate_5s reached only 4.46. Break-even is <=4.4, verified by replaying the
+# recording through the real should_fire() (analyze_trade_mole/replay_mole.py),
+# not a re-implementation. B/C/F being nowhere near is by design, not a
+# miscalibration: they are relative to the name's own cadence and PLAG's
+# itiBaseline is 876.9 s, so an 11-minute pre-PR gap is NORMAL for it
+# (876.9/669.2 = 1.31).
+#   LABELLED-corpus cost: none. sweep_thresholds.py --fixes none is identical at
+#   every step from 10 down to 3 — pos 16/16, neu 7/8, neg 11/20, median TTF
+#   0.25 s — over the 44 scored of the 61 labelled recordings >= 2026-07-09; 2.2
+#   is where the first extra negative appears. But the dollar leg is INERT on
+#   that corpus (the +1.2% price leg is what binds), so it endorses the change no
+#   more than it forbids it — do not quote "zero cost" without the next para.
+#   WIDER cost, measured over ALL 2.2-era recordings (>= 2026-07-30, 54 of 114
+#   scored — the unlabelled live sessions the sweep never looks at): fires go
+#   27 -> 30, i.e. +3 (+11%). The new fires are PLAG itself, OXBR 2026-08-04
+#   ($rate 9.8, +4.73%) and DXST 2026-07-30 ($rate 5.0, +6.41%); REBN
+#   2026-08-11 fires 2.25 s EARLIER via E instead of Rule C. Nine other files
+#   differ only in the threshold printed inside surge_reason — same row, same
+#   instant, cosmetic. OXBR and DXST are unlabelled and their recordings hold no
+#   prints after the new fire point, so whether those two are wins is UNKNOWN;
+#   this cut is accepted on PLAG (n=1) plus the absence of a measurable negative.
+#   Label those two and re-check before loosening this constant any further.
+# WARNING — coupled to DEDUP_EXCLUDE_TWIN_FROM_COUNTS. PLAG's 4.46 is
+#   twin-inflated (that single 18-lot fill is counted twice); de-twinned it is
+#   2.232, so at 3.0 this rule STOPS firing PLAG the moment that flag is turned
+#   on. If it is ever flipped, move this constant to 2.0 in the SAME edit
+#   (--fixes both is flat 10 -> 1.5 at neg 9/20, so 2.0 is free there).
+# WARNING — direction of travel. At 3.0 Rule E is close to "price up >=1.2% with
+#   any real flow behind it". The pre-2026-06-11 price-momentum rule was retired
+#   for firing too loosely, and SURGE_FLOW_MIN_PRICE_RISE_PCT is now the only
+#   thing holding this one. If an FP reappears, tune the PRICE leg, not this one.
+
+SURGE_FLOW_MIN_DOLLAR_RATE_5S = 3.0
 SURGE_FLOW_MIN_PRICE_RISE_PCT = 0.012
 
 # Rule F — pre-trade start-staleness (added 2026-07-23). Snapshot-only twin of
@@ -275,6 +330,35 @@ DEFAULT_LARGE_TRADE_MULT = 2.0
 # from the OTHER RT channel is treated as that duplicate and does not advance the
 # measured-ITI series (it forward-fills the parent values instead).
 DEDUP_EPSILON_SEC = 0.005
+
+# ---------------------------------------------------------------------------
+# Recorded-feature corrections (added 2026-08-08, both DEFAULT OFF).
+#
+# Found while investigating the AZI 2026-08-07 fire. Each changes the value of
+# every count/rate column, and the 2026-07-30 A/D/E thresholds were fit on the
+# UNCORRECTED columns, so turning either on without re-deriving the constants
+# would silently move the operating point. Flip them together with the new
+# thresholds once the recalibration report exists. Toggle offline with
+# `analyze_trade_mole/replay_mole.py --set NAME=True`.
+#
+# 1. The DEDUP_EPSILON_SEC dedup above suppresses the RTVolume/RTTradeVolume
+#    twin for the measured-ITI series only — the twin is still counted into
+#    _cum_* and _trade_log, so trades_in_{w}s, volume/dollar sums and every rate
+#    derived from them double-count each fill. The inflation is not a constant
+#    factor: it tracks the odd-lot share, which varies per symbol. On AZI,
+#    cum_volume read 208 against a true 141 and dollar_rate_5s 71.96 against 48.9.
+DEDUP_EXCLUDE_TWIN_FROM_COUNTS = False
+# 2. Window rates divide by the NOMINAL window w, so during the first w seconds
+#    of a session — the whole life of a PR surge — they are diluted by the time
+#    we had no subscription for. At AZI's fire the session was 2.53 s old and
+#    every 5 s rate read ~2x low. With this on, the divisor is the elapsed
+#    session age, floored at RATE_MIN_ELAPSED_SEC so a single early print cannot
+#    manufacture an unbounded rate.
+RATE_NORMALIZE_BY_SESSION_AGE = False
+# Never claim to have measured a rate over less than this. Itself a tunable —
+# it sets how aggressive the first second of a session looks, so the
+# recalibration should sweep it rather than treat it as fixed.
+RATE_MIN_ELAPSED_SEC = 1.0
 
 # Generic ticks for reqMktData
 GENERIC_TICKS = "233,236,293,294,295,318,375,165,221"
@@ -706,19 +790,27 @@ class IBKRSurgeApp(EWrapper, EClient):
         # M1 — aggressor classification against the prevailing NBBO snapshot
         aggr = self._classify_aggressor(price)
 
-        # Cumulative totals (patched later by reconciler for aggregated events)
-        self._cum_trade_count += 1
-        self._cum_volume += size
-        self._cum_dollar_volume += price * size
+        # A twin is the SAME fill re-reported on the other RT channel. Counting it
+        # inflates every count/volume/rate column (see
+        # DEDUP_EXCLUDE_TWIN_FROM_COUNTS). The twin still gets its own recorded
+        # row — the audit trail and the forward-filled ITI columns are unchanged —
+        # it just stops contributing to the totals and the rolling window scan.
+        count_this = not (is_duplicate and DEDUP_EXCLUDE_TWIN_FROM_COUNTS)
 
-        # Append to trade log
-        if single_trade_flag:
-            self._trade_log.append((now_mono, price, size, "exact", aggr))
-        else:
-            self._trade_log.append((now_mono, price, size, "provisional", aggr))
-            self._pending_rt_events.append(
-                (now_mono, size, rt_total_volume, price, aggr)
-            )
+        if count_this:
+            # Cumulative totals (patched later by reconciler for aggregated events)
+            self._cum_trade_count += 1
+            self._cum_volume += size
+            self._cum_dollar_volume += price * size
+
+            # Append to trade log
+            if single_trade_flag:
+                self._trade_log.append((now_mono, price, size, "exact", aggr))
+            else:
+                self._trade_log.append((now_mono, price, size, "provisional", aggr))
+                self._pending_rt_events.append(
+                    (now_mono, size, rt_total_volume, price, aggr)
+                )
 
         # Trim trade log
         cutoff = now_mono - DEQUE_HISTORY_SECONDS
@@ -939,15 +1031,24 @@ class IBKRSurgeApp(EWrapper, EClient):
                         mid_c[w] += 1
 
         # ----- Emit trade-side per-window metrics -----
+        # Rate divisor: the nominal window, or the part of it we have actually
+        # been recording for (see RATE_NORMALIZE_BY_SESSION_AGE). Only the first
+        # w seconds of a session differ; after that the window is full and the
+        # two agree exactly.
+        elapsed = None
+        if RATE_NORMALIZE_BY_SESSION_AGE and self._session_start_mono is not None:
+            elapsed = max(now_mono - self._session_start_mono, RATE_MIN_ELAPSED_SEC)
+
         for w in WINDOWS:
             c = counts[w]
+            span = min(w, elapsed) if elapsed is not None else float(w)
             out[f"trades_in_{w}s"] = c
             out[f"volume_in_{w}s"] = volumes[w]
             out[f"dollar_vol_in_{w}s"] = dollar_vols[w]
-            out[f"trade_rate_{w}s"] = c / w
-            out[f"avg_iti_{w}s"] = (w / c) if c > 0 else None
+            out[f"trade_rate_{w}s"] = c / span
+            out[f"avg_iti_{w}s"] = (span / c) if c > 0 else None
             # M3 — dollar volume rate
-            out[f"dollar_rate_{w}s"] = dollar_vols[w] / w
+            out[f"dollar_rate_{w}s"] = dollar_vols[w] / span
             # M2 — order-flow imbalance
             out[f"buy_count_{w}s"] = buy_c[w]
             out[f"sell_count_{w}s"] = sell_c[w]
@@ -1315,7 +1416,11 @@ class IBKRSurgeApp(EWrapper, EClient):
         full-recall trigger but fires on flow with no direction; requiring the last
         price to already sit >= +1% above session start keeps only bought-up tape
         (rejects AUID at max +0.78% and SMCI, recovers SUGP which prints slowly but
-        large).
+        large). The dollar leg was cut 10 -> 3 on 2026-08-11 (PLAG: price leg passed
+        at +3.06% on a 2-fill tape while the rate reached only 4.46) — it is inert on
+        the labelled corpus, so the PRICE leg is now the whole of Rule E's direction
+        AND its selectivity. See the constant's comment block for the coupling to
+        DEDUP_EXCLUDE_TWIN_FROM_COUNTS.
         """
         # VETO — last price too far below session start blocks every rule this row.
         sp = self._start_price
@@ -1489,12 +1594,47 @@ class IBKRSurgeApp(EWrapper, EClient):
         self._note_first_event(now_wall)
 
         # 48 = RTVolume (tick 233), 77 = RTTradeVolume (tick 375)
+        #
+        # ⚠ `size` AND `totalVolume` BELOW ARE IN **LOTS**, NOT SHARES. DO NOT
+        # "FIX" THIS — the truncation it causes is load-bearing. Measured
+        # 2026-08-11 (mole-outputs/tickbytick-probe-2026-08-11.md):
+        # rt_total_volume == reqMktData tick 8 exactly (28143 vs 28139 on SCKT,
+        # ratio 1.000; tick 8 is IBKR's lot-denominated volume tick), and `size`
+        # shares that unit (sum of message sizes == cumulative delta, ratio 1.00
+        # on 5/5 probed symbols). The corpus agrees: of 4017 recorded TRADE rows
+        # 93.2% of sizes are <100 and only 0.7% are multiples of 100, with modes
+        # 1/2/5/10/20/50 — lots, not the multiples-of-100 clustering that real
+        # share counts show.
+        #
+        # Two consequences, and they pull in OPPOSITE directions:
+        #  1. _cum_volume and _cum_dollar_volume are ~100x understated in
+        #     share/dollar terms, so SURGE_A_MIN_DOLLAR_RATE_5S = 60 is really
+        #     ~$6000/s and SURGE_FLOW_MIN_DOLLAR_RATE_5S = 10 is ~$1000/s. This
+        #     is COSMETIC: every threshold was fit on these same columns, so the
+        #     operating point is self-consistent. Rescaling buys nothing and
+        #     forces A and E to be re-derived. Fix the names/docs, not the code.
+        #  2. `int()` truncation means a fill under 100 shares becomes 0 lots and
+        #     is dropped by the `rt_size > 0` guard below. That silently discards
+        #     ~64% of prints (but only ~8% of volume — which is why A and E barely
+        #     care and the ITI rules B/C/D carry the whole exposure).
+        #
+        # (2) reads like a bug and is NOT. On four non-surging small caps in
+        # pre-market, the unfiltered tick-by-tick tape spends 24-62% of its
+        # intervals under Rule D's 0.28 s bar and reaches a 5 s count of 34
+        # against a threshold of 3 — on a day with no news on any of them. The
+        # lot truncation is acting as a noise filter that strips small,
+        # numerous, uninformative prints; Rule D's 0.28 s was calibrated against
+        # that filtered tape and depends on it. Feeding the full tape does not
+        # surface surges earlier, it makes ordinary background trading look like
+        # one. Compounding it: measured_ITI is computed on the LOCAL ARRIVAL
+        # clock, and the unfiltered feed delivers in bursts (SCKT's median
+        # arrival-ITI there was literally 0.000 s).
         if tickType in (48, 77) and value:
             try:
                 parts = value.split(";")
                 if len(parts) >= 6 and parts[0] and parts[1]:
                     rt_price = float(parts[0])
-                    rt_size = int(float(parts[1]))
+                    rt_size = int(float(parts[1]))   # LOTS — see the note above
                     rt_time_ms = int(parts[2]) if parts[2] else None
                     rt_total_volume = int(float(parts[3])) if parts[3] else None
                     vwap = float(parts[4]) if parts[4] else None

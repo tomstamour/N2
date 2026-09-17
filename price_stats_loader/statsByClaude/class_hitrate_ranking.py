@@ -54,13 +54,15 @@ TARGET_DEFAULT = "fromPR_High(%)"
 TSV_DEFAULT = ("../outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_"
                "11EncScored_Classed_BodyEnc_clean_FromPRhigh.tsv")
 
-# Encoder score channels tested in the interaction section. Suffix match on
-# every *_<channel> column (head and _Body twins) plus the bare FinBERT
-# columns, so new encoder blocks are picked up without editing a list.
-CHANNEL_SUFFIXES = ("_positive", "_negative", "_neutral", "_indecisive",
-                    "_sentiment_score")
-EXTRA_COLUMNS = ["positive", "negative", "neutral", "sentiment_score",
-                 "nocoref_neutral_filter", "nocoref_confidence_weighted",
+# Encoder score channels tested in the interaction section. Since the 2026-08-09
+# column unification the channel is an INFIX, not a suffix — `_hd`/`_bd` is
+# terminal — so these match `_<channel>_` anywhere and pick up head and body twins
+# alike, without editing a list when a new encoder block is added.
+CHANNEL_INFIXES = ("_pos_", "_neg_", "_neu_", "_ind_", "_ss_")
+# ProsusAI FinBERT no longer needs listing here: its columns used to be the bare
+# `positive` / `sentiment_score` / … and are now ordinary `Prosus_*_hd` members of
+# the infix match above.
+EXTRA_COLUMNS = ["nocoref_neutral_filter", "nocoref_confidence_weighted",
                  "nocoref_net_score", "nocoref_top_k", "nocoref_positional"]
 # Never predictors (outcome / leakage / operational).
 BLOCKLIST = {"fromPR_High(%)", "fromPR_HighTime(m:s)", "fromPR_status",
@@ -153,7 +155,7 @@ def detect_channels(df, min_valid):
     for c in df.columns:
         if c in BLOCKLIST or c in cols:
             continue
-        if c.endswith(CHANNEL_SUFFIXES) or c in EXTRA_COLUMNS:
+        if any(inf in c for inf in CHANNEL_INFIXES) or c in EXTRA_COLUMNS:
             v = pd.to_numeric(df[c], errors="coerce")
             if v.notna().sum() >= min_valid and v.nunique(dropna=True) > 2:
                 cols.append(c)

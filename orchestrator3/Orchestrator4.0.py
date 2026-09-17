@@ -284,15 +284,20 @@ def analyze_finbert(news_dict: dict) -> dict:
     """FinBERT headline sentiment analysis. Runs once per article."""
     result = analyze_headline(news_dict['Headline'])
     logger.info(
-        f"[FinBERT] {news_dict['Symbol']} → {result['label'].upper()} "
-        f"(score={result['sentiment_score']:.4f})"
+        f"[FinBERT] {news_dict['Symbol']} → {result['lab'].upper()} "
+        f"(score={result['ss']:.4f})"
     )
+    # FROZEN FILE — the OUTPUT keys below are this build's own TSV column names and
+    # must not change, or its tables stop matching the backtests they exist to
+    # reproduce. Only the INPUT side is adapted: FinBERT-headliner.py switched to the
+    # unified short keys on 2026-08-09, so read `pos`/`neg`/`neu`/`ss`/`lab` and keep
+    # writing the old column names. See orchestrator5/CLAUDE.md.
     return {
-        'positive':        result['positive'],
-        'negative':        result['negative'],
-        'neutral':         result['neutral'],
-        'sentiment_score': result['sentiment_score'],
-        'label':           result['label'],
+        'positive':        result['pos'],
+        'negative':        result['neg'],
+        'neutral':         result['neu'],
+        'sentiment_score': result['ss'],
+        'label':           result['lab'],
     }
 
 

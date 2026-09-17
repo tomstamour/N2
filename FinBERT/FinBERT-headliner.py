@@ -22,8 +22,8 @@ Library usage:
     from FinBERT_headliner import analyze_headline, analyze_news_file
 
     scores = analyze_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.82, "negative": 0.03,
-    #  "neutral": 0.15, "sentiment_score": 0.79, "label": "positive"}
+    # {"headline": "...", "pos": 0.82, "neg": 0.03,
+    #  "neu": 0.15, "ss": 0.79, "lab": "positive"}
 
     result = analyze_news_file("./FEED_28-jan-2026_1.json")
 """
@@ -34,6 +34,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -243,21 +244,34 @@ def analyze_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
 
     Returns:
         {
-            "headline":        str,
-            "positive":        float,
-            "negative":        float,
-            "neutral":         float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # "positive" | "negative" | "neutral"
+            "headline": str,
+            "pos":      float,
+            "neg":      float,
+            "neu":      float,
+            "ss":       float,   # positive - negative
+            "lab":      str,     # "positive" | "negative" | "neutral"
+            "ms":       float,   # tokenize + forward wall time
         }
     """
     load_model(model_dir)
 
+    t0 = time.perf_counter()
     scores = _inferencer.predict(headline)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). This model
+    # is `Prosus` in the column convention — the ONE headliner outside
+    # tools/Encoder_Models/, and the one whose O5.2 columns used to be UNPREFIXED.
+    # The internal `scores` dict keeps its full words so `lab` stays a full word.
+    # `ms` is new: this was the only headliner returning no timing at all.
     return {
         "headline": headline,
-        **scores,
-        "label": _label_from_score(scores["sentiment_score"]),
+        "pos": scores["positive"],
+        "neg": scores["negative"],
+        "neu": scores["neutral"],
+        "ss":  scores["sentiment_score"],
+        "lab": _label_from_score(scores["sentiment_score"]),
+        "ms":  round(elapsed_ms, 1),
     }
 
 

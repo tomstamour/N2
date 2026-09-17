@@ -1,12 +1,29 @@
 from ib_insync import IB, Stock
 import pandas as pd
-import pandas_market_calendars as mcal
 import argparse
 import logging
 import os
 import sys
 from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
+
+# Session/calendar/exchange helpers live in session_utils so tools that never touch
+# the Gateway (coffee_filter.py) can reuse the exact definitions used to build
+# fromPR_High(%) without importing ib_insync. Re-exported here so existing callers
+# (dailyStats_pipeline.py, prevclose_backfill_addOn.py) keep importing them from
+# this module.
+from session_utils import (  # noqa: F401  (re-exported for importers of this module)
+    EASTERN,
+    EXTENDED_CLOSE_ET_HOUR,
+    EXTENDED_OPEN_ET_HOUR,
+    MARKET_CLOSE_ET_HOUR,
+    US_EXCHANGES,
+    get_target_date,
+    is_trading_day,
+    is_us_exchange,
+    next_trading_day,
+    open_seconds_between,
+    parse_created_dt,
+)
 
 IB_HOST = '127.0.0.1'
 # Default to the idle paper Gateway (4002): these bulk 1-min extended-hours
@@ -19,23 +36,82 @@ CLIENT_ID = 7
 REQUEST_TIMEOUT = 180
 PACING_SLEEP_SECONDS = 2
 
+# Historical request span, in CALENDAR days back from the session end.
+BASE_DURATION = '2 D'
+# Fallback used only when BASE_DURATION returned no bar before the PR minute:
+# 2 calendar days from a Monday 20:00 stops at Saturday, missing Friday's
+# session entirely. 5 clears every US market closure (incl. a Good-Friday or
+# holiday-Monday long weekend) and stays inside IBKR's 1-week cap for 1-min bars.
+WIDE_DURATION = '5 D'
+
 # Resilience tuning
 FETCH_RETRIES = 2            # attempts per (symbol, created) before giving up
 RECONNECT_ATTEMPTS = 3       # reconnect tries when the connection drops
 RECONNECT_BACKOFF_SECONDS = 5
 CONSECUTIVE_FAILURE_ABORT = 10  # abort run after this many US fetches fail in a row
+# ...but only if they span this many DISTINCT symbols. An HMDS outage is
+# symbol-agnostic; a dead contract is not. Without this guard a handful of
+# permanently unfetchable symbols retried in file order (CODX x9 + BNBX + INLX,
+# 2026-08-30) reach 10 on their own and abort a healthy run.
+FAILURE_ABORT_MIN_SYMBOLS = 3
 
-# US market closes at 4 PM ET; extended session runs 4 AM - 8 PM ET.
-MARKET_CLOSE_ET_HOUR = 16
-EXTENDED_OPEN_ET_HOUR = 4
-EXTENDED_CLOSE_ET_HOUR = 20
+# reqHistoricalData returns an empty list for BOTH a real HMDS outage and a
+# contract that will never have data, so the accompanying error text is the only
+# thing that tells them apart. Same lists (and the ErrorWatch class below) as
+# tools/ohlc-fetch/ohlc_minute_fetch.py — keep them in sync.
+#   transient -> 'failure': counts toward the outage abort, retried next run.
+TRANSIENT_ERROR_TEXTS = (
+    'query cancelled', 'pacing violation', 'timed out', 'time out',
+    'not connected', 'connection is broken', 'connectivity between',
+    'historical market data service query message',
+    'no market data permissions', 'max number of requests',
+)
+#   permanent -> 'skip': a per-contract condition, must NOT trip the abort.
+#   'not supported for this contract' is the CODX case (retired contract, error
+#   162 "BEST queries are not supported for this contract"); 'query returned no
+#   data' is the BNBX case (PINK/OTC with no HMDS history).
+PERMANENT_ERROR_TEXTS = (
+    'unknown contract', 'no security definition', 'query returned no data',
+    'no data of type', 'invalid step', 'not supported for this contract',
+)
+# Codes that always mean the connection/farm is the problem.
+TRANSIENT_ERROR_CODES = {1100, 1101, 1102, 1300, 2103, 2105, 2157, 504}
 
-EASTERN = ZoneInfo('America/New_York')
 
-# Exchange names as they appear in the TSV that are covered by the US data subscription
-US_EXCHANGES = {
-    'NASDAQ', 'NYSE', 'NYSE AMERICAN', 'NYSE ARCA', 'NYSE MKT', 'AMEX', 'CBOE',
-}
+class ErrorWatch:
+    """Collects IB error events so an empty bar set can be classified.
+
+    Ported from tools/ohlc-fetch/ohlc_minute_fetch.py (the TODO left in
+    version_control.txt on 2026-07-27). classify() speaks this module's status
+    vocabulary: 'failure' (transient) / 'skip' (permanent) / None (nothing seen).
+    """
+
+    def __init__(self, ib):
+        self.events: list[tuple[int, str]] = []
+        ib.errorEvent += self._on_error
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        self.events.append((errorCode, errorString or ''))
+
+    def clear(self) -> None:
+        self.events.clear()
+
+    def classify(self) -> str | None:
+        """'failure' | 'skip' | None. Transient wins: when both kinds of error
+        were seen the request is worth retrying on a later run."""
+        verdict = None
+        for code, text in self.events:
+            low = text.lower()
+            if code in TRANSIENT_ERROR_CODES:
+                return 'failure'
+            if any(p in low for p in TRANSIENT_ERROR_TEXTS):
+                return 'failure'
+            if any(p in low for p in PERMANENT_ERROR_TEXTS):
+                verdict = 'skip'
+        return verdict
+
+    def texts(self) -> str:
+        return '; '.join(f"{c}: {t}" for c, t in self.events)
 
 
 def setup_logging(log_path: str | None = None) -> None:
@@ -59,62 +135,36 @@ def setup_logging(log_path: str | None = None) -> None:
     )
 
 
-def is_us_exchange(exchange_val) -> bool:
-    """Return True if the exchange value is a supported US market."""
-    return str(exchange_val).strip().upper() in {e.upper() for e in US_EXCHANGES}
+def has_value(series: pd.Series) -> pd.Series:
+    """Boolean mask of rows whose cell holds a real (non-empty) value.
 
-
-# US equity trading calendar (NYSE/Nasdaq). Used to skip weekends AND holidays
-# (e.g. Memorial Day) so target dates always land on a real trading session.
-_XNYS = mcal.get_calendar('XNYS')
-
-
-def is_trading_day(d: date) -> bool:
-    """Return True if d is a US equity trading session (not weekend/holiday)."""
-    return len(_XNYS.valid_days(start_date=d, end_date=d)) > 0
-
-
-def next_trading_day(d: date) -> date:
-    """Return the first US trading session strictly after d."""
-    sched = _XNYS.valid_days(start_date=d + timedelta(days=1),
-                             end_date=d + timedelta(days=10))
-    return sched[0].date()
-
-
-def parse_created_dt(created_str: str, arrival_str: str,
-                     arrival_date_str: str) -> datetime:
-    """Combine the Created time-of-day (US/Eastern) with the row's date.
-
-    Created holds only 'HH:MM:SS.mmm'; the date comes from ArrivalTime when it
-    is a full ISO datetime ('2026-05-03 20:45:01'), otherwise from ArrivalDate.
-    Returns a tz-aware US/Eastern datetime. Raises ValueError if unparseable.
+    notna() alone is not enough: a cell can round-trip as a whitespace-only
+    string, which would otherwise count as 'already scored' and never be filled.
     """
-    created = created_str.strip()
-    if not created:
-        raise ValueError('empty Created value')
-
-    arrival = arrival_str.strip()
-    if arrival[:5].count('-'):
-        day = datetime.fromisoformat(arrival).date()
-    elif arrival_date_str.strip():
-        day = date.fromisoformat(arrival_date_str.strip())
-    else:
-        raise ValueError('no date available (ArrivalTime time-only, no ArrivalDate)')
-
-    tod = datetime.strptime(created, '%H:%M:%S.%f').time()
-    return datetime.combine(day, tod, tzinfo=EASTERN)
+    return series.fillna('').astype(str).str.strip().ne('')
 
 
-def get_target_date(created_dt: datetime) -> date:
-    """Return the trading session whose end (8 PM ET) closes the high window.
+def select_rows_to_fetch(df: pd.DataFrame, retry_skipped: bool) -> tuple[list, dict]:
+    """Return (row indices needing a lookup, counts for the run summary).
 
-    Created before the 4 PM close on a trading day -> that same day. Otherwise
-    (after close, or a weekend/holiday) -> the next trading session.
+    A row is done once fromPR_High(%) holds a value. Rows previously booked
+    'skip' are permanent per-symbol/data conditions (retired contract, non-US
+    exchange, no baseline bar) and are left alone unless retry_skipped is set —
+    retrying them every run wastes requests and, when they were misbooked as
+    'failure', used to trip CONSECUTIVE_FAILURE_ABORT. Rows booked 'failure'
+    are transient (HMDS/connectivity) and are always retried.
     """
-    created_date = created_dt.date()
-    if created_dt.hour < MARKET_CLOSE_ET_HOUR and is_trading_day(created_date):
-        return created_date
-    return next_trading_day(created_date)
+    scored = has_value(df['fromPR_High(%)'])
+    skipped = ~scored & df['fromPR_status'].fillna('').astype(str).str.strip().eq('skip')
+
+    todo_mask = ~scored if retry_skipped else ~scored & ~skipped
+    counts = {
+        'total': len(df),
+        'scored': int(scored.sum()),
+        'skipped': int(skipped.sum()),
+        'todo': int(todo_mask.sum()),
+    }
+    return list(df.index[todo_mask]), counts
 
 
 def ensure_connected(ib: IB) -> bool:
@@ -152,31 +202,9 @@ def bar_time_et(bar) -> datetime:
     return dt.astimezone(EASTERN)
 
 
-def open_seconds_between(start: datetime, end: datetime) -> int:
-    """Seconds between start and end that fall within extended trading sessions
-    (4 AM-8 PM ET on US trading days). Overnight closes (8 PM-4 AM) and
-    non-trading days contribute zero, so the result reflects only time the
-    market was open (extended hours included)."""
-    if end <= start:
-        return 0
-    total = 0
-    day = start.date()
-    while day <= end.date():
-        if is_trading_day(day):
-            sess_open = datetime(day.year, day.month, day.day,
-                                 EXTENDED_OPEN_ET_HOUR, tzinfo=EASTERN)
-            sess_close = datetime(day.year, day.month, day.day,
-                                  EXTENDED_CLOSE_ET_HOUR, tzinfo=EASTERN)
-            lo = max(start, sess_open)
-            hi = min(end, sess_close)
-            if hi > lo:
-                total += int((hi - lo).total_seconds())
-        day += timedelta(days=1)
-    return total
-
-
 def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
-                       target_dt: date, request_timeout: int = REQUEST_TIMEOUT):
+                       target_dt: date, request_timeout: int = REQUEST_TIMEOUT,
+                       watch: 'ErrorWatch | None' = None):
     """
     Fetch 1-min bars around created_dt and measure the high since the PR.
 
@@ -186,24 +214,31 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
     excluded; the high is the max bar high from created_dt to 8 PM ET of
     target_dt (extended hours included), which DOES include the PR's bar.
 
-    Returns (pct, high_time_str, status) where status is one of:
+    Returns (pct, high_time_str, status, hmds_answered) where status is one of:
       'ok'      - data fetched and both columns computed
-      'failure' - genuine empty/errored response (HMDS/connectivity signal);
-                  counts toward the consecutive-failure abort
-      'skip'    - contract not found, or bars returned but no baseline/window
-                  bar exists; a per-symbol/data condition that must NOT trip
-                  the abort
+      'failure' - empty/errored response that looks transient (HMDS/connectivity
+                  signal); counts toward the consecutive-failure abort
+      'skip'    - contract not found, an empty response the error text marks as
+                  permanent (retired contract, no HMDS history), or bars
+                  returned but no baseline/window bar exists; a per-symbol/data
+                  condition that must NOT trip the abort
+
+    hmds_answered is True when HMDS actually returned bars for this request.
+    Only that proves the data farm is alive, so it — not the status — is what
+    the caller uses to reset the consecutive-failure streak: a 'skip' from a
+    failed qualification says nothing about HMDS, while a 'skip' from
+    "bars returned but no baseline" says everything.
     """
     contract = Stock(symbol, 'SMART', 'USD')
     try:
         qualified = ib.qualifyContracts(contract)
         if not qualified:
             logging.warning(f"{symbol}: could not qualify contract, skipping.")
-            return None, None, 'skip'
+            return None, None, 'skip', False
         contract = qualified[0]
     except Exception as e:
         logging.warning(f"{symbol}: qualification error — {e}")
-        return None, None, 'skip'
+        return None, None, 'skip', False
 
     # Window ends at 8 PM ET of the target session; '2 D' of 1-min bars also
     # covers the prior trading day so the pre-Created baseline bar is present
@@ -212,41 +247,64 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
                            EXTENDED_CLOSE_ET_HOUR, tzinfo=EASTERN)
     end_dt_str = session_end.strftime('%Y%m%d %H:%M:%S US/Eastern')
 
-    bars = None
-    for attempt in range(1, FETCH_RETRIES + 1):
-        if not ensure_connected(ib):
-            logging.warning(f"{symbol}: not connected, cannot fetch.")
-            return None, None, 'failure'
-        try:
-            bars = ib.reqHistoricalData(
-                contract,
-                endDateTime=end_dt_str,
-                durationStr='2 D',
-                barSizeSetting='1 min',
-                whatToShow='TRADES',
-                useRTH=False,
-                formatDate=2,
-                keepUpToDate=False,
-                timeout=request_timeout,
-            )
-        except Exception as e:
-            logging.warning(f"{symbol}: reqHistoricalData error (attempt {attempt}/{FETCH_RETRIES}) — {e}")
-            bars = None
+    def request_bars(duration: str):
+        """Issue the historical request, retrying FETCH_RETRIES times.
 
-        if bars:
-            break
+        Returns the bar list, or None if the connection is gone (the caller
+        turns that into 'failure').
+        """
+        got = None
+        for attempt in range(1, FETCH_RETRIES + 1):
+            if not ensure_connected(ib):
+                logging.warning(f"{symbol}: not connected, cannot fetch.")
+                return None
+            # Cleared per attempt so classify() only ever sees this request's
+            # errors (a permanent verdict from the previous symbol must not
+            # leak forward).
+            if watch is not None:
+                watch.clear()
+            try:
+                got = ib.reqHistoricalData(
+                    contract,
+                    endDateTime=end_dt_str,
+                    durationStr=duration,
+                    barSizeSetting='1 min',
+                    whatToShow='TRADES',
+                    useRTH=False,
+                    formatDate=2,
+                    keepUpToDate=False,
+                    timeout=request_timeout,
+                )
+            except Exception as e:
+                logging.warning(f"{symbol}: reqHistoricalData error "
+                                f"(attempt {attempt}/{FETCH_RETRIES}) — {e}")
+                got = None
 
-        if attempt < FETCH_RETRIES:
-            logging.warning(f"{symbol}: no bars around {created_dt} (attempt {attempt}/{FETCH_RETRIES}), retrying...")
-            ib.sleep(PACING_SLEEP_SECONDS)
+            if got:
+                break
+
+            if attempt < FETCH_RETRIES:
+                logging.warning(f"{symbol}: no bars around {created_dt} "
+                                f"(attempt {attempt}/{FETCH_RETRIES}), retrying...")
+                ib.sleep(PACING_SLEEP_SECONDS)
+        return got
+
+    bars = request_bars(BASE_DURATION)
+    if bars is None and not ensure_connected(ib):
+        return None, None, 'failure', False
 
     if not bars:
-        logging.warning(f"{symbol}: no bars returned around {created_dt} after {FETCH_RETRIES} attempts.")
-        return None, None, 'failure'
+        # An empty list is ambiguous; the error text decides. Anything the
+        # classifier does not recognise stays 'failure' so a novel outage still
+        # arms the abort.
+        reason = watch.texts() if watch is not None else ''
+        status = (watch.classify() if watch is not None else None) or 'failure'
+        logging.warning(
+            f"{symbol}: no bars returned around {created_dt} after {FETCH_RETRIES} "
+            f"attempts — booking '{status}'{f' [{reason}]' if reason else ''}."
+        )
+        return None, None, status, False
 
-    baseline = None
-    high = None
-    high_time = None
     one_min = timedelta(minutes=1)
     # The bar CONTAINING the PR starts before created_dt but already holds the
     # news reaction, so it must not become the baseline — comparing against it
@@ -255,22 +313,63 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
     # bar that ENDS at or before the PR minute's start; that same PR-minute bar
     # still counts as a high candidate below, which is intended.
     pr_minute_start = created_dt.replace(second=0, microsecond=0)
-    for bar in bars:
-        start = bar_time_et(bar)
-        if start < pr_minute_start:
-            baseline = bar.close
-        if start + one_min > created_dt and start <= session_end:
-            if high is None or bar.high > high:
-                high = bar.high
-                high_time = start
+
+    def scan(bar_list):
+        """Pick the baseline close, the window's highest high, and its volume."""
+        base = None
+        hi = None
+        hi_t = None
+        win_vol = 0.0
+        for bar in bar_list:
+            start = bar_time_et(bar)
+            if start < pr_minute_start:
+                base = bar.close
+            if start + one_min > created_dt and start <= session_end:
+                win_vol += bar.volume or 0
+                if hi is None or bar.high > hi:
+                    hi = bar.high
+                    hi_t = start
+        return base, hi, hi_t, win_vol
+
+    baseline, high, high_time, window_volume = scan(bars)
+
+    if baseline is None or not baseline:
+        # BASE_DURATION is CALENDAR days back from the session end, so a Monday
+        # (or post-holiday) request never reaches the previous *trading*
+        # session: '2 D' from Monday 20:00 stops at Saturday. A symbol with no
+        # prints in its own pre-market then has no baseline bar at all and used
+        # to be skipped outright (SBFM 2026-06-01, INCR 2026-08-24, both
+        # Mondays). Widen once, far enough to clear any US market closure.
+        # This cannot change an existing value: the baseline is the LAST bar
+        # before the PR minute, so older history never displaces it, and the
+        # high scan is bounded by created_dt..session_end either way.
+        logging.info(f"{symbol}: no baseline bar within {BASE_DURATION}, "
+                     f"retrying with {WIDE_DURATION}...")
+        wider = request_bars(WIDE_DURATION)
+        if wider:
+            baseline, high, high_time, window_volume = scan(wider)
 
     if baseline is None or not baseline:
         logging.warning(f"{symbol}: no bar ending at or before {pr_minute_start} "
-                        f"to use as baseline, skipping.")
-        return None, None, 'skip'
+                        f"to use as baseline (tried {BASE_DURATION} and "
+                        f"{WIDE_DURATION}), skipping.")
+        return None, None, 'skip', True
     if high is None:
         logging.warning(f"{symbol}: no bars between {created_dt} and {session_end}, skipping.")
-        return None, None, 'skip'
+        return None, None, 'skip', True
+    if not window_volume:
+        # IB forward-fills no-trade minutes inside a returned range (repeated
+        # price, volume=0), so a window that never traded still yields bars —
+        # and every one of them carries the pre-PR price. The metric then
+        # computes a fabricated 0.00 ("no move") from a high that was never
+        # printed. Audited 2026-08-31: 5 of 225 zero rows are this case (XHG,
+        # DBCA x2, NTZ, CNF); the other 220 have real volume and are genuine.
+        # A zero-volume BASELINE bar is normal (90% of all rows) and fine — the
+        # carried price is the last real trade. This tests the whole window.
+        logging.warning(f"{symbol}: window {created_dt}..{session_end} has zero traded "
+                        f"volume (all bars forward-filled), skipping rather than "
+                        f"reporting a fabricated 0.00.")
+        return None, None, 'skip', True
 
     pct = round((high - baseline) / baseline * 100, 2)
     # Count only market-open (extended-session) time, so overnight closes and
@@ -278,7 +377,7 @@ def fetch_from_pr_high(ib: IB, symbol: str, created_dt: datetime,
     delta_s = open_seconds_between(created_dt, high_time)
     high_time_str = f"{delta_s // 60:02d}:{delta_s % 60:02d}"
 
-    return pct, high_time_str, 'ok'
+    return pct, high_time_str, 'ok', True
 
 
 def main():
@@ -297,6 +396,12 @@ def main():
             'elapsed MM:SS from Created to the bar where that high printed, '
             'counting only market-open (extended-session, 4 AM-8 PM ET) time so '
             'overnight closes and weekends/holidays are excluded.\n\n'
+            'INCREMENTAL BY DEFAULT: rows that already carry a fromPR_High(%) value '
+            'are detected and left untouched, and only the empty ones are fetched. '
+            'Rows previously booked fromPR_status="skip" are not retried either '
+            '(--retry-skipped overrides). Pass --rescore-all to wipe the columns and '
+            're-fetch everything. The three result columns are created if absent, so '
+            'a file that has never been scored is handled the same way.\n\n'
             'Output file is named <input_stem>_fromPRhigh.tsv and written to '
             '--output-dir (defaults to the same directory as the input file).'
         ),
@@ -326,12 +431,27 @@ def main():
              'atomically renamed, so in-place enrichment is safe.',
     )
     parser.add_argument(
+        '--rescore-all',
+        action='store_true',
+        dest='rescore_all',
+        help='Clear the three result columns and re-fetch EVERY row, ignoring values '
+             'already present. Use after a metric change (e.g. the 2026-07-26 baseline '
+             'fix) that invalidates existing values. Default is incremental gap-fill.',
+    )
+    parser.add_argument(
+        '--retry-skipped',
+        action='store_true',
+        dest='retry_skipped',
+        help='Also re-attempt rows previously booked fromPR_status="skip". Those are '
+             'normally permanent per-symbol conditions (retired contract, non-US '
+             'exchange, no baseline bar), so they are left alone by default.',
+    )
+    parser.add_argument(
         '--only-missing',
         action='store_true',
         dest='only_missing',
-        help='Incremental mode: keep existing fromPR_High(%%) values and only fetch rows '
-             'where it is empty and fromPR_status is not "skip". Without this flag all '
-             'rows are (re)scored, as before.',
+        help=argparse.SUPPRESS,  # deprecated: gap-fill is now the default. Kept so
+                                 # dailyStats_pipeline.py keeps working unchanged.
     )
     parser.add_argument(
         '--timeout', '-t',
@@ -382,59 +502,74 @@ def main():
     if args.log_file:
         logging.info(f"Logging to {os.path.abspath(args.log_file)}")
 
+    if args.only_missing:
+        logging.warning("--only-missing is deprecated and now a no-op: incremental "
+                        "gap-fill is the default. Use --rescore-all to re-fetch every row.")
+
     # dtype=str keeps every untouched column byte-for-byte on the round-trip;
     # default inference would e.g. rewrite integer columns that contain gaps as
-    # floats, silently mutating the master on --only-missing in-place runs.
+    # floats, silently mutating the master on in-place gap-fill runs.
     df = pd.read_csv(args.input_file, sep='\t', dtype=str)
     if 'Created' not in df.columns:
         logging.error("Column 'Created' not found in input file. Run createdTime_AddOn.py first.")
         return
     result_cols = ['fromPR_High(%)', 'fromPR_HighTime(m:s)', 'fromPR_status']
-    if args.only_missing:
+    if args.rescore_all:
+        for col in result_cols:
+            df[col] = None
+    else:
         for col in result_cols:
             if col not in df.columns:
                 df[col] = None
+
+    todo, counts = select_rows_to_fetch(df, args.retry_skipped)
+    already_scored = counts['scored']
+    if args.rescore_all:
+        logging.info("--rescore-all: re-fetching all %d rows.", counts['total'])
     else:
-        for col in result_cols:
-            df[col] = None
+        logging.info(
+            "Scan: %d rows — %d already scored, %d booked 'skip'%s, %d to fetch.",
+            counts['total'], counts['scored'], counts['skipped'],
+            ' (retrying)' if args.retry_skipped else ' (not retried)', counts['todo'],
+        )
 
     ib = IB()
     aborted = False
+    cache: dict = {}
+    watch: ErrorWatch | None = None
+    if not todo:
+        # Nothing to do — don't take a Gateway client slot just to rewrite the
+        # file unchanged. The output is still written below so --output-file
+        # semantics (e.g. copying to a new path) hold either way.
+        logging.info("No rows need fetching; skipping the IBKR connection.")
     try:
-        logging.info(f"Connecting to IBKR at {IB_HOST}:{IB_PORT} clientId={CLIENT_ID}...")
-        try:
-            ib.connect(IB_HOST, IB_PORT, clientId=CLIENT_ID, timeout=20)
-        except ConnectionRefusedError:
-            logging.error(
-                f"Connection refused on {IB_HOST}:{IB_PORT}. "
-                "Make sure TWS or IB Gateway is running with API connections enabled."
-            )
-            sys.exit(1)
-        except Exception as e:
-            logging.error(f"Could not connect to IBKR: {e}")
-            sys.exit(1)
-        if not ib.isConnected():
-            logging.error("Failed to connect to IBKR. Exiting.")
-            sys.exit(1)
-        logging.info("Connected.")
+        if todo:
+            logging.info(f"Connecting to IBKR at {IB_HOST}:{IB_PORT} clientId={CLIENT_ID}...")
+            try:
+                ib.connect(IB_HOST, IB_PORT, clientId=CLIENT_ID, timeout=20)
+            except ConnectionRefusedError:
+                logging.error(
+                    f"Connection refused on {IB_HOST}:{IB_PORT}. "
+                    "Make sure TWS or IB Gateway is running with API connections enabled."
+                )
+                sys.exit(1)
+            except Exception as e:
+                logging.error(f"Could not connect to IBKR: {e}")
+                sys.exit(1)
+            if not ib.isConnected():
+                logging.error("Failed to connect to IBKR. Exiting.")
+                sys.exit(1)
+            logging.info("Connected.")
+            # Subscribed once for the whole run; ensure_connected() reconnects
+            # the same IB object, so the handler survives a dropped connection.
+            watch = ErrorWatch(ib)
 
-        cache: dict = {}
         consecutive_failures = 0
-        already_scored = 0
+        failure_symbols: set[str] = set()
 
-        for idx, row in df.iterrows():
+        for n, idx in enumerate(todo, 1):
+            row = df.loc[idx]
             symbol = str(row['Symbol']).strip()
-
-            if args.only_missing:
-                # Keep rows that already have a value, and don't retry rows marked
-                # 'skip' (permanent per-symbol/data conditions). 'failure' rows
-                # (transient HMDS/connectivity) stay blank and are retried here.
-                if pd.notna(row['fromPR_High(%)']):
-                    already_scored += 1
-                    continue
-                prior_status = str(row['fromPR_status']).strip() if pd.notna(row['fromPR_status']) else ''
-                if prior_status == 'skip':
-                    continue
 
             created_str = str(row['Created']).strip() if pd.notna(row['Created']) else ''
             arrival_str = str(row.get('ArrivalTime', '')).strip()
@@ -464,26 +599,36 @@ def main():
 
             cache_key = (symbol, created_dt)
             if cache_key not in cache:
-                logging.info(f"Fetching fromPR high for {symbol} since {created_dt} (window ends {target_dt} 20:00 ET)...")
-                pct, high_time_str, status = fetch_from_pr_high(
-                    ib, symbol, created_dt, target_dt, args.timeout)
+                logging.info(f"[{n}/{len(todo)}] Fetching fromPR high for {symbol} since "
+                             f"{created_dt} (window ends {target_dt} 20:00 ET)...")
+                pct, high_time_str, status, hmds_answered = fetch_from_pr_high(
+                    ib, symbol, created_dt, target_dt, args.timeout, watch)
                 cache[cache_key] = (pct, high_time_str, status)
 
-                # Track consecutive genuine fetch failures to detect an HMDS outage.
-                # 'skip' (unqualifiable contract / no baseline/window bars) is a
-                # per-symbol data condition and must not trip the abort.
-                if status == 'failure':
+                # Track consecutive genuine fetch failures to detect an HMDS
+                # outage. 'skip' (unqualifiable contract, permanently dead
+                # contract, no baseline/window bars) is a per-symbol data
+                # condition and must not trip the abort. The streak is reset by
+                # any request HMDS actually answered with bars — not just an
+                # 'ok' — and the abort additionally requires the streak to span
+                # several symbols, since an outage fails everything while a dead
+                # contract fails only itself.
+                if hmds_answered:
+                    consecutive_failures = 0
+                    failure_symbols.clear()
+                elif status == 'failure':
                     consecutive_failures += 1
-                    if consecutive_failures >= CONSECUTIVE_FAILURE_ABORT:
+                    failure_symbols.add(symbol)
+                    if (consecutive_failures >= CONSECUTIVE_FAILURE_ABORT
+                            and len(failure_symbols) >= FAILURE_ABORT_MIN_SYMBOLS):
                         logging.error(
-                            f"{consecutive_failures} consecutive fetches failed — HMDS appears down. "
+                            f"{consecutive_failures} consecutive fetches failed across "
+                            f"{len(failure_symbols)} symbols — HMDS appears down. "
                             f"Aborting to avoid silent data loss; restart IB Gateway and re-run. "
                             f"Last attempted: {symbol} since {created_dt} (row {idx})."
                         )
                         aborted = True
                         break
-                elif status == 'ok':
-                    consecutive_failures = 0
 
                 ib.sleep(PACING_SLEEP_SECONDS)
             else:
@@ -508,13 +653,14 @@ def main():
     df.to_csv(tmp_path, sep='\t', index=False)
     os.replace(tmp_path, out_path)
     logging.info(f"Saved enriched file to {out_path}")
-    filled = df['fromPR_High(%)'].notna().sum()
+    filled = int(has_value(df['fromPR_High(%)']).sum())
     logging.info(
-        f"Rows processed: {len(df)}, unique (symbol, created) lookups: {len(cache)}, "
-        f"rows with fromPR_High(%): {filled}, blank: {len(df) - filled}"
+        f"Rows attempted: {len(todo)} of {len(df)}, unique (symbol, created) lookups: "
+        f"{len(cache)}, rows with fromPR_High(%): {filled} (was {already_scored}), "
+        f"blank: {len(df) - filled}"
     )
-    if args.only_missing:
-        logging.info(f"Rows already scored, kept untouched: {already_scored}")
+    status_counts = df['fromPR_status'].fillna('(blank)').value_counts().to_dict()
+    logging.info(f"fromPR_status: {status_counts}")
     if aborted:
         # Partial results are saved above; nonzero exit lets a caller (cron
         # pipeline) flag the run. Missing rows are retried on the next run.

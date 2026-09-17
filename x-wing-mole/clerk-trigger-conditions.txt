@@ -5,5 +5,25 @@
 #   lifeTime=mm:ss       mole watch window (surge must fire within this)
 #   finbert_gate=on|off  whether the Sentiment/FinBERT gate is required
 #                        before x-wing places the order
+#
+# ⚠ 2026-08-19 — the one WINDOW line this file ever carried was REMOVED:
+#
+#     WINDOW 04:00-06:59   lifeTime=00:10  finbert_gate=off
+#
+# `finbert_gate=off` meant the clerk DISCARDED the orchestrator's BAD and traded
+# on the surge alone, so a PR the O5.2 gate had rejected could still trade. Its
+# reach was wider than the span suggests: TrioSession.conditions_instant()
+# resolves a closed-market arm against its DEFERRED collection start (04:00),
+# not its arrival, so overnight and weekend PRs were governed by it too —
+# measured 88 such rows in orchestrator5/tables/*.tsv (ClerkSentiment
+# `BAD:sentiment_ignored_gate_off`), 75 arriving 04:00-06:59 and 13 overnight.
+# Removed so every PR trades only per orchestrator_trigger_rules.txt, at every
+# hour. Deleting the line (rather than setting the keys to the DEFAULT values)
+# is deliberate: an all-DEFAULT WINDOW line is a no-op that still echoes a
+# `WINDOW ... ET` line at startup, falsely implying a special regime is live.
+#
+# To reinstate it, uncomment the line above and restart the clerk — but note it
+# reintroduces a surge-only trade path that bypasses the sentiment gate entirely,
+# and it also restores the 10s early-premarket watch window (a second, separate
+# knob: the mole then has 10s rather than 150s for a surge to fire).
 DEFAULT              lifeTime=02:30  finbert_gate=on
-WINDOW 04:00-06:59   lifeTime=00:10  finbert_gate=off

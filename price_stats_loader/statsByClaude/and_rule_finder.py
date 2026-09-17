@@ -64,7 +64,7 @@ TOP_KEEP = 20000
 # CLI spec parsing  (copied from threshold_finder_finbert_finmarba.py)
 # --------------------------------------------------------------------------- #
 def parse_columns(specs):
-    """['positive>=', 'FinMarBa_indecisive<='] -> [('positive','>='), ...]"""
+    """['Prosus_pos_hd>=', 'FinMarBa_ind_hd<='] -> [('Prosus_pos_hd','>='), ...]"""
     out = []
     for s in specs:
         for op in (">=", "<="):
@@ -80,7 +80,7 @@ def parse_columns(specs):
 
 
 def parse_anchors(specs):
-    """['positive=0.5,0.6'] -> {'positive': [0.5, 0.6]}"""
+    """['Prosus_pos_hd=0.5,0.6'] -> {'Prosus_pos_hd': [0.5, 0.6]}"""
     out = {}
     for s in specs:
         if "=" not in s:
@@ -194,11 +194,11 @@ def rule_str_plain(legs):
 # column detection
 # --------------------------------------------------------------------------- #
 def detect_columns(df):
-    """Every `*_sentiment_score` plus the kw15 probabilities, in file order."""
+    """Every `*_ss_hd` / `*_ss_bd` plus the kw15 probabilities, in file order."""
     out = []
     for c in df.columns:
-        if c.endswith("_sentiment_score") or c in ("kw15_body_proba",
-                                                   "kw15_head_proba"):
+        if c.endswith(("_ss_hd", "_ss_bd")) or c in ("kw15_proba_bd",
+                                                     "kw15_proba_hd"):
             out.append((c, ">="))
     return out
 

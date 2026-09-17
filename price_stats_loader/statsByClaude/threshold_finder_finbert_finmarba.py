@@ -10,7 +10,7 @@ headline columns, all externally trained so every row is an honest test:
     FinMarBa_positive           fire HIGH  (>=)
     FinMarBa_sentiment_score    fire HIGH  (>=)   +/-1 scale (pos - neg)
     FinMarBa_negative           fire LOW   (<=)
-    FinMarBa_indecisive         fire LOW   (<=)
+    FinMarBa_ind_hd         fire LOW   (<=)
 
 IMPORTANT — the columns are scored on the SAME rows that select the winning
 rule. With a few hundred candidate rules surviving the "Wilson-low > base"
@@ -60,11 +60,11 @@ SPLIT_DATE = "2026-06-20"
 # (column, operator) - operator is the fire direction. Overridable with
 # --columns; these remain the default so existing invocations are unchanged.
 COLUMNS = [
-    ("positive", ">="),
-    ("FinMarBa_positive", ">="),
-    ("FinMarBa_sentiment_score", ">="),
-    ("FinMarBa_negative", "<="),
-    ("FinMarBa_indecisive", "<="),
+    ("Prosus_pos_hd", ">="),
+    ("FinMarBa_pos_hd", ">="),
+    ("FinMarBa_ss_hd", ">="),
+    ("FinMarBa_neg_hd", "<="),
+    ("FinMarBa_ind_hd", "<="),
 ]
 # Quantiles used to build each column's frontier grid. For ">=" a higher
 # quantile is a stricter cutoff (fewer fires); for "<=" a lower quantile is
@@ -73,19 +73,19 @@ GRID_GE = [0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 GRID_LE = [0.70, 0.60, 0.50, 0.40, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05]
 # Candidate cutoffs each column contributes to the AND/OR combo search, as
 # quantiles. Spread down into the tails so the search can reach the
-# high-precision corners (e.g. FinMarBa_indecisive's far-left tail, which is the
+# high-precision corners (e.g. FinMarBa_ind_hd's far-left tail, which is the
 # live-gate operating point).
 CAND_GE = [0.50, 0.65, 0.78, 0.88, 0.94]
 CAND_LE = [0.50, 0.30, 0.18, 0.10, 0.05]
 # Interpretable round cutoffs added to the combo candidates alongside the
 # quantiles, so the search is anchored to human operating points (e.g. the live
-# gate's positive>=0.6 / indecisive<=0.1) and not just data percentiles.
+# gate's Prosus_pos_hd>=0.6 / indecisive<=0.1) and not just data percentiles.
 ANCHORS = {
-    "positive": [0.5, 0.6, 0.7, 0.8],
-    "FinMarBa_positive": [0.6, 0.7, 0.8],
-    "FinMarBa_sentiment_score": [0.3, 0.5, 0.65],
-    "FinMarBa_negative": [0.10, 0.15, 0.20],
-    "FinMarBa_indecisive": [0.08, 0.10, 0.12, 0.15],
+    "Prosus_pos_hd": [0.5, 0.6, 0.7, 0.8],
+    "FinMarBa_pos_hd": [0.6, 0.7, 0.8],
+    "FinMarBa_ss_hd": [0.3, 0.5, 0.65],
+    "FinMarBa_neg_hd": [0.10, 0.15, 0.20],
+    "FinMarBa_ind_hd": [0.08, 0.10, 0.12, 0.15],
 }
 
 MIN_FIRES = 20          # a cutoff must fire on this many rows to be "recommendable"
@@ -95,7 +95,7 @@ MIN_FIRES_COMBO = 12    # combos are sparser; slightly lower floor
 #   SENTIMENT_POSITIVE_MIN = 0.6, FMB_INDECISIVE_MAX = 0.13, COMBO_TRIGGER_MIN = 0.67
 # Earlier versions of this script hardcoded indecisive <= 0.1 and combo >= 0.6,
 # neither of which was ever the deployed value.
-LIVE_GATE_DEFAULT = "positive>=0.6,FinMarBa_indecisive<=0.13"
+LIVE_GATE_DEFAULT = "Prosus_pos_hd>=0.6,FinMarBa_ind_hd<=0.13"
 COMBO_THRESHOLD_DEFAULT = 0.67
 
 
@@ -103,7 +103,7 @@ COMBO_THRESHOLD_DEFAULT = 0.67
 # CLI spec parsing
 # --------------------------------------------------------------------------- #
 def parse_columns(specs):
-    """['positive>=', 'FinMarBa_indecisive<='] -> [('positive','>='), ...]"""
+    """['Prosus_pos_hd>=', 'FinMarBa_ind_hd<='] -> [('Prosus_pos_hd','>='), ...]"""
     out = []
     for s in specs:
         for op in (">=", "<="):
@@ -119,7 +119,7 @@ def parse_columns(specs):
 
 
 def parse_anchors(specs):
-    """['positive=0.5,0.6'] -> {'positive': [0.5, 0.6]}"""
+    """['Prosus_pos_hd=0.5,0.6'] -> {'Prosus_pos_hd': [0.5, 0.6]}"""
     out = {}
     for s in specs:
         if "=" not in s:
@@ -133,7 +133,7 @@ def parse_anchors(specs):
 
 
 def parse_rule(spec):
-    """'positive>=0.6,FinMarBa_indecisive<=0.13' -> [(col, op, cut), ...]"""
+    """'Prosus_pos_hd>=0.6,FinMarBa_ind_hd<=0.13' -> [(col, op, cut), ...]"""
     legs = []
     for part in spec.split(","):
         part = part.strip()
@@ -310,7 +310,7 @@ def main():
                          f"COMBO_TRIGGER_MIN)")
     ap.add_argument("--columns", nargs="+", default=None, metavar="NAME>=|NAME<=",
                     help="score columns and their fire direction, e.g. "
-                         "'positive>=' 'FinMarBa_indecisive<='. Default: the "
+                         "'Prosus_pos_hd>=' 'FinMarBa_ind_hd<='. Default: the "
                          "five FinBERT/FinMarBa headline columns.")
     ap.add_argument("--anchors", nargs="+", default=None, metavar="NAME=v1,v2",
                     help="interpretable cutoffs added to each column's combo "
@@ -756,7 +756,7 @@ def main():
                 delta = f"{aprec - cprec:+.0%} [{lo*100:+.0f}, {hi*100:+.0f}] {verdict}"
             else:
                 verdict, delta = "no fires", "no fires"
-            s7.append({"label": label, "sprec": sprec, "mlift": mlift, "mn": mn,
+            s7.append({"Prosus_lab_hd": label, "sprec": sprec, "mlift": mlift, "mn": mn,
                        "aprec": aprec, "an": an, "verdict": verdict})
             P(f"| {label} | {fmt_pct(sprec)}/{fmt_pct(srec)} | "
               f"{fmt_pct(oprec)}/{fmt_pct(orec)} | {mtp}/{mn}, {fmt_pct(mprec)}, "
@@ -771,14 +771,14 @@ def main():
         P(f"- `{ccol} >= {cthr:g}` alone: {fmt_pct(cprec)} precision, "
           f"{fmt_lift(clift)}, {cn} fires. "
           + (f"**{len(beats)} of {len(s7)}** sentiment rules beat it standalone ("
-             + ", ".join(f"`{r['label']}` {fmt_pct(r['sprec'])}" for r in beats[:3])
+             + ", ".join(f"`{r['Prosus_lab_hd']}` {fmt_pct(r['sprec'])}" for r in beats[:3])
              + ")." if beats else
              f"None of the {len(s7)} sentiment rules beat it standalone."))
         earners = [r for r in s7 if r["mn"] >= MIN_FIRES_COMBO
                    and not np.isnan(r["mlift"]) and r["mlift"] > 1.0]
         P("- **As an extra OR leg:** " + (
             f"{len(earners)} rule(s) add combo-missed fires at lift > 1x — "
-            + ", ".join(f"`{r['label']}` ({r['mn']} adds, {fmt_lift(r['mlift'])})"
+            + ", ".join(f"`{r['Prosus_lab_hd']}` ({r['mn']} adds, {fmt_lift(r['mlift'])})"
                         for r in earners[:3]) + "."
             if earners else
             f"none of the {len(s7)} rules add combo-missed fires above base rate "
@@ -788,7 +788,7 @@ def main():
         hurts = [r for r in s7 if r["verdict"] == "hurts"]
         P("- **As an AND conviction filter:** " + (
             f"{len(helps)} rule(s) raise combo's precision with a Newcombe CI "
-            f"excluding 0 — " + ", ".join(f"`{r['label']}` -> {fmt_pct(r['aprec'])} "
+            f"excluding 0 — " + ", ".join(f"`{r['Prosus_lab_hd']}` -> {fmt_pct(r['aprec'])} "
                                           f"on {r['an']} fires" for r in helps[:3]) + "."
             if helps else
             f"no rule's precision gain over combo alone clears its Newcombe CI; "

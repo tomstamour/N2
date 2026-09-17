@@ -32,30 +32,69 @@ fresh clone rebuild them with `--export`; never force-add them.
 Every script is the same skeleton: an `ONNXExporter` (download/export/quantize),
 an inferencer class, and a module-level singleton exposed as a library API —
 `load_model()` to pre-warm, `score_headline(str)` / `score_headline_file(path)`
-returning `{negative, neutral|indecisive, positive, sentiment_score, label,
-elapsed_ms}`. `sentiment_score` = positive − negative (LouMcD-SDict:
-(pos − neg)/(pos + neg) over lexicon hits). The zero-shot scripts (ModernBERT,
-DeBERTa) have no classification head — they score via the NLI hypothesis
-template `"This example is {}."`.
+returning `{neg, neu|ind, pos, ss, lab, ms}`. `ss` = positive − negative
+(LouMcD-SDict: (pos − neg)/(pos + neg) over lexicon hits). The zero-shot scripts
+(ModernBERT, DeBERTa) have no classification head — they score via the NLI
+hypothesis template `"This example is {}."`.
 
 To add a model: copy the closest existing headliner, then probe-verify the
 label map with known-sentiment headlines before trusting any output.
 
+## ⚠ Column / key naming — unified 2026-08-09
+
+One name per score, everywhere: standalone script, batch scorer, and live
+`Orchestrator5.2`. Columns are
+
+```
+{Model}_{channel}_{hd|bd}       e.g.  FLANG_pos_hd   LouMcD_smod_bd
+```
+
+`hd` = the model scored the **headline**, `bd` = the **body**.
+
+- **Channels**: `pos` `neu` `neg` `ss` `lab` `ms`; FinMarBa uses **`ind`** in place
+  of `neu`; LouMcD-SDict adds `unc` `lit` `smod` `wmod` `cons`.
+- **Model tokens** (hyphen-free, so a column is a legal pandas attribute):
+  `FinMarBa` `FLANG` `FLElectra` `RoBERTa` `ModernB` `DeBERTa` `FinTone`
+  `FinancialB` `DistilRo` `TradeHero` `LouMcD`, plus **`Prosus`** for ProsusAI
+  FinBERT (`../../FinBERT/FinBERT-headliner.py`, the one headliner outside this
+  directory and not in `MODELS`).
+- The **`hd`/`bd` suffix is NOT in the result dict** — a headliner handed a body
+  string cannot know which it got. `HeadScore11encoders` appends `_hd`,
+  `BodyScore11encoders` appends `_bd`, and that is the whole reason the body twin
+  can reuse the head registry untouched.
+- **`ms` replaced `elapsed_ms` (7 scripts) and `inference_ms` (4)**, which removed
+  a `setdefault` papering over the split in `HeadScore11encoders` and a two-key
+  lookup in `verify_headliners`.
+- ⚠ **`ind` is not a neutral probability.** FinMarBa's classes are
+  negative/indecisive/positive, so a LOW `ind` means confident in *either*
+  direction. It keeps a distinct token so no one reads it as `neu` — see the ⚠⚠
+  warning in `orchestrator_trigger_rules.txt` about the rule this cost.
+- ⚠ **`LABEL_ORDER` and the internal `scores` dicts deliberately keep FULL words.**
+  `lab`'s VALUE is one of those words (`max(scores, key=...)`), so shortening them
+  would change cell contents, not just names. Only the public return is renamed.
+- **Migrating an old TSV**: `rename_encoder_cols.py` rewrites the header line only
+  (values did not change). It is idempotent and refuses a file whose header
+  matches neither vocabulary — which matters because the column COUNT is identical
+  before and after, so a half-migrated file cannot be caught by arity.
+- Old spellings, for reading pre-08-09 files: `FLANG-BERT_positive` (head),
+  `FLANG-BERT_Body_positive` (body — an **infix**, now a suffix),
+  `FinMarBa_indecisive`, `{M}_sentiment_score`, `{M}_elapsed_ms`.
+
 ## Models
 
-| Script | Checkpoint | Precision | Logit order 0/1/2 | Warm | Quirk |
+| Script (column token) | Checkpoint | Precision | Logit order 0/1/2 | Warm | Quirk |
 |---|---|---|---|---|---|
 | FinMarBa | baptle/FinBERT_market_based | INT8 | neg/indecisive/pos | ~12 ms | config.json id2label is junk numerics |
-| FLANG-BERT | avinasht/FLANG-BERT_flang-bert | INT8 | neg/neu/pos | ~12 ms | tokenizer from base SALT-NLP repo (official FLANG-BERT is MLM-only); weak on biotech positives |
-| FLANG-ELECTRA | avinasht/FLANG-ELECTRA_Synonym-wordnet | **FP32** | neg/neu/pos | ~110 ms | INT8 flips delisting→neutral; intra_op=2 |
+| FLANG-BERT (`FLANG`) | avinasht/FLANG-BERT_flang-bert | INT8 | neg/neu/pos | ~12 ms | tokenizer from base SALT-NLP repo (official FLANG-BERT is MLM-only); weak on biotech positives |
+| FLANG-ELECTRA (`FLElectra`) | avinasht/FLANG-ELECTRA_Synonym-wordnet | **FP32** | neg/neu/pos | ~110 ms | INT8 flips delisting→neutral; intra_op=2 |
 | RoBERTa | cardiffnlp/twitter-roberta-base-sentiment-latest | INT8 | neg/neu/pos | ~7 ms | neutral-heavy on formal PR wording |
-| ModernBERT | MoritzLaurer/ModernBERT-base-zeroshot-v2.0 | INT8 | zero-shot NLI | ~70 ms | large variant rejected (INT8 flips labels, FP32 530 ms); intra_op=2 |
+| ModernBERT (`ModernB`) | MoritzLaurer/ModernBERT-base-zeroshot-v2.0 | INT8 | zero-shot NLI | ~70 ms | large variant rejected (INT8 flips labels, FP32 530 ms); intra_op=2 |
 | DeBERTa | MoritzLaurer/deberta-v3-base-zeroshot-v2.0 | **FP32** | zero-shot NLI | ~105 ms | INT8 corrupts DeBERTa-v3 (uniform probs, label flips); intra_op=3 |
-| finbert-tone | yiyanghkust/finbert-tone | INT8 | neu/pos/neg | ~12 ms | neutral-heavy on regulatory/biotech |
-| FinancialBERT | ahmedrachid/FinancialBERT-Sentiment-Analysis | INT8 | neg/neu/pos | ~15 ms | dry bad news (delisting, flat bankruptcy) → neutral |
-| distilroberta | mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis | INT8 | neg/neu/pos | ~6.5 ms | fastest transformer; dry bad news → neutral |
-| Trading-Hero | fuchenru/Trading-Hero-LLM | INT8 | neu/pos/neg | ~7 ms | delisting → neutral |
-| LouMcD-SDict | Loughran-McDonald lexicon 1993-2025 | stdlib | 7-category counts | ~0.02 ms | polarity = (pos−neg)/(pos+neg); pure stdlib, no ONNX |
+| finbert-tone (`FinTone`) | yiyanghkust/finbert-tone | INT8 | neu/pos/neg | ~12 ms | neutral-heavy on regulatory/biotech |
+| FinancialBERT (`FinancialB`) | ahmedrachid/FinancialBERT-Sentiment-Analysis | INT8 | neg/neu/pos | ~15 ms | dry bad news (delisting, flat bankruptcy) → neutral |
+| distilroberta (`DistilRo`) | mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis | INT8 | neg/neu/pos | ~6.5 ms | fastest transformer; dry bad news → neutral |
+| Trading-Hero (`TradeHero`) | fuchenru/Trading-Hero-LLM | INT8 | neu/pos/neg | ~7 ms | delisting → neutral |
+| LouMcD-SDict (`LouMcD`) | Loughran-McDonald lexicon 1993-2025 | stdlib | 7-category counts | ~0.02 ms | polarity = (pos−neg)/(pos+neg); pure stdlib, no ONNX |
 
 ## Rules
 
@@ -70,3 +109,10 @@ label map with known-sentiment headlines before trusting any output.
   the fresh export differs from the validated one — not that the golden is
   wrong. Only re-baseline (`verify_headliners.py --capture --force`) after
   deliberately re-validating a model by hand.
+- ⚠ **A key RENAME also fails every probe** (goldens compare flattened dot-paths
+  and reject unknown/missing keys), which makes `--capture --force` tempting and
+  dangerous: it would silently bake in any numeric regression alongside the
+  rename. The 2026-08-09 rename was cleared first by scoring all 8 probes × 12
+  models with the new keys, mapping them back to the old names, and asserting
+  every value byte-identical to the previous goldens (96/96) — *then* capturing.
+  Do the same for any future rename; the timing key is exempt (`VOLATILE_KEYS`).

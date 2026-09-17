@@ -1,265 +1,220 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for working with universe_finder pipeline code in this directory.
 
-## Purpose
+## `universe_finder.py` — in-memory symbol filter library
 
-`universe_finder.py` is a importable Python library that maintains a filtered list of small-cap stock symbols in memory for use by a downstream short-selling strategy. It requires no IBKR connection — all data comes from yfinance.
-
-## Usage
+Importable module that maintains a filtered list of small-cap symbols (no IBKR connection; yfinance only).
 
 ```python
-import universe_finder
-
-universe_finder.start(
-    watchlist_path='./watchlist.txt',  # required — one symbol per line, '#' = comment
-    max_institution_pct=20,            # exclude if institutional ownership >= 20%
-    max_float_m=20,                    # exclude if float >= 20M shares
-    max_price=10,                      # exclude if last close >= $10
-    refresh_minutes=5,
-)
-
+universe_finder.start(watchlist_path='./watchlist.txt', max_institution_pct=20,
+    max_float_m=20, max_price=10, refresh_minutes=5)
 symbols = universe_finder.get_universe()  # blocks on first call until ready
 ```
 
-## Architecture
+**Architecture:** Two-phase. (1) Startup fetches fundamentals once via `ThreadPoolExecutor` using `yf.Ticker.info` — never re-fetched. (2) Every refresh cycle batch-fetches close prices via `yf.download()`, re-applies filters.
 
-**Two-phase data model:**
-1. **Startup** — fundamentals (float shares, institutional %) fetched once via `ThreadPoolExecutor(max_workers=10)` using `yf.Ticker(sym).info`. Never re-fetched during the session.
-2. **Every refresh cycle** — close prices batch-fetched via `yf.download()` for all watchlist symbols at once. Filter re-applied against cached fundamentals.
+**Threading:** `start()` blocks caller until first fetch (`threading.Event`); daemon `_refresh_loop()` runs indefinitely; `threading.Lock` guards `_universe` between background writes and reads.
 
-**Threading model:**
-- `start()` blocks the caller until the first fetch completes (`threading.Event`)
-- Background daemon thread runs `_refresh_loop()` indefinitely; killed automatically on process exit
-- `threading.Lock` protects `_universe` list between background writes and caller reads
+**Filter logic:** ALL three criteria must pass (AND). Missing data treated as passing (permissive policy).
 
-**Filter logic:** ALL three criteria must pass (AND). Missing data (None/NaN from yfinance) is treated as passing — permissive policy.
-
-**`yf.download()` column handling:** Returns a `DataFrame` with symbol columns for multiple tickers, or a `Series` for a single ticker. `_fetch_prices()` handles both shapes via `hasattr(close, 'columns')`.
-
-## Watchlist file format
-
-Plain text, one symbol per line, `#` for comments:
-```
-# My short candidates
-HOOD
-CLOV
-AMC
-```
-
-## Logging
-
-Writes to `./runs/DD-Mon-YYYY/universe_finder.log` at DEBUG level. Date is fixed at `start()` call time. Uses a named logger `"universe_finder"` — will not interfere with the calling script's logging.
-
-## Supporting files
-
-- `ntt-test.tsv` — template TSV with columns `c1_Ticker`, `c2_News`, `c3_Price`, `c4_Float-M`, `c5_Inst-%`; intended as a reference table format for downstream consumers of `get_universe()`
+Watchlist format: plain text, one symbol per line, `#` = comment. Logs to `./runs/DD-Mon-YYYY/universe_finder.log` at DEBUG level.
 
 ---
 
-# `pipeline_daily.py` — nightly IBKR universe builder
+## `pipeline_daily.py` — legacy nightly builder (SUPERSEDED)
 
-`pipeline_daily.py` is a separate, cron-driven script (NOT part of `universe_finder.py`). It produces the dated universe TSVs in `./data/` that downstream consumers read.
+Produces dated universe TSVs; replaced by `daily_universe_pipeline-2.py` since 2026-06-08.
 
-## Four steps + twelve-column output
+Four steps: (1) fundamentals via finviz/yfinance, (2) IBKR close prices, (3) RTH/ETH inter-trade intervals, (4) ITI imputation.
 
-1. **Step 1** — `NASDAQ_symbols_data.build_dataframe()` fetches NASDAQ symbols + float + market cap (finviz primary, yfinance fallback; see `_finviz_fundamentals` / `_yfinance_fundamentals`). Each metric (float, market cap) falls through to the next source independently via `_fetch_fundamentals` — if finviz has a market cap but `Shs Float = '-'`, the float is still recovered from the yfinance fallback instead of being dropped. **Fix (2026-06-05):** previously the first source that returned *either* value "won" both slots, causing symbols like TURB (finviz had market cap but no float) to lose their float. `_fetch_fundamentals` now sources each metric independently, short-circuiting only when both are filled. Result is cached for 24 h. Caches written before the MarketCap_M column was added are auto-invalidated.
-2. **Step 2** — IBKR historical close price per symbol (`closing_price_fetch_addOn.fetch_last_rth_close_async`).
-3. **Step 3** — RTH/ETH avg inter-trade interval per symbol (`trade_frequency_addOn.fetch_freq_async`, which returns a 2-tuple `(rth_iti, eth_iti)`). (The `trade_frequency_volume_addOn.py` superset, which also returns `RTH_volPerTrade` / `ETH_volPerTrade` from the same TRADES bars and returns a 4-tuple, is retained on disk but **not** wired into the pipeline — it was reverted out after a full-scale run errored, pending separate testing.)
-4. **Step 4** — `ITI_imputer.py` overwrites the 8-column file in place with the 10-column imputed version. Runs after the canonical write so an imputer crash can't lose the fetch. Skipped by `--no-impute`.
+**Crash-safety invariants (do not break):**
+1. All result columns pre-initialized to NaN before `connect()` — any exit path must still produce complete file with 44444 sentinels.
+2. `df.to_csv(...)` lives OUTSIDE the IBKR `try/finally`.
+3. `_run_concurrent` catches `ConnectionError`/`OSError`, tries one reconnect, fills remainder with `nan_value` on failure — does NOT retry indefinitely (would loop forever around 03:59 ET Gateway restart).
+4. `nan_value` is caller's parameter (Step 2: `(nan, None)`; Step 3: `(nan, nan)`).
 
-Intermediate Step 1–3 columns: `Symbol, Exchange, Float_M, MarketCap_M, Float_Source, LastDailyClosePrice, RTH_avgITI_sec, ETH_avgITI_sec`. Step 1 fields (`Float_M`, `MarketCap_M`) stay **NaN** when no source had the value. Missing IBKR data (Step 2/3 fields) is filled with the sentinel **`44444`** (never NaN). `Float_Source` records where the **float** came from and usually doubles as the provenance for `MarketCap_M` — there is no separate `MarketCap_Source`. The two can diverge: `_fetch_fundamentals` sources each metric independently, so when finviz lists a `Market Cap` but `Shs Float = '-'` (e.g. TURB), the float is taken from the yfinance fallback (`Float_Source=yfinance`) while the market cap stays from finviz.
+**Throughput:** `--price-concurrency` 12 (default), `--freq-concurrency` 4 (default). Error 366 > ~50 on a full run = Gateway-side slot exhaustion, not connection problem — lower `--freq-concurrency`.
 
-Step 4 writes the model-predicted ITI values **straight into the canonical `RTH_avgITI_sec` / `ETH_avgITI_sec` columns** (rounded to 1 decimal) and adds 2 provenance sidecars: `ITI_impute_flag, ITI_impute_method`. The 44444 sentinels are converted to NaN on load and then the formerly-sentinel rows are filled with predictions; only the never-fetched `nan_skipped` rows (e.g. `--max-float` skips) remain NaN. The orchestrator reads the canonical columns directly, so it now consumes imputed ITIs for those rows and its `if pd.isna(val): TM_DEFAULT_BASELINE_ITI = 44444.0` fallback fires only for the `nan_skipped` rows.
-
-## Two TSV file kinds in `data/` — do NOT confuse them
-
-- `nasdaq_symbols_data.tsv` (no date, 5 columns) — **Step 1 cache only**. Owned by `NASDAQ_symbols_data.py:51,349`. `pipeline_daily` reads it as input; do not treat it as a pipeline output. Its mtime tells you when Step 1 last ran, not when the pipeline last succeeded.
-- `nasdaq_symbols_data_priced_YYYY-MM-DD.tsv` (10 columns after Step 4; 8 columns transiently between Steps 3 and 4) — **the real pipeline output**. Written by `pipeline_daily.py` near the end of `main()`, then overwritten in-place by `ITI_imputer.py`. The 8-column transient state can survive a Step 4 crash; re-running `pipeline_daily.py --no-impute` first then standalone `ITI_imputer.py --date YYYY-MM-DD` is the recovery path.
-- `nasdaq_symbols_data_priced_YYYY-MM-DD_HHMM.tsv` and `..._HHMM_superseded.tsv` — sidecars produced by the overwrite-protection logic at the write step. If a run finds a same-date canonical file already present and it has more populated RTH+ETH ITI rows than the new run, the new run goes to a timestamped sidecar instead of clobbering. If the new run is at least as good in both columns, the outgoing canonical file is moved to `..._HHMM_superseded.tsv` for one safety cycle. This was added after the 2026-06-03 incident where a daytime re-run silently overwrote the nightly cron output with a strictly worse file (43%/40% → 41%/37%).
-
-If only the no-date file is fresh, the nightly pipeline crashed before its final write — check `runs/{DD-MMM-YYYY}/pipeline_daily.log` and `runs/cron.log`.
-
-**Operational note:** don't stack two `pipeline_daily.py` runs against the same IB Gateway session without restarting the Gateway between them — Step 3 slot accounting carries over and the second run inherits the depleted state. The 2026-06-03 morning losses were caused by a `--limit 500` test at 07:29 followed by a full run at 08:18 on the same Gateway.
-
-## Hard constraint: IB Gateway restarts at 03:59 ET nightly
-
-The cron fires at 20:30 ET, so the available IBKR window is ~7.5 h. At 03:59 the Gateway forces a socket close that ib_insync re-raises as `ConnectionError: Socket disconnect`. Code in this script must tolerate it without aborting — see invariants below.
-
-## Crash-safety invariants (don't break these)
-
-1. **All result columns are pre-initialised to NaN before `connect()`** (`pipeline_daily.main`). Any code path that exits — clean, mid-run disconnect, or unexpected exception — must still produce a complete output file with 44444 sentinels.
-2. **`df.to_csv(...)` lives OUTSIDE the IBKR `try/finally`.** Don't move it back inside; the Steps 2/3 block also has an outer `try/except Exception` whose sole job is to fall through to the write.
-3. **`_run_concurrent` catches `ConnectionError`/`OSError` from `ib.run(_gather(...))`.** On catch it tries one `ensure_connected`. If reconnect fails, it fills the remainder with the caller's `nan_value` and returns — it does NOT retry indefinitely (that would loop forever around the 03:59 cutoff). The failed batch's symbols stay NaN; we don't retry the batch even after a successful reconnect.
-4. **`nan_value` is a parameter of `_run_concurrent`.** Step 2 passes `(nan, None)` (price + qualified contract); Step 3 passes `(nan, nan)` (RTH + ETH ITI). If you add another step, supply your own sentinel.
-
-## Throughput design
-
-- Step 2 (close prices) and Step 3 (trade frequency) have separate concurrency knobs: `--price-concurrency` (default 12) and `--freq-concurrency` (default 4). Step 3 is the per-request bottleneck. Both sit well below IBKR's 50-simultaneous-historical-requests cap and ib_insync's 45 req/s client-side throttle (`MaxRequests=45` in `ib_insync/client.py`). `--freq-concurrency` history: **48 → 24 → 8 → 4**. 48 collapsed instantly (Step 3 went 0/7000). 24 *looked* safe but bled slowly via Gateway-side slot accounting drift — the 2026-06-01 run produced **9% Step 3 success on 7152 symbols, with 10k+ Error 162 ("query cancelled") and 1.4k+ Error 366 ("no historical data query found for ticker id") in the log, zero pacing violations and zero socket disconnects** (so the previous `_run_concurrent` reconnect path never triggered — it's not a connection problem, it's slot exhaustion). 8 paired with `--freq-timeout 30` looked clean on the 2026-06-02 500-symbol test (74% success on valid-contract symbols, 7 Error 366 total) but the cascade crept back at full 7000-symbol scale — the 2026-06-02 cron logged **880 Error 162 + 58 Error 366** with **RTH 43% / ETH 40%**. 4 is the next step per the diagnostic ladder (>~50 Error 366 ⇒ lower concurrency before touching anything else).
-- Step 3 reuses the qualified `Stock` contracts produced by Step 2 (`fetch_freq_async(..., contract=...)`) — this halves the per-symbol IBKR round-trips. Symbols where Step 2 couldn't qualify short-circuit to NaN in Step 3 instead of re-trying qualify.
-- `--freq-timeout` default is **30 s** (was trimmed to 12 s; reverted 2026-06-02). The 12 s trim assumed "real fetches complete in 5–7 s under load" — that was only true under the old high-concurrency regime, where anything slower was queue-buildup pathology rather than a real fetch worth waiting on. With concurrency=8 the queue is no longer the bottleneck; per-symbol latency on thin micro-caps legitimately spans 15–25 s, and 12 s mass-timed-out real symbols (2026-06-02 head-to-head: 28% success at 12 s vs 74% at 30 s, same concurrency=8 on the same 500 symbols). If you raise `--freq-concurrency` above 8 you can likely drop the timeout again — they trade off.
-- `--freq-retries` default is **0** (vs `--retries` = 2 for prices): retrying a freq fetch rarely succeeds because the underlying cause is usually "no TRADES history".
-- If `Historical Market Data Service error message:Pacing violation` shows up in the log, lower `--freq-concurrency` further (try 4). (These messages are now captured in `pipeline_daily.log` directly — `_setup_logging` attaches the per-day file handler to the `ib_insync` logger too.)
-- **The Error 162 / Error 366 cascade is the signature of Gateway-side historical-data slot exhaustion**, not a connection or pacing problem. The reconnect logic in `_run_concurrent` doesn't help here (the socket stays up). If a run shows the cascade, the diagnostic is: (a) check `grep -c "Error 366"` — anything > ~50 on a full run means slots aren't draining; (b) check `grep -c "Pacing violation"` — should be zero; (c) check Step 3 success rate vs the float-filtered fetch count. If the cascade is back, lower `--freq-concurrency` before touching anything else.
-- **Step 3.5 — paced retry of failed Step 3 symbols.** After the first Step 3 pass, `main()` identifies rows where `qualified[i] is not None` but `rth_results[i]` came back NaN (i.e. the symbol *should* have been fetchable), sleeps 90 s to let Gateway slot accounting drain, then re-runs `_run_concurrent` on just that cohort at **half the configured `--freq-concurrency`, capped at 2**. Skipped if (a) > 50% of attempted symbols failed (a paced retry won't help that magnitude — check Gateway state instead), or (b) we're within 20 min of the 03:59 ET Gateway restart. This is qualitatively different from `--freq-retries` (which is still 0): inline per-symbol retries on the same loop fail for the same reason the first attempt did because slot bookkeeping is time-paced. The retry uses the qualified contracts already cached from Step 2 — no re-qualification.
-
-## Logging & `runs/cron.log` rotation
-
-- Per-run log: `runs/{DD-MMM-YYYY}/pipeline_daily.log` (DEBUG level, full history).
-- Aggregate stdout/stderr: `runs/cron.log` (written by cron's shell `>> 2>&1`).
-- `_rotate_cron_log()` runs **once at the top of `_setup_logging`**. If `cron.log` is ≥ 5 MB it's renamed to `cron.log.1` (and any existing `.1` to `.2`) before the new run starts writing. Single-writer (the shell), race-free. Do NOT add a `RotatingFileHandler` pointing at the same file — that would race with the shell's append.
-
-## Cron entry
-
-```
-TZ=America/New_York
-30 20 * * * path/to/venv/bin/python3 path/to/N2/scripts/universe_finder/pipeline_daily.py >> path/to/N2/scripts/universe_finder/runs/cron.log 2>&1
-```
+**Two TSV file kinds:** `nasdaq_symbols_data.tsv` (Step 1 cache only, not output); `nasdaq_symbols_data_priced_YYYY-MM-DD.tsv` (the real output).
 
 ---
 
-# `daily_universe_pipeline-2.py` — trade-size-enabled successor (THE nightly cron since 2026-06-08)
+## `daily_universe_pipeline-3.py` — current nightly cron (SINCE 2026-09-17)
 
-Parallel to `pipeline_daily.py` but Step 3 also fetches a per-trade trade-size
-baseline (shares/trade) for RTH and ETH from the *same* TRADES bars (via
-`trade_frequency_and_size.addOn.py`'s 4-tuple `fetch_freq_async`), and the
-output gets two extra columns. Writes to a DISTINCT stem so it never collides
-with the old pipeline's output: `data/stocks_universe_YYYY-MM-DD.tsv`.
-
-## Step 3 lookback = LAST COMPLETE SESSION ONLY (since 2026-07-15)
-
-`--past-days-lookback` defaults to **1**: ITI and trade size describe the
-single most recent complete session, not a multi-day average. Changed after
-the SOBR 2026-07-14 case: the old 3-day mean of per-day ITIs (only 3 samples,
-so `iqr_filtered_mean` falls back to a plain mean) let one dead pre-surge day
-dominate — SOBR's ETH ITI read 1425.9 s = mean(4275.0, 1.8, 0.9) while the
-stock was actually trading sub-second. Three coupled semantics in
-`trade_frequency_and_size.addOn.py`:
-
-- `past_trading_days()` starts at **today when now ≥ 20:00 ET** (after-hours
-  session over → today is complete), else yesterday. The 20:30 cron therefore
-  captures the just-finished session — zero-day lag instead of one.
-- It is **holiday-aware** via `pandas_market_calendars` (NYSE calendar,
-  weekday-walk fallback if the import fails). Essential at lookback=1: a
-  holiday in the window would otherwise blank the whole universe into 44444s.
-- `compute_session_volumes(bars, days)` now takes the same `days` filter as
-  `compute_session_itis`, so trade size covers exactly the lookback sessions
-  (it previously aggregated every fetched bar, including the +4-calendar-day
-  request buffer and today's partial session).
-- **Zero-trade sessions are censored real values, not imputation fodder**:
-  when the fetch returned bars but a session had no trades,
-  `compute_session_itis` records the full session length (RTH 23,400 s /
-  ETH 34,200 s) instead of dropping the day (which used to cascade into
-  NaN → 44444 → HGB-imputed). Zero trades is a genuine observation — "gap ≥
-  whole session" — and the scale stays continuous (1 trade scores the same).
-  Dead-session rows therefore carry `ITI_impute_flag=ok` and join the
-  imputer's training set; only true fetch failures (no bars at all) still
-  produce 44444 → imputed. Trade *size* for a dead session remains
-  44444 → imputed (no trades = nothing to measure), so ITI=real + size=imputed
-  is a legitimate flag combination. Verified 2026-07-15 on ATCX (dead ETH →
-  34200.0 real) and BLIV (fetch fine, zero trades all day → 23400/34200 both).
-
-The first file built with these semantics is `stocks_universe_2026-07-16.tsv`
-(the 2026-07-15 cron ran before the changes landed).
-
-## Cron entry (since 2026-07-07: paper Gateway + reduced Step 3 pressure)
+v2 plus the two blocks the XGBoost models need, minus the borrow fetch. Outputs
+the SAME `stocks_universe_YYYY-MM-DD.tsv` (147 columns, 151 with `--splits`);
+O5.2 / daily-board read by column name, so the extra columns are transparent.
 
 ```
-30 20 * * * /home/tom/venv/bin/python3 …/daily_universe_pipeline-2.py --port 4002 --freq-concurrency 2 --freq-timeout 60 >> …/runs/cron.log 2>&1
+ 38  v2 today       Symbol … SI_DataCoverage          unchanged
+ +5  Step 8.5       Date + 4 raw ITI/trade-size sidecars
++84  Step 9         market_state_calculator.py        ~60 min IBKR
++20  Step 10        vix_addOn.py                      ~5 s, 2 bulk HTTP
+[+4] Step 11        Stock-Split-finder.py             opt-in, --splits
 ```
 
-**Why `--port 4002` (paper Gateway):** the 2026-07-06 incident. The pipeline
-shared the LIVE Gateway (4001) with the whole live trading stack (clerk-1.1's
-30-client pool, x-wing/mole RTVolume tick streams, daily-board's ~100 market
-data lines) for the first time that night, and the Gateway's historical path
-was starved from the very first request: 709× Error 162 + 745 timeouts
-(baseline: 18–57/night), 691/819 Step 3 failures, ~170/200 empties in every
-batch, zero pacing violations, zero disconnects, live data unaffected. None of
-the live-stack scripts issue ongoing `reqHistoricalData` — the contention is
-the live Gateway JVM itself servicing ~130+ tick lines while assembling
-historical responses (intraday-bar queries slow to 80–150 s+; daily bars stay
-fast, which is why Step 2 was 98% fine). The paper Gateway (IBC, port 4002,
-same 03:59 restart) is idle and serves the identical TRADES history —
-verified 2026-07-07. Isolation also kills the run-stacking hazard: daytime
-test runs on 4002 no longer poison the Gateway session the cron uses…
-as long as those tests also use 4002.
+**The anchor contract — the whole point.** Every session-resolving step of the
+training-set chain ran at `--days-prior 1` against each PR's `ArrivalDate`. v3
+runs on the evening of day D at `--days-prior 0`, which
+`tools/market_state/CLAUDE.md` states as an identity:
 
-`_run_concurrent` now has a **contention canary**: if >50% of the FIRST batch
-(≥50 symbols) comes back empty, it logs an ERROR naming this signature and the
-port — distinguishing it from the slot-exhaustion cascade (which builds up
-over time and floods Error 366).
+    training:  PR on ArrivalDate = D+1, --days-prior 1 → resolve(D+1, 1) = D
+    v3:        run on day D,            --days-prior 0 → resolve(D,   0) = D
+    "Train with 1, infer with 0."
 
-**`--freq-concurrency 2 --freq-timeout 60`** (cron flags; code defaults stay
-4/30): July 6 showed 30 s mass-times-out real queries when the historical path
-is under pressure; 60 s rides them out and concurrency 2 halves the standing
-load. Healthy-night cost: Step 3 wall time roughly doubles (~25 → ~50 min at
-~820 symbols), still far inside the 03:59 window.
+`SESSION_DATE` is resolved ONCE at process start (`_session_date`) and drives the
+output filename, the `Date` column, MSC's `--anchor-date`, vix_addOn's anchor and
+the splits `--as-of`. Nothing re-reads the clock. ⚠ This is not cosmetic:
+`market_state_calculator.load_universe_price_refs` resolves
+`stocks_universe_<anchor>.tsv` **by filename** to referee `msc_basis_ratio` — a
+model feature — so a drifted name silently costs it its reference price.
+Weekends need no special-casing: `--days-prior 0` on a Saturday resolves to Friday.
 
-## Steps 4–8 and the 38-column output
+**Steps 9–11 are subprocess replays** of each addon's own CLI, not reimplementations.
+`_run_addon` skips on a marker column (`msc_anchor_date` / `VIX_AnchorDate` /
+`LastSplit_Status`) — MSC and vix_addOn do NOT self-guard and a second pass would
+append a duplicate copy of every column — then verifies the `<stem>_<suffix>.tsv`
+sibling column-for-column against its input before `os.replace`. Any failure
+leaves the pre-step file intact.
 
-- **Step 4** — ITI imputation: runs `ITI_imputer.py` in place on the 8-column
-  canonical schema (the trade-size columns are NOT present yet, so the imputer's
-  strict 8-col check passes) → 10 columns (`ITI_impute_flag`, `ITI_impute_method`).
-- **Step 6** — appends `RTH_tradeSize` / `ETH_TradeSize` (read-back-as-strings so
-  Steps 1–10 formatting is byte-preserved) → 12 columns. At this point trade size
-  carries the **44444** sentinel for attempted-but-failed fetches and stays
-  **blank** for `--max-float`-skipped rows.
-- **Step 7** — trade-size imputation: runs `trade_size_imputer.py` in place →
-  14 columns (`TradeSize_impute_flag`, `TradeSize_impute_method`). Skipped by
-  `--no-size-impute` (independent of `--no-impute`). A Step 7 failure leaves the
-  12-column Step 6 file intact and re-runnable (the call is wrapped in try/except
-  exactly like Steps 4 and 6).
-- **Step 8** — short-interest enrichment: `../ShortInterrest/ShortInterrest_AddON.py`
-  is loaded by path and its `enrich_dataframe(df, skip_borrow_history=...)`
-  appends 24 columns in place (same read-back-as-strings pattern as Step 6) →
-  the final **38-column** file: `SI_*` ×8, `SVR_*` ×4, `CTB_*` ×3, `Borrow_*` ×4,
-  `RegSHO_*` ×2, `SqueezeFlags`, `SqueezeScore`, `SI_DataCoverage`. Free web
-  sources only (FINRA SI + daily short volume, IBKR shortstock FTP, iBorrowDesk,
-  Nasdaq Reg SHO threshold list) — no IBKR API connection; downloads cached
-  per-day under `../ShortInterrest/cache/`. Skipped by `--no-short-interest`;
-  `--skip-borrow-history` drops the per-symbol iBorrowDesk calls (~0.8 s each —
-  those feed `CTB_FeeDelta5d` / `Borrow_AvailDelta5dPct` / `Borrow_UtilProxy`).
-  Best-effort: a failure leaves the 14-column file intact; recovery is running
-  the addon standalone (`-i data/stocks_universe_YYYY-MM-DD.tsv`, which writes a
-  `_SI.tsv` sibling — its CLI is a thin wrapper around the same `enrich_dataframe`).
-  The addon logs to the named logger `short_interest`, routed into the per-day
-  `pipeline_daily.log` and console by `_setup_logging`.
+**Fixed flags that are NOT free choices:**
+- `--session both` (Step 9). The training `msc_` block was built with it; the
+  three session modes are not comparable and `msc_session` records which made a row.
+- `--split-cache-max-age-days 36500` (Steps 9 and 11). The addons' own default of
+  1 re-queries ~830 symbols nightly, and for a **delisted** symbol yfinance
+  returns empty splits with live metadata, so `fetch_splits` writes a header-only
+  "never split" over real history (NTZ, OMH — 2026-09-07). `forward_split_factor`
+  is a no-op in universe mode, so the TTL buys nothing here. See
+  [[split-cache-refresh-degrades-delisted]].
+- `--never-split-fill blank` (Step 11). The default `maxima` sentinel is derived
+  from **the file's own** resolved rows, so a nightly file emits a different
+  sentinel than the one frozen into the training corpus.
 
-First-14-column schema (before the Step 8 SI columns):
-`Symbol, Exchange, Float_M, MarketCap_M, Float_Source, LastDailyClosePrice,
-RTH_avgITI_sec, ETH_avgITI_sec, ITI_impute_flag, ITI_impute_method,
-RTH_tradeSize, ETH_TradeSize, TradeSize_impute_flag, TradeSize_impute_method`.
+**Borrow is gone.** Step 3.6 and all five `--borrow-*` flags removed: ~72 min of
+the run, 0 of the 49 model features, and grepping `orchestrator5/`, `x-wing-mole/`
+and `daily-board/` for `CTB_*`/`Borrow_*`/`SqueezeScore`/`RegSHO_*` returns zero
+hits. The 7 columns stay in the header, blank. ⚠ Step 8 must be called with
+`ibkr_borrow={}` — **not `None`**: `use_ibkr = ibkr_borrow is not None`, so `None`
+re-enables the two dead web sources (15 s FTP timeout + ~830 iBorrowDesk calls at
+0.8 s = ~15 min to produce nothing).
 
-## `trade_size_imputer.py` — the trade-size analogue of `ITI_imputer.py`
+**Raw ITI/trade-size sidecars** (`RTH_avgITI_sec_raw`, `ETH_avgITI_sec_raw`,
+`RTH_tradeSize_raw`, `ETH_TradeSize_raw`). Training used the RAW 44444 sentinel,
+which `xgb_cons49_se_prep.json` maps to frozen constants (46800.0 / 68400.0 /
+0.0); Steps 4 and 7 overwrite it with HGB predictions, and must, because O5.2
+reads the canonical columns as `itiBaseline`/`tradeSizeBaseline`. Both views now
+ship. None of the three is in the current 49-feature allowlist — this is for retrains.
 
-**`ITI_imputer.py` is treated as frozen** — it enforces a strict 8-column
-schema and is shared by both pipelines; don't touch it without explicit user
-approval. One approved exception (2026-07-07): the `< --min-train-rows` abort
-branch used to write the file with the 44444 sentinels erased (converted to
-NaN at load, never restored) and a blanket `ITI_impute_flag=skipped_nan` —
-which destroyed the attempted-vs-skipped provenance on the 2026-07-06
-catastrophic-fetch night. It now restores the sentinels and writes
-cohort-accurate flags (`ok`/`rth`/`eth`/`both`/`skipped_nan`) with method=""
-— the same gate behavior `trade_size_imputer.py` always had. Still rc=1;
-the normal imputation path is untouched. `trade_size_imputer.py`
-*imports* its schema-agnostic helpers (`_build_feature_frame`, `_fit_predict_hgb`,
-`_clip_to_p1_p99`, `_bin_counts`, `_is_feature_degenerate`) so both imputers share
-one feature/HGB engine and can't drift. Differences:
+**The 15 model features this file supplies:** `Float_M`→`Float`,
+`MarketCap_M`→`MktCap` (O5.2 renames), `SI_ChangePct`, `SVR_5dAvgPct`,
+`FNG_Index`, `atr_pct_14`, `float_turnover_max_20d`, `msc_basis_ratio`,
+`dist_swing_high_20d_pct`, `range_pct_1d`, `amihud_63d`, `realized_vol_5d`,
+`gap_abs_mean_20d`, `days_since_52w_low`, `illiq_trend`. The other 14 + 20 PCA
+are PR-level and belong to the O5.2 successor — see the module docstring.
 
-- Targets `RTH_tradeSize` / `ETH_TradeSize` (shares/trade), two-stage cascade
-  (Stage A = RTH; Stage B = ETH adding `log1p(RTH_tradeSize)` as a feature).
-- **Base features only** (float / mcap / price / exchange / source) — the imputed
-  ITI columns are deliberately NOT used as predictors (avoids model-on-model coupling).
-- Target transform is **`log1p` / `expm1`** (not bare `log`): trade size can be
-  fractional/near-zero; predictions are floored at 0 and clipped to the train P1/P99.
-- Same sentinel policy as ITI: 44444 → NaN at load, predict only the was-sentinel
-  rows, leave `--max-float`-skipped (blank) rows blank (`skipped_nan`).
-- **Idempotent**: accepts a 12-col or already-imputed 14-col file. If the file has
-  the sidecars and no 44444 left, it's a no-op (file untouched, provenance kept).
-- **Flag** is cohort-based (`ok`/`rth`/`eth`/`both`/`skipped_nan`); **method**
-  records what was done (`hgb`/`global_median`/combined, `""` when not imputed).
-  A per-stage min-train-rows gate can leave a stage unimputed: those rows then read
-  flag=`rth`/`eth`/`both` with method=`""` and keep the 44444 value.
-- Own log file `runs/{DD-MMM-YYYY}/trade_size_imputer.log`.
+⚠ **Accepted divergence:** `RegSHO_Flag`/`RegSHO_ConsecDays` get their 1-session
+publication lag by accident (the live SI addon walks back from `eastern_today()`
+and Nasdaq has not posted yet). A run reaching Step 8 after ~23:00 ET reads day
+D's list where the training backfill used D−1's. Neither is a model feature; only
+`SqueezeScore` (10 of 100 points) is touched. Keeping Step 8 *before* the
+60-minute Step 9 is what keeps most nights on the right side of 23:00.
 
-Run standalone: `python3 trade_size_imputer.py --input <_sized .tsv> [--min-train-rows N]`.
+Runtime ~2h20m on a cold-Step-1 night, ~1h05m warm — **faster than v2** despite
+the new fetch, because dropping borrow (~72 min) more than pays for MSC (~60 min).
+⚠ MSC's bar cache gives nothing night-over-night: its hit test is
+`cached[-1].date >= anchor`, so a new anchor misses every symbol and refetches a
+full 2-year series.
+
+Cron entry: `30 20 * * * /home/tom/venv/bin/python3 …/daily_universe_pipeline-3.py
+--port 4002 --freq-concurrency 2 --freq-timeout 60 >> runs/cron.log 2>&1`
+(the crontab block already exports `TZ=America/New_York`, which is what makes
+`datetime.now()` in `_session_date` an ET date). Per-day log is
+`runs/{DD-MMM-YYYY}/pipeline_daily-3.log`.
+
+---
+
+## `daily_universe_pipeline-2.py` — previous nightly cron (2026-07-07 → 2026-09-17, SUPERSEDED by `-3.py`)
+
+Outputs `stocks_universe_YYYY-MM-DD.tsv` (38 columns). Runs on paper Gateway (port 4002) to avoid live-stack contention (2026-07-06 incident: 691/819 Step 3 failures when shared with live gateway + ~130 tick lines).
+
+**Hardcoded output filters** (NOT CLI flags — code edits):
+- `_FILTER_MAX_FLOAT_M = 50.0` (must be < 50M shares)
+- `_FILTER_MAX_MCAP_M = 50.0` (must be < 50M)
+- `_FILTER_MAX_PRICE = 6.00` (must be < $6)
+
+All three strict — NaN fails. Float/mcap filter runs BEFORE IBKR fetches (early skip); price filter runs AFTER Step 2 (close unknown until then). ⚠️ `MarketCap_M` = shares outstanding × price, NOT float × price.
+
+**Step 3 lookback:** `--past-days-lookback` defaults to 1 (LAST SESSION ONLY, since 2026-07-15). Changed after SOBR case where 3-day mean of sparse ITIs let a dead day dominate. `past_trading_days()` is holiday-aware via `pandas_market_calendars`.
+
+Held the cron slot until 2026-09-17; everything below is still accurate for
+steps 1–8, which `-3.py` carries over unchanged. Its one removed step is 3.6
+(borrow) and its filename tag came from `datetime.now()` at *write* time, so a
+run crossing midnight labelled session-D data as D+1.
+
+**Steps 4–8:** ITI imputation (10 col) → trade-size append (12 col) → trade-size imputation (14 col) → Step 3.6 borrow fetch → SI enrichment (38 col final).
+
+---
+
+## `ibkr_borrow_addOn.py` — Step 3.6 borrow data (2026-08-30 → 2026-09-17, NOT in the nightly path)
+
+⚠ `daily_universe_pipeline-3.py` dropped Step 3.6 — ~72 min a night for columns no live consumer reads and no model feature uses. The script is unchanged and still works standalone; `ShortInterrest_backfill_AddON.py --ibkr-rates` reads the cache that `ShortInterrest/ibkr_rates_fetch_AddON.py` (which imports `_rate_bars` from here) writes.
+
+Supplies 7 borrow columns (`CTB_FeePct`, `CTB_RebatePct`, `CTB_FeeDelta5d`, `Borrow_Available`, `Borrow_AvailDelta5dPct`, `Borrow_UtilProxy`, `Borrow_Source`) via IBKR API, replacing two dead web sources (iBorrowDesk 403 since 2026-07-22; IBKR FTP never worked).
+
+**Three IBKR sources:** `FEE_RATE` bars → CTB_FeePct/Delta; `REBATE_RATE` bars → CTB_RebatePct; market data tick 236 → Borrow_Available.
+
+**⚠️ CRITICAL: IBKR returns ANNUALIZED DECIMAL FRACTIONS — everything must be ×100.** Mis-scaling corrupts CTB30/CTB80 flags by 100×.
+
+Runs inside IBKR block after Step 3.5 retry (borrow failure must never cost ITI data). Reuses Step 2's qualified contracts; symbol failing to qualify short-circuits.
+
+Flags: `--no-ibkr-borrow`, `--borrow-concurrency` 4, `--borrow-timeout` 60, `--borrow-retries` 0.
+
+---
+
+## `ShortInterrest_backfill_AddON.py` — historical SI backfill
+
+Computes 24 SI columns **as of a historical date** (Step 8 only started 2026-07-06). Writes `<stem>_SIback.tsv` (inputs never modified).
+
+**Three publication lags** (the core rule):
+1. **FINRA SI — 7 business days, holiday-aware.** Newest settlement `≤ as_of` reproduces production exactly.
+2. **Nasdaq RegSHO — 1 day.** File posted ~23:00 ET, so 20:30 cron hasn't caught it yet; use `as_of - 1`.
+3. **FINRA daily short volume — none.** Downloaded same day.
+
+⚠️ Do NOT point at live `cache/finra_si/` (wrong key structure; silently returns today's records). ⚠️ `ShortInterrest_backfill_AddON.py` is NOT a fix for the iBorrowDesk hole — it reads frozen cache (stale > 5 days is blank).
+
+---
+
+## `trade_frequency_and_size_backfill_AddON.py` — point-in-time ITI/size
+
+Recomputes `RTH_avgITI_sec, ETH_avgITI_sec, RTH_tradeSize, ETH_TradeSize` as of a historical session. Writes `<stem>_freqSizeBack.tsv`.
+
+**`--days-prior` vs `--past-days-lookback` — do NOT confuse.** First shifts the anchor (which nightly run to replay); second is the window length (defaults both to 1).
+
+⚠️ **Share splits are CORRECTED on trade-size columns.** IBKR back-adjusts historical volume; ITI (transaction count) is immune, but trade size (volume/count) scales by cumulative split factor. `yfinance` leads; a price probe audits discrepancies outside ±2%.
+
+---
+
+## `marketcap_backfill_AddON.py` — market cap, TWO MODES
+
+`MarketCap_M` entered Step 1 on 2026-06-05. Two holes, two methods, one script since 2026-09-05 (`price_stats_loader/mktcap_backfill_addOn.py` was deleted and its join absorbed here).
+
+**Which mode runs is decided by `--date-column` (default `ArrivalDate`) being present in the input** — not by a flag. Universe file → filename date, formula only. PR-stats → per-row dates, join then formula.
+
+### Universe files (RECONSTRUCTION)
+
+Formula: `MarketCap_M = LastDailyClosePrice × shares_out / 1e6`. Source shares via cross-file median of production values (default `--shares-source implied` — touches no network). Acceptance test: `-i data/stocks_universe_2026-06-09.tsv --compare-to same --all-rows` → **96.9% within 1%**. ⚠️ Without `--all-rows` the test is a fake 100%: rows that already have a value are `kept` and compared to themselves.
+
+### PR-stats files — pass 1 is a JOIN, NOT A FORMULA
+
+⚠️⚠️ **`MktCap` in PR-stats is NOT `LastDailyClose × sharesOut`.** Orchestrator writes it straight from the universe file loaded at start; PR's `LastDailyClose` filled independently. Join `MarketCap_M` from the most recent mcap-bearing universe file dated ≤ **calendar** `ArrivalDate - 1` (D-1 because file for day D is written by 20:30 cron on D). Calendar, not session: **the cron writes weekend files too**, so a Monday PR was served by Sunday's file (they carry Friday's close, byte-equal on 6291/6292 shared symbols). No split handling — the universe file already recorded it in its own share terms.
+
+### PR-stats pass 2 — formula, for what no universe file can serve
+
+Pre-2026-05-14 rows plus symbols absent from their anchor file. Anchored with `--days-prior` (default 1) via `Sessions.resolve`, imported from `tools/market_state/market_state_calculator.py`.
+
+⚠️ **Splits MUST be divided out here** — the universe-file mode's safety (close and shares from the same file) does not hold. `shares_at_row = shares_observed / F`. ⚠️ **F is anchored on `ArrivalDate`, NOT on the session anchor**, matching how `lastDailyClose_AddOn.py` set the close's basis; the session anchor straddles any ex-date in between and re-applies a correction the price already carries (EZRA's 05-17 1-for-40 inflated its 05-18 row 40×). Cross-check: every corrected row must be `LastDailyClosePrice_SplitAdj == adjusted`, never `none_needed`.
+
+⚠️ Split lookup is **cache-only** (`tools/market_state/tables/splits/`); a miss blanks the cell rather than assuming 1.0. `--split-network` opts in, but the cache covers 3313 symbols against 7143 in a universe file — that burst shares the yfinance endpoint the nightly Step 1 depends on.
+
+On the 2026-05-04→08-28 corpus: joined 1705, formula 770 (19 split-corrected), kept 2311, 18 unfillable (15 no close).

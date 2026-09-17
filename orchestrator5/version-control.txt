@@ -18,11 +18,26 @@ Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
   - Run exactly ONE orchestrator at a time — never two of 5.0/5.1/5.2 (double-arm).
 
 Current version: Orchestrator5.2.py.  5.1 and 5.0 are frozen predecessors.
-NOTE: 5.2 has been extended IN PLACE five times since 2026-07-20 (keyword-leg
+NOTE: 5.2 has been extended IN PLACE eight times since 2026-07-20 (keyword-leg
 replacement 07-28, FLANG third leg 07-29, Trigger column 07-29, OR->AND gate retune
-08-01, earnings branch 08-02, three solo branches 08-03).  There is no 5.3 — the dated
-sections below are the only record of which gate/schema a given day's TSV was written
-with, and from 08-02 the gate changes no longer change the schema at all.
+08-01, earnings branch 08-02, three solo branches 08-03, gate externalized to
+orchestrator_trigger_rules.txt 08-07, class-whitelist precondition 08-17).  There is
+no 5.3 — the dated sections below are the only record of which gate/schema a given
+day's TSV was written with, and from 08-02 the gate changes no longer change the
+schema at all.
+
+!! FROM 2026-08-07 THE GATE IS NOT IN THE PYTHON.  Rules live in
+   orchestrator5/orchestrator_trigger_rules.txt, one rule per line, read ONCE at
+   startup.  The dated sections below remain the CALIBRATION record — why each cut is
+   what it is — but they no longer describe where it lives.  For the gate a given
+   process actually ran, read its [Gate] ACTIVE block in logs/.
+
+!! FROM 2026-08-17 THE GATE IS NOT A FLAT OR.  A `REQUIRE <Name>: ...` line is a
+   PRECONDITION, AND-ed over the whole gate, so
+       gate = (every REQUIRE line holds) AND (any ordinary rule fires)
+   One ships (ClassWhitelist).  Two consequences for anyone reading old tooling:
+   a Trigger cell verdict of `NO` no longer implies every group reads `:NO`, and a
+   REQUIRE condition FAILS CLOSED — a dead scorer behind one stops ALL trading.
 
 
 --------------------------------------------------------------------------------
@@ -427,7 +442,9 @@ Verified:
 
 
 ================================================================================
-2026-08-03 — THREE SOLO LEGS, each firing ALONE                       [CURRENT]
+2026-08-03 — THREE SOLO LEGS, each firing ALONE
+   [the legs are unchanged, but from 2026-08-07 they live in
+    orchestrator_trigger_rules.txt, not in the constants named below]
 ================================================================================
 WHAT: three MORE branches beside the 2026-08-01 five-way AND and the 2026-08-02
   earnings leg.  Each is a SINGLE condition and fires the trade unaided:
@@ -579,3 +596,498 @@ Verified:
   !! NOT verified by a live run: an Orchestrator5.2.py started 2026-08-02 was
      RUNNING at the time of this edit and holds the OLD gate in memory.  It must be
      restarted for these branches to take effect, and only ONE instance may run.
+
+================================================================================
+2026-08-07 — GATE EXTERNALIZED: orchestrator_trigger_rules.txt
+================================================================================
+WHAT: the trade gate is no longer in the Python.  All NINE threshold constants
+  (SENTIMENT_POSITIVE_MIN, FMB_INDECISIVE_MAX, KW15_BODY_MIN, KW15_HEAD_MIN,
+  FLANG_SCORE_MIN, EARN_SCORE_MIN, KW15_BODY_SOLO_MIN, FLANG_SOLO_MIN,
+  SENTIMENT_POSITIVE_SOLO_MIN) and the hand-written five-branch boolean are
+  DELETED.  Rules now live in a text file beside the script, ONE RULE PER LINE:
+
+      <RuleName>: <field> <op> <value> AND <field> <op> <value> AND ...
+
+  Rules are OR-ed, conditions within a rule AND-ed.  The shipped file reproduces
+  the 2026-08-03 gate exactly:
+
+      CORE:        FinBERT_positive >= 0.8 AND FMB_indecisive <= 0.14 AND
+                   kw15_body >= 0.50 AND kw15_head >= 0.50 AND FLANG_score >= 0.96
+      EARNINGS:    FineClass == Earnings_Results AND EarningScore >= 4 AND
+                   kw15_body >= 0.50
+      KwBodySolo:  kw15_body >= 0.70
+      FLANGSolo:   FLANG_score >= 0.975
+      FinBERTSolo: FinBERT_positive >= 0.935
+
+WHY: the gate changed SIX times in three weeks (07-20, 07-28, 07-29, 08-01,
+  08-02, 08-03), every one a Python edit to a live trading process.  Retuning was
+  a nine-constant edit; adding a branch meant touching a leg alias, the `fired`
+  list, the is_ok OR-chain, the missing_blocked terms and the _cond_token render
+  list — five places kept consistent BY HAND.  Now: edit the file, restart.
+
+MEASURED EFFECT ON LIVE TAPE (tables/news_output_2026-08-03..08-07, 390 rows,
+  42-col, replayed through the OLD constants and the NEW rules file):
+
+      check                                    result
+      is_ok agreement                          390 / 390   (100%)
+      fires                                     41 (10.5%)  identical
+      fired rule names on firing rows           41 / 41
+      missing_blocked agreement                390 / 390
+      Trigger cell round-trip                  390 / 390
+
+  The baseline was captured by an INDEPENDENT reimplementation of the five
+  branches run BEFORE the refactor touched the file, not by importing the code
+  under test.
+
+THREE BEHAVIOUR CHANGES, all deliberate:
+  1. Trigger cell is RULE-GROUPED, was a flat token list:
+        NO | CORE:NO[FinBERT_positive:PASS(0.9100>=0.80)
+             FMB_indecisive:FAIL(0.2000>0.14) ...] EARNINGS:NO[...] ...
+     Token names are now the rules-file field names (FinBERT_positive, not
+     FinBERT), which removes a real ambiguity — the old FinBERT:/FLANG: tokens
+     never said WHICH score they meant — and lets a token be pasted back into a
+     rule.  EVERY rule prints on EVERY row, including rows that fired, so the TSV
+     stays a complete offline replay input.
+     !! The token-count build marker (5 = 08-01, 7 = 08-02, 10 = 08-03) is DEAD.
+        Presence of '[' identifies this build.  Every parser written for the flat
+        format breaks; unavoidable once the cell says which rule a condition
+        belongs to.
+  2. ClerkSentiment names RULES, not legs.  Keyword / FinBERT_FMB / FLANG named
+     sub-parts INSIDE the CORE branch, so Keyword_FLANG_FLANGSolo and
+     FLANG_FLANGSolo both now read FLANGSolo.  Measured collapse on the 390 rows:
+     BAD 349, FLANGSolo 19, KwBodySolo 10, EARNINGS 5, CORE_FLANGSolo 3,
+     CORE_FLANGSolo_FinBERTSolo 2, FinBERTSolo 1, FLANGSolo_FinBERTSolo 1.
+     Nothing is lost — the detail moved to Trigger.  The wire is unchanged
+     (OK/BAD).  The vocabulary is now the OPERATOR's: rule names come from the
+     file, which is why the parser rejects '_' in a rule name.
+  3. missing_blocked is ONE generalized expression (a rule is blocked-by-missing
+     when every EVALUABLE condition passed and >=1 alarming field was None),
+     replacing three hand-written terms.  Exact for CORE and for the solo legs.
+     A STRICT SUPERSET for EARNINGS: a dead PR classifier (FineClass None) with a
+     passing kw15_body now warns, where the old `c_class and ...` made it silent.
+     Cost measured: 0 extra warnings on the 390-row 08-03..08-07 tape (FineClass
+     is never blank there); 25 of 138 on the 39-col 07-29..08-02 tape, where
+     FineClass is absent by design.  Feeds a WARNING only, never trading.
+
+WIDER, not just externalized: rules can now read 27 fields, up from the 7 the old
+  gate consulted — every output of all three headline models, both kw pipelines,
+  the classifier/scorer, AND per-ticker row fields (Float, MktCap, LastDailyClose,
+  itiBaseline, tradeSizeBaseline, Exchange, Symbol, TickerCount).  Rules like
+  "kw15_body >= 0.60 AND Float <= 20" were not expressible before.  Row fields
+  deliberately do NOT arm the dead-scorer alarm: a symbol missing from the
+  universe TSV is a universe gap, not a broken model.
+
+Implementation:
+  - _FieldSpec / _Cond / _Rule NamedTuples; _TRIGGER_FIELDS is the single field
+    table (adding a field is one row — the Trigger cell prints the same name, so
+    there is no second table to update).
+  - Parsed ONCE at startup into _trigger_rules; per row the gate does one
+    extraction pass over the DISTINCT fields any rule reads (7 today), then a dict
+    lookup plus a pre-resolved operator callable per condition.  No parsing, no
+    string dispatch and no threshold formatting on the trade-critical path
+    (_fmt_thr now runs at parse time only, cached in _Cond.thr_str).
+  - NO eval().  Whitelisted field table + an operator-module dict; _OPS and
+    _OP_NEG share a key set so a new operator missing from one is a load-time
+    KeyError, never a wrong Trigger cell.
+  - Loaded BEFORE any model pre-warm: the rules file is the artifact a human
+    edits, so failing on it must not cost 30 s of ONNX loading at 06:00.
+  - EarningScore keeps its NA verdict via a general _FieldSpec.na_when predicate,
+    not a special case in the gate loop.  81% of rows (315/390) rely on it.
+  - EARN_CLASS SURVIVES as a Python constant: it is a SCORING-path decision (the
+    ~85% early-exit in _classify_and_score_earnings, and the startup smoke) and
+    must keep working even if the rules file never mentions Earnings_Results.
+  - Row fields resolved once into row_vals at step 2c of _collect_and_log, before
+    the gate; completed_dict reads from that dict.  6 _iti_df_lock acquisitions
+    per row before, 6 after — no double lookup.
+  - NEW: `Orchestrator5.2.py --check-rules` parses + echoes the gate and exits
+    (~1 s, no models, no sockets).  Given the refuse-to-start policy this is the
+    mitigation that stops a typo becoming a trading outage.
+  - [Gate] ACTIVE is now data-driven and rebuilt FROM THE COMPILED CONDITIONS, so
+    a parse that differs from what the human meant is visible in logs/.  It also
+    prints which model feeds which rule, and WARNs when a model is scored on every
+    PR but NO rule reads it.
+  - The two model smoke lines no longer quote thresholds — they are model checks.
+
+ERROR POLICY: a missing, empty or malformed rules file is a HARD FAIL
+  (RuntimeError, refusing to start) with a `file:line:` message.  NO fallback gate
+  and NO skip-the-bad-line, deliberately: a fallback means a typo silently trades
+  a gate nobody wrote, and a skipped line silently narrows the gate while the tape
+  still looks alive.  Unknown fields get difflib suggestions plus a hard alias map
+  for the five TSV-column names a human is likely to copy (kw15_body_proba,
+  kw15_head_proba, FLANG_sentiment_score, positive, sentiment_score).
+
+TSV: NO schema change — still 42 columns, same header, same order.  Only the
+  CONTENT of the Trigger and ClerkSentiment cells changes, so no file rotates.
+  !! This means 42 columns now spans the 08-02 gate, the 08-03 gate AND every
+     rules-file gate from here on.  The Trigger cell distinguishes them.
+
+Verified:
+  - Equivalence replay, 390 rows, all five checks above (scratch scripts
+    gate_baseline.py / gate_replay.py; baseline captured pre-refactor).
+  - 49 synthetic parser/renderer checks: all 20 parse errors refuse to start with
+    the right message; both WARNINGs let startup proceed; golden Trigger token
+    strings; MISSING vs NA vs the widened alarm; case-insensitive string compare;
+    row fields addressable and not alarm-arming.  These paths are NOT reachable
+    from the replay corpus — it has 0 rows with a None core score and 0 blank
+    FineClass — so they had to be synthetic.
+  - `--check-rules` exit 0, echoing all five rules with every threshold rendered
+    correctly (0.80 / 0.14 / 0.50 / 0.50 / 0.96 / 4 / 0.70 / 0.975 / 0.935).
+  !! NOT verified by a live run: an Orchestrator5.2.py started 2026-08-03 20:52
+     was RUNNING at the time of this edit, with clerk-1.2.py attached to the LIVE
+     Gateway (port 4001).  It holds the OLD in-memory gate and is unaffected by
+     these file edits.  It must be restarted to pick up the rules file, and only
+     ONE instance may ever run.  Run --check-rules first.
+
+================================================================================
+2026-08-09 — UNIFIED SENTIMENT COLUMN NAMING (pure rename, no behaviour change)
+================================================================================
+Every sentiment score in the repo now spells itself the same way, whether it was
+produced by a standalone headliner, by the offline batch scorers, or live by
+O5.2:
+
+    {Model}_{channel}_{hd|bd}        e.g.  FLANG_pos_hd   LouMcD_smod_bd
+
+  hd = the model scored the HEADLINE, bd = the BODY.
+  Channels: pos neu neg ss lab ms  (FinMarBa uses `ind` in place of `neu`;
+  LouMcD adds unc lit smod wmod cons).
+  Model tokens: Prosus FinMarBa FLANG FLElectra RoBERTa ModernB DeBERTa FinTone
+  FinancialB DistilRo TradeHero LouMcD  — hyphen-free, so a column is a legal
+  pandas attribute.
+
+This is the INVERSE of the 08-07 refactor: that one changed the gate and touched
+no column; this one changes every column name and touches no gate.
+
+WHAT THIS FIXED
+  - ProsusAI FinBERT's five columns were UNPREFIXED in the daily TSV (`positive`,
+    `negative`, `neutral`, `sentiment_score`, `label`) — generic names that could
+    not coexist with any other model's.
+  - Three vocabularies for one score: offline head `FLANG-BERT_positive`, offline
+    body `FLANG-BERT_Body_positive` (an INFIX), live `FLANG_sentiment_score`.
+  - `_TSV_ALIASES` existed only to translate between O5.2's own TSV spelling and
+    its own rules-file spelling. Those are now one vocabulary; the table is gone,
+    replaced by `_LEGACY_FIELD_NAMES` which maps PRE-08-09 names to their
+    replacement so an old rule pasted into the file gets a precise error.
+  - The headliners disagreed on their timing key: 7 returned `elapsed_ms`, 4
+    `inference_ms`. Both are now `ms`, which deleted the `setdefault` hack in
+    HeadScore11encoders and the two-key lookup in verify_headliners.
+  - `FLANG_time` (a completion STAMP) and `FLANG_ms` (a DURATION) were named as
+    if the same kind of thing. Now `_at_hd` vs `_ms_hd` throughout.
+
+WHAT DELIBERATELY DID NOT CHANGE
+  - Thresholds. All five rules keep their exact cuts (0.8 / 0.14 / 0.50 / 0.50 /
+    0.96 / 4 / 0.70 / 0.975 / 0.935).
+  - Column COUNT: still 42 live, still 70 per offline block.
+  - Cell VALUES, including `lab` — LABEL_ORDER and the headliners' internal
+    `scores` dicts keep their full words, because the label's VALUE is one of
+    those words. Only the public return dict was renamed.
+  - The four frozen predecessors (O5.0, O5.1, O4.0, O4.2) keep their own TSV
+    schemas. Only their FinBERT read boundary was adapted, so they still run and
+    still reproduce the backtests they exist for.
+
+VERIFIED
+  - Numeric equivalence: 8 golden probes x 12 models = 96 results scored with the
+    new keys, mapped back to the old names, every value byte-identical to the
+    pre-rename goldens. Only THEN was verify_goldens.txt re-baselined; the fresh
+    goldens then verify clean (11/11 PASS, max_drift 0.0000).
+  - Gate equivalence: 391 rows of tables/news_output_2026-08-03..09 replayed
+    through the renamed gate — is_ok, fired-rule label and missing_blocked
+    identical on 391/391 (42 fires, 10.74%).
+  - --check-rules exit 0, all 5 rules echoed with the new field names.
+  - HeadScore11encoders + BodyScore11encoders re-run end-to-end: 42 -> 112 -> 182
+    columns, correct _hd/_bd suffixes, label values still full words.
+  - rename_encoder_cols.py migrated a live tape (22 cols) and an offline
+    head+body corpus (160 cols); header of the migrated tape equals _TSV_COLUMNS
+    EXACTLY, data rows byte-identical, second run a no-op.
+  - head_vs_body.py pairs 48 head/body columns across all 11 encoders on a
+    migrated corpus (the _Body_ infix -> _bd suffix change).
+  - py_compile clean across all ~30 touched files.
+
+MIGRATION
+  tools/Encoder_Models/rename_encoder_cols.py rewrites the HEADER LINE ONLY (no
+  value changed, so re-scoring would be waste). Idempotent; refuses a file whose
+  header matches neither vocabulary.
+  !! Column count is IDENTICAL before and after, so a half-migrated file cannot
+     be detected by arity — only by name. That refusal is the guard.
+  !! Do not migrate today's tables/news_output_*.tsv while O5.2 is running: it
+     appends under a header-equality check and would rotate the file.
+
+!! NOT verified by a live run. A running O5.2 keeps its old in-memory gate AND
+   its old column names until restarted. Restart it (only ONE instance ever) and
+   run --check-rules first.
+
+================================================================================
+2026-08-12 — DUPLICATE-PR DOUBLE-ARM FIXED (dedup key + clerk one-session guard)
+================================================================================
+THE INCIDENT
+  Four PRs arrived twice on the firehose and THREE fired the gate twice, each
+  opening two independent clerk sessions on the SAME ticker:
+
+    NEXR  nGNX2c9Cf7 [NEXR,NEXRW]  vs nGNEbx8McJ [NEXR]        0.13s  clients 1014+1015
+    BBLG  nGNE5HFCsP [BBLG]        vs nGNX7K93rf [BBLG,BBLGW]  1.52s  clients 1018+1003
+    FABC  nGNX7vpn9Y [FABC,KOPN]   vs nGNEb3mh9t [FABC]        0.12s  fired twice
+    EXYN  nGNE7k2hnr [EXYN]        vs nGNX5J49w4 [EXYN,EXYNW]  0.09s  gate BAD, still double-armed
+
+  Both NEXR sessions filled and stopped out independently — 2x size, 2x
+  commission, two ladders competing on the exit.
+
+WHY NOTHING CAUGHT IT
+  - ID dedup: misses by design (RTPR re-publishes under a NEW ID — that is the
+    whole reason content dedup exists: PRZO 07-06, FOFO 07-07).
+  - Content dedup: THE ROOT CAUSE. Key was
+        (' '.join(headline.lower().split()), tuple(sorted(tickers)))
+    The headline half matched perfectly all four times. The TICKER half differed
+    EVERY time: the re-publish adds or drops the warrant (NEXRW/BBLGW/EXYNW) or
+    a co-mentioned partner (KOPN). Different tuple -> different key -> not a dup.
+  - Ticker-count <= 2: [NEXR,NEXRW] is exactly 2. No help.
+  - The gate: worked correctly. Both copies scored identically and both
+    legitimately fired. A gate is not supposed to know about duplicates.
+  - The clerk: had NO per-symbol guard of any kind. handle_trigger never
+    consulted _sessions; it popped the next free warm client and said accepted.
+    Nothing downstream helps either — each session has its own clientId, and
+    x-wing tracks position from its OWN fills only (no reqPositions), so
+    session B starts at position 0 and enters on its own.
+
+  NOT a one-off: 07-02..08-12 the tape holds 48 re-published articles on 26 of
+  39 days. The old key caught 11 of them (the ones whose ticker lists happened
+  to match); 37 got through.
+
+THE FIX — two independent layers
+  (1) Orchestrator5.2.py — content-dedup key is now PER TICKER,
+      (normalized headline, ticker), one entry per ticker instead of one per
+      article. A re-publish collapses because the ticker that matters is in both
+      copies. Partial overlap keeps the un-handled tickers only (FABC dropped,
+      KOPN kept), EXCEPT when nothing in-universe survives — the common shape
+      where the second copy is the one carrying the warrant — which is dropped
+      whole so the all-out-of-universe fallback cannot write a junk warrant-only
+      row into the calibration corpus. Guarded on `dupes`, so a genuinely new
+      article keeps the old behaviour exactly, fallback row included.
+      CONTENT_DEDUP_MAX_KEYS 10_000 -> 20_000 (up to 2 keys/article now).
+      Position in the sequence is UNCHANGED: still after the ticker-count filter
+      (an article naming > 2 tickers is spam whatever the dedup state) and
+      before the NW4 excluded-string filter.
+  (2) clerk-1.2.py — handle_trigger REJECTS an arm for a symbol that already has
+      a live session: {"status":"rejected","reason":"already_armed"}, logged at
+      WARNING with the incumbent's clientId. O5.2 needs no change to consume it
+      — it already maps any non-accepted reply to ClerkSentiment
+      'skipped:arm_rejected', and still writes the row with its full Trigger
+      cell, so the duplicate stays auditable offline.
+      The check is a check-and-CLAIM under _sessions_lock via a new _arming set,
+      not a bare `in self._sessions` read: handle_trigger runs on a thread per
+      connection and the real duplicates land ~90 ms apart, well inside the
+      acquire+construct window.
+      !! COMPANION FIX, NOT OPTIONAL: the session_start_failed path called
+         register_session and returned WITHOUT unregistering. Harmless before;
+         with the guard it would block that symbol for the life of the process.
+  (3) clerk-1.2.py — unregister_session(session) is now IDENTITY-CHECKED, popping
+      only when the stored session IS the one finishing. Popping by symbol let
+      the first of two same-symbol sessions delete the second's routing entry,
+      after which a live session was unreachable and a late Sentiment for it fell
+      through to 'sentiment_ignored'. (2) should make two live sessions
+      impossible; this keeps the registry correct regardless.
+
+VERIFIED
+  - Tape replay, all 39 daily TSVs 07-02..08-12 regrouped into articles by ID:
+    new key drops 48, old key dropped 11, and ZERO regressions (nothing the old
+    key caught is missed). Every one of the 48 is a second copy of an identical
+    headline — no false positives. On 08-12 exactly the four second-copies drop
+    and nothing else.
+  - Clerk guard, real methods bound to a stub (no Gateway, no socket, live clerk
+    untouched): 12/12 checks — second arm rejected already_armed; rejected
+    BEFORE consuming a warm client; claim released on every path so a failed arm
+    never blocks the symbol; re-arm allowed after the session is released; the
+    identity-checked unregister leaves a second live session intact.
+  - Concurrency: two arms 90 ms apart racing a 300 ms acquire, 20/20 trials
+    exactly one claimed and one rejected — no double-claim leak.
+  - --check-rules exit 0, same 5 rules. Neither change goes near
+    _evaluate_trigger, _TRIGGER_FIELDS or the rules file; TSV still 42 cols.
+  - py_compile clean on both files.
+
+KNOWN-LATENT, deliberately NOT fixed (they collide only when two sessions share
+a symbol, which the guard now prevents):
+  - PendingStore.upsert/remove are keyed by symbol alone.
+  - Per-session file paths are symbol + second-resolution timestamp, so two arms
+    in the same second share them. On 08-12 both NEXR moles wrote the same
+    trade-mole-table_NEXR_2026-08-12_07-58-00.csv (the second overwrote the
+    first) and shared one T47 TSV.
+
+SEPARATE ISSUE, out of scope — TICKER-RENAME TWINS. The replay surfaced two
+  articles (08-04, 08-06) publishing one PR under both VTAK and SOAR. The new key
+  handles them as well as it can (VTAK dedups, SOAR proceeds), but two DIFFERENT
+  tickers for the same company can still both arm, and the clerk guard is
+  per-symbol so it cannot see that either.
+
+!! NOT verified by a live run. Both processes read this at startup: a running
+   O5.2 keeps its old dedup and a running clerk-1.2 its old arm handler until
+   restarted. Restart the clerk first, then O5.2 (only ONE instance ever), and
+   run --check-rules before the O5.2 restart.
+
+================================================================================
+2026-08-17 — CLASS WHITELIST: a REQUIRE precondition gates every rule  [CURRENT]
+================================================================================
+WHAT: a new RULE KIND in orchestrator_trigger_rules.txt.  A line prefixed
+  `REQUIRE ` is a PRECONDITION: it never fires anything, it only permits, and
+  every one of them is AND-ed over the whole gate.  So the gate is no longer a
+  flat OR:
+
+      gate = (every REQUIRE line holds) AND (any ordinary rule fires)
+
+  One REQUIRE line ships, first in ACTIVE RULES:
+
+      REQUIRE ClassWhitelist: FineClass in MA, Partnership, Regain_Compliance,
+              Clinical_Data, Contract_Award, Patent_IP, Earnings_Results
+
+  (one physical line in the file).  CORE / EARNINGS / KwBodySolo / FLANGSolo /
+  FinBERTSolo are UNCHANGED, character for character — they are simply now
+  conditional on the catalyst class.
+
+  Second new feature, needed to express it: the `in` / `not in` OPERATOR on
+  string fields, taking a comma-separated list (braces optional on input, always
+  printed on output).  The DSL has no OR inside a line, so without `in` a
+  7-class whitelist would have been 7 rules per branch = 35 lines.
+
+WHY: every cut in the gate reads a SENTIMENT score; none reads the catalyst
+  TYPE.  A confidently-positive headline therefore fires whether the PR is an
+  acquisition or a share offering, and the false positives concentrate in the
+  classes that barely move.  From
+  ../price_stats_loader/outputs/08_class_trading_value.md, honest window:
+  `Other` 18.8% / `Product_Launch` 8.3% / `Offering_Financing` 10.0% /
+  `Clinical_Update` 0% against `Partnership` 46.2% and `MA` 32.1%.
+
+  ⚠ A class VETO was measured first and rejected: dropping the six worst classes
+  moves precision 22.0% -> 22.6%, because the sentiment cuts already almost never
+  fire there (8 fires total across all six).  Only a WHITELIST moves the number,
+  and that is what this is.
+
+MEASURED EFFECT (replay_gate.py over 07_PRstats_2026-05-04-2026-08-13_gateReplay
+  .tsv, 4376 rows; the REAL _evaluate_trigger, not a reimplementation):
+
+  FULL corpus:  349 -> 237 fires (-112, -32%).  Lost, by class:
+    Other 30, Product_Launch 28, Offering_Financing 16, Clinical_Update 11,
+    Crypto_Treasury 9, Business_Update 9, Management_Change 5, FDA_Approval 1,
+    Deficiency_Notice 1, Buyback_Dividend 1, Earnings_Date 1.
+
+  HONEST window (ArrivalDate >= 2026-06-20, 1710 rows, base rate 8.71%):
+                    fires   TP   FP    precision   lift   trades/day
+    before            177   38  139        21.5%  2.46x          3.3
+    with whitelist    119   32   87        26.9%  3.09x          2.2
+  i.e. 52 of 139 false positives removed (37%) for 6 of 38 true positives lost
+  (16%), staying above the operator's >=2 trades/day floor.  (trades/day is
+  ratio-anchored to the live 3.3/day as in 08_class_trading_value.md; the raw
+  per-day figures over the window's 41 days are 4.3 -> 2.9.)
+  Per-rule fires, full corpus: CORE 70->43, EARNINGS 80->80 (Earnings_Results is
+  whitelisted, so it is untouched), KwBodySolo 75->55, FLANGSolo 187->100,
+  FinBERTSolo 41->30.
+
+  ⚠ n=32 TPs.  And EARNINGS is now 80 of 237 fires (34%) while being the ONE
+    branch this corpus cannot replay faithfully — the 400-word Body cap corrupts
+    EarningScore on 42/70 earnings rows.  The weakest measurement in the corpus
+    now carries a third of the gate.
+
+BEHAVIOUR CHANGES (three, all in the Trigger cell; the wire is untouched):
+  1. A REQUIRE group prints ALLOW / BLOCK, not YES / NO.  `grep -c ':BLOCK\['
+     tables/news_output_*.tsv` counts blocked rows.
+  2. ⚠ A `:YES` GROUP NO LONGER IMPLIES THE ROW FIRED.  Until today a cell
+     starting `NO |` meant every group read `:NO`.  Now an ordinary rule can hold
+     while a precondition blocks the gate, so
+     `NO | ClassWhitelist:BLOCK[...] CORE:YES[...]` is a normal, correct cell.
+     Read the LEADING verdict for what the row did.  Anything counting fires by
+     grepping `:YES` is now wrong.
+  3. Set membership renders with ∈ / ∉ and the WHOLE list, never truncated:
+     `FineClass:PASS(MA∈{MA,Partnership,...})`,
+     `FineClass:FAIL(Offering_Financing∉{MA,...})`.  ~+148 chars on a cell that
+     measured ~497 average.
+  The `if is_ok else 'BAD'` guard on `label` is LOAD-BEARING again (it was merely
+  defensive from 08-07 to today): a blocked row has a NON-EMPTY `fired` and
+  is_ok False, and without the guard ClerkSentiment would read `CORE_FLANGSolo`
+  on a row that never traded.  The comment there predicted this exact day.
+
+FAIL CLOSED, and what it costs: a None FineClass (dead PR classifier) fails the
+  precondition like any other None, which closes the WHOLE gate rather than one
+  branch.  Nothing trades, and the existing BLOCKED-BY-MISSING-SCORE-ONLY WARNING
+  fires on EVERY row until it is fixed — no new alarm code, it falls out of the
+  generalized 08-07 expression.  ⚠ THE PR CLASSIFIER IS NOW A SINGLE POINT OF
+  FAILURE FOR THE ENTIRE GATE, and that WARNING is the only thing distinguishing
+  "trading has stopped" from "a quiet news day".  Grep logs/ for it.
+
+COMPANION BUG FIX, required by the above: _classify_and_score_earnings returned
+  the all-None dict — INCLUDING FineClass — on ANY exception, including one
+  raised by earn_extract_metrics/earn_score_metrics long after classification had
+  already succeeded.  Its own docstring promised "a dead earnings scorer costs
+  the new trades but never blocks the old ones"; fail-closed made that sentence
+  false, since a scorer crash would have wiped the class and blocked a row CORE
+  would have traded.  `fine` is now pre-bound to None and returned from the
+  except, so a crashed scorer costs the earnings branch and nothing else.  A
+  future TIMEOUT still yields None, correctly — that genuinely has no class.
+
+Implementation (Orchestrator5.2.py):
+  - _op_in / _op_not_in: thin wrappers, because operator.contains(a,b) is `b in
+    a` — reversed from every other _OPS entry.  Wrapping keeps _cond_true a
+    single uniform cond.fn(lhs, cond.rhs) call with NO per-operator branch on the
+    trade-critical path, so `in` costs nothing there.  Still no eval(): the
+    operator is looked up in a closed whitelist keyed by literal text and bound
+    once at parse time; that guarantee never rested on the callables being
+    `operator` builtins.
+  - _OP_CELL, a THIRD table beside _OPS/_OP_NEG: `in`/`not in` are WORDS and a
+    Trigger token must not contain a space, hence ∈/∉.  All three key sets are
+    now checked at IMPORT time with a `raise` (not an assert — python -O strips
+    those), upgrading what was a comment-only promise since 08-07.
+  - _Cond.rhs for a list is a frozenset of lowercased values; thr_str is built
+    from the ORDERED, AS-TYPED items and never from the frozenset, whose
+    iteration order varies with PYTHONHASHSEED — that would have made
+    --check-rules print a different gate on every run.
+  - _Rule gains `kind`, LAST and defaulted, so 4-positional construction still
+    works.  _RULE_VERDICT maps kind -> the group's verdict words.
+  - _parse_in_list hard-errors on EVERY degenerate list: empty, empty element
+    (doubled/trailing comma), duplicate value (case-insensitively), and an
+    element CONTAINING A SPACE.  That last one matters most: `in MA Partnership,
+    Patent_IP` would otherwise compile to a set holding "ma partnership", match
+    nothing, and silently narrow the gate — the exact failure this file's
+    no-partial-parse policy exists to stop.
+  - `not in` is the only two-word operator and chunk.split(None,2) cannot see it,
+    so it is glued back BEFORE _OPS is consulted (otherwise difflib helpfully
+    suggests `!=` for `not`).
+  - _REQUIRE_PREFIX_RE is `^REQUIRE(?:\s+|$)`, stripped BEFORE the ':' partition
+    so every name check downstream is untouched and applies identically to
+    REQUIRE names.  `REQUIRE:` with no space is NOT a prefix — `require` is now
+    reserved, so it errors instead of parsing as a rule that merely looks like a
+    precondition.  `REQUIREMENT:` still parses as an ordinary rule.
+  - _log_active_gate prints REQUIRE lines first and marks them in the per-source
+    "feeds rule(s)" line.  With no REQUIRE loaded its output is BYTE-IDENTICAL to
+    the pre-08-17 one, deliberately — that is what makes the neutrality proof a
+    literal diff.
+  - rule.text needed no change and now round-trips: it renders
+    `FineClass in {MA,Partnership,...}`, which is valid parser input.
+
+ERROR POLICY unchanged, plus one new hard-fail class: a file with ONLY REQUIRE
+  lines ("it permits, it never fires — the gate needs at least one ordinary
+  line").  Still no fallback gate and no skip-the-bad-line.
+
+TSV: NO schema change — still 42 columns, same header, same order.  Only the
+  Trigger CELL changes (a new leading group + the ∈/∉ glyph).  As of 08-02 the
+  header does not identify a gate at all; an ALLOW/BLOCK group verdict is what
+  identifies this build, and for a running process the [Gate] ACTIVE block in
+  logs/ remains the only authority.
+
+Verified:
+  - NEUTRALITY, proved BEFORE the rule was added: with every Python edit in place
+    and no REQUIRE line in the file, all 4376 corpus rows replay BYTE-IDENTICAL
+    on is_ok, label, the FULL detail cell (every token, every threshold) and
+    missing_blocked; the 457-row live tape (08-11..08-17) likewise, reproducing
+    the same 5 pre-existing 08-11 disagreements (those rows were written by a
+    process still holding the pre-08-11 gate); and --check-rules echoes
+    byte-identically.  Re-confirmed after a late parser fix.
+  - 60 synthetic checks for what the corpus cannot reach (0 of 4376 rows have a
+    blank FineClass): in/not-in parsing and case-folding, every reject message,
+    REQUIRE parsing incl. collisions and the only-REQUIRE file, ALLOW/BLOCK
+    rendering, every token well-formed and space-free, the echo round-trip, the
+    key-set guard, and the gate semantics — CORE:YES inside a NO cell, label
+    'BAD' anyway, and None FineClass -> is_ok False + missing_blocked True.
+  - LEAK TEST on the whitelist run: 0 of 237 fires carry a class outside the
+    seven, and 0 rows went from blocked to firing.
+  - --check-rules exit 0 on the shipped file.
+
+!! NOT verified by a live run.  Rules are read at STARTUP: a running O5.2 keeps
+   the old gate until restarted.  Run --check-rules, then restart (ONE instance
+   only), then confirm the [Gate] ACTIVE block in logs/ shows the REQUIRE line.
+   replay_gate.py's --verify-since default was bumped to 2026-08-18 accordingly;
+   until the first post-restart trading day that window is legitimately empty.

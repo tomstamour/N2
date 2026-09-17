@@ -368,7 +368,8 @@ def fetch_freq(ib: IB, symbol: str, days: list, delay_ms: int) -> tuple:
 async def fetch_freq_async(ib: IB, symbol: str, days: list, sem: asyncio.Semaphore,
                            timeout: int = 30, retries: int = 2,
                            bar_size: str = _FREQ_BAR_SIZE,
-                           contract: Optional[Stock] = None) -> tuple:
+                           contract: Optional[Stock] = None,
+                           end_datetime: str = "") -> tuple:
     """Async sibling of fetch_freq for concurrent batch fetching.
 
     `sem` bounds the number of in-flight requests. A failed qualifyContracts is
@@ -381,6 +382,15 @@ async def fetch_freq_async(ib: IB, symbol: str, days: list, sem: asyncio.Semapho
     If a pre-qualified `contract` is supplied (e.g. from an earlier
     `fetch_last_rth_close_async` call in the same run), the qualify round-trip
     is skipped — this roughly halves the per-symbol IBKR cost.
+
+    `end_datetime` is passed straight through to reqHistoricalDataAsync:
+    "" (the default) means "now", which is what the nightly pipeline wants.
+    An IBKR-format timestamp ("YYYYMMDD HH:MM:SS US/Eastern") anchors the
+    request on a past session instead — that is the single knob
+    trade_frequency_and_size_backfill_AddON.py needs, and the reason it can
+    reuse this function verbatim rather than re-typing the request parameters.
+    Anchor it at or after 20:00 ET so the whole ETH session is inside the
+    window; the backfill's `end_datetime_str` does that in ET, not UTC.
 
     Returns (rth_iti_avg, eth_iti_avg, rth_volPerTrade, eth_volPerTrade);
     any element may be float('nan') on error.
@@ -415,7 +425,7 @@ async def fetch_freq_async(ib: IB, symbol: str, days: list, sem: asyncio.Semapho
             try:
                 bars = await ib.reqHistoricalDataAsync(
                     contract,
-                    endDateTime="",
+                    endDateTime=end_datetime,
                     durationStr=f"{n_cal} D",
                     barSizeSetting=bar_size,
                     whatToShow="TRADES",

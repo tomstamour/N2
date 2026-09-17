@@ -21,9 +21,9 @@ Library usage:
     from RoBERTa_headliner import score_headline
 
     result = score_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.49, "neutral": 0.30,
-    #  "negative": 0.21, "sentiment_score": 0.28, "label": "positive",
-    #  "elapsed_ms": 42.1}
+    # {"headline": "...", "pos": 0.49, "neu": 0.30,
+    #  "neg": 0.21, "ss": 0.28, "lab": "positive",
+    #  "ms": 42.1}
 """
 
 import argparse
@@ -255,26 +255,30 @@ def score_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     Returns:
         {
             "headline":        str,
-            "positive":        float,
-            "neutral":         float,
-            "negative":        float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax of the three classes
-            "elapsed_ms":      float,   # tokenize + forward wall time
+            "pos":             float,
+            "neu":             float,
+            "neg":             float,
+            "ss":              float,   # positive - negative
+            "lab":             str,     # argmax of the three classes
+            "ms":              float,   # tokenize + forward wall time
         }
     """
     load_model(model_dir)
 
     scores = _inferencer.predict(headline)
     label = max(_inferencer.label_order, key=lambda k: scores[k])
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). Only the
+    # OUTPUT keys are short; LABEL_ORDER and the internal `scores` dict keep their
+    # full words, because `label` is one of those words and renaming them would
+    # change the VALUE, not just the key.
     return {
-        "headline":        headline,
-        "positive":        scores["positive"],
-        "neutral":         scores["neutral"],
-        "negative":        scores["negative"],
-        "sentiment_score": scores["sentiment_score"],
-        "label":           label,
-        "elapsed_ms":      scores["elapsed_ms"],
+        "headline": headline,
+        "pos":      scores["positive"],
+        "neu":      scores["neutral"],
+        "neg":      scores["negative"],
+        "ss":       scores["sentiment_score"],
+        "lab":      label,
+        "ms":       scores["elapsed_ms"],
     }
 
 

@@ -6,7 +6,7 @@ Two views, because one is not enough:
   ABSOLUTE cutoffs  — the live-trigger view. What you get if you wire
                       `col >= 0.8` into a gate. Directly comparable to
                       false_positive_count.py. Meaningless across columns whose
-                      distributions differ wildly (FinMarBa_indecisive has
+                      distributions differ wildly (FinMarBa_ind_hd has
                       median 0.186; FLANG-ELECTRA_positive is saturated near 1).
 
   TOP-k% selection  — the ranking view. Take the k% of rows a column scores
@@ -27,22 +27,22 @@ F = ("outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_"
 BLANK = ("", "nan", "NaN")
 
 # (column, invert) — best channel per model, from head_vs_body Section B.
-FINBERT = [("positive", 0), ("sentiment_score", 0), ("neutral", 1), ("negative", 1)]
+FINBERT = [("Prosus_pos_hd", 0), ("Prosus_ss_hd", 0), ("Prosus_neu_hd", 1), ("Prosus_neg_hd", 1)]
 NOCOREF = [("nocoref_net_score", 0), ("nocoref_confidence_weighted", 0),
            ("nocoref_neutral_filter", 0)]
-HEAD = [("FLANG-BERT_sentiment_score", 0), ("FLANG-ELECTRA_sentiment_score", 0),
-        ("DeBERTa_sentiment_score", 0), ("Trading-Hero_positive", 0),
-        ("FinMarBa_indecisive", 1), ("distilroberta_sentiment_score", 0),
-        ("ModernBERT_positive", 0), ("finbert-tone_sentiment_score", 0),
-        ("RoBERTa_positive", 0), ("FinancialBERT_negative", 1),
-        ("LouMcD-SDict_sentiment_score", 0)]
-BODY = [("Trading-Hero_Body_sentiment_score", 0),
-        ("FinancialBERT_Body_sentiment_score", 0),
-        ("FLANG-ELECTRA_Body_positive", 0), ("FLANG-BERT_Body_sentiment_score", 0),
-        ("distilroberta_Body_sentiment_score", 0), ("DeBERTa_Body_positive", 0),
-        ("FinMarBa_Body_indecisive", 1), ("ModernBERT_Body_positive", 0),
-        ("RoBERTa_Body_positive", 0), ("finbert-tone_Body_sentiment_score", 0),
-        ("LouMcD-SDict_Body_strong_modal", 0)]
+HEAD = [("FLANG_ss_hd", 0), ("FLElectra_ss_hd", 0),
+        ("DeBERTa_ss_hd", 0), ("TradeHero_pos_hd", 0),
+        ("FinMarBa_ind_hd", 1), ("DistilRo_ss_hd", 0),
+        ("ModernB_pos_hd", 0), ("FinTone_ss_hd", 0),
+        ("RoBERTa_pos_hd", 0), ("FinancialB_neg_hd", 1),
+        ("LouMcD_ss_hd", 0)]
+BODY = [("TradeHero_ss_bd", 0),
+        ("FinancialB_ss_bd", 0),
+        ("FLElectra_pos_bd", 0), ("FLANG_ss_bd", 0),
+        ("DistilRo_ss_bd", 0), ("DeBERTa_pos_bd", 0),
+        ("FinMarBa_ind_bd", 1), ("ModernB_pos_bd", 0),
+        ("RoBERTa_pos_bd", 0), ("FinTone_ss_bd", 0),
+        ("LouMcD_smod_bd", 0)]
 
 TOPK = [0.05, 0.10, 0.20, 0.30]
 LEVELS = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]

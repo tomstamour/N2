@@ -1,9 +1,4 @@
-
-
-
-
-
-Commands.txt
+ommands.txt
 ######
 python3 exchange_AddON.py --input inputs/news_output_2026-05-11.tsv --output-dir outputs
 
@@ -17,10 +12,10 @@ python3 finBERT_noCoref_AddON.py --input outputs/concatenated_enriched.tsv
 python3 rule-based-AddOn.py --column-name Headline --input outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings.tsv --output outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv
 
 #######
-python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir inputs/ -o outputs/PRstats_2026-07-24-2026-07-30_raw.tsv
+python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir inputs/ -o outputs/PRstats_2026-05-04-2026-08-28-unfiltered.tsv
 
 ######
-python3 coffee_filter.py --input outputs/05_PRstats_2026-07-24-2026-07-30_kwScored_FromPRhigh_11EncBodyHeadScored.tsv --output outputs/05_PRstats_2026-07-24-2026-07-30_kwScored_FromPRhigh_11EncBodyHeadScored_CoffeeF.tsv --MaxFloat 50 --string-to-exclude ../orchestrator5/excluded_strings-2.txt --remove-duplicates true
+python3 filter_float_dailyhigh.py --input outputs/PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh.tsv --output outputs/PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh_excStr2.tsv --MaxFloat 50 --string-to-exclude /home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator5/excluded_strings-2.txt 
 
 ###### This command will get all the jsons files in the table and bring them to a single directory
 python3 json_regrouper.py -i ./outputs/PR-stats-2026-05-03to18-filtered-50float-12high.tsv
@@ -32,33 +27,45 @@ python3 plot_sentiment_vs_dailyhigh.py --input outputs/fconcatenated_enriched_Fi
 #
 python3 plot_sentiment_vs_dailyhigh_terminal.py outputs/concatenated_enriched_FinBERT_05-03-to05-18_Float50_price5.tsv
 
-###### Scatter fromPR_High(%) (Y) vs PR row order (X); blue = rows meeting ALL --and-operand conditions.
-###### --and-operand takes COL [OP] VALUE ; operator defaults to '>' when omitted (> >= < <= == !=)
-/home/tom/venv/bin/python plot_sentiment_AND-logics.py \
---input outputs/05_PRstats_2026-07-24-2026-07-30_kwScored_FromPRhigh_11EncBodyHeadScored_CoffeeF_Categorized_FinBERT.tsv \
---top-y-value 400 \
---and-operand FinBERT_positive '>=' 0.8 \
---and-operand kw15_body_proba '>=' 0.5 \
---and-operand kw15_head_proba '>=' 0.5 \
---and-operand FinMarBa_indecisive '<=' 0.14 \
---and-operand FLANG-BERT_sentiment_score '>=' 0.96
-
-###### Backfill kw15_body/head_proba + FinBERT_* onto rows captured before O5.2 wrote them
-###### (kw15 from 2026-07-29, FinBERT_* only ever an offline rescore). Same frozen artefacts
-###### as the live orchestrator, so a backfilled cell == what O5.2 would have written:
-###### verified max|d|=0.0 vs 05's existing kw15 cols, and 0.0 vs 04's live `positive`.
-/home/tom/venv/bin/python kw15_finbert_backfill_addOn.py \
---input     outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_Classed_BodyEnc_clean_FromPRhigh.tsv \
---id-filter outputs/02_PRstats_2026-06-20-2026-07-23_CoffeeFilter_clean.tsv \
---output    outputs/04sub_PRstats_2026-06-22-2026-07-23_kwScored_FinBERT.tsv
-
-###### Merge the backfilled 06-22..07-23 half with the 07-24..07-30 half (ID-disjoint,
-###### date-contiguous, so a plain union-column append is already chronological).
-/home/tom/venv/bin/python enriched_tsv_concatener.py \
---base outputs/04sub_PRstats_2026-06-22-2026-07-23_kwScored_FinBERT.tsv \
---add  outputs/05_PRstats_2026-07-24-2026-07-30_kwScored_FromPRhigh_11EncBodyHeadScored_CoffeeF.tsv \
--o     outputs/06_PRstats_2026-06-22-2026-07-30_11EncBodyHeadScored_kwScored_FinBERT.tsv
+#############################################
+python3 coffee_filter.py \
+-i outputs/PRstats_2026-05-04-2026-08-28-unfiltered.tsv \
+-o outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd.tsv \
+--pr-cooloff 240 --max-body-words 400 \
+--string-to-exclude ../orchestrator5/excluded_strings-2.txt
 
 
+########################################################
+python3 mktcap_backfill_addOn.py -i ./outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip_11EncBodyScored_11EncScored_mktstate_SIback_noDupCol_FinBERTScored_freqSizeBack.tsv --log mktcap-backfill.log
 
+########################################################
+# XGBoost scores vs the live O5.2 gate -- predictive power on fromPR_High(%).
+# Report: statsByClaude/2026-09-16_XGB_vs_O52_predictive_power.md
+#
+# Step 0 -- score the val fold. Since 2026-09-16 this predicts at best_iteration, NOT at
+# all boosted rounds; --all-trees reproduces the old (wrong) behaviour for comparison.
+# Write straight into price_stats_loader/outputs/ -- the old path needed two hand-renames.
+/home/tom/venv/bin/python ../training_data/score_val_predictions.py \
+  --out outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter.tsv
 
+# Step 1 -- join the 6 gate columns. !! Keep any suffix AFTER "XGBscores": this script
+# auto-globs 2026-07-28_2026-08-28_RawData*XGBscores.tsv and hard-fails on 2 matches.
+/home/tom/venv/bin/python orch52cols_backfill_addOn.py \
+  --input outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter.tsv
+
+# Step 2 -- EarningScore + ID. WITHOUT it replay_gate silently disables the EARNINGS
+# branch (52 of the gate's 113 fires on the 07-28..08-28 window) with no error.
+/home/tom/venv/bin/python earnscore_backfill_addOn.py \
+  --input outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter_orch52cols.tsv
+
+# Step 3 -- the check that licenses every gate number. non-Earnings_Results MUST be 100%.
+/home/tom/venv/bin/python replay_gate.py \
+  --input outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter_orch52cols_gateReplay.tsv \
+  --verify-against ../orchestrator5/tables --verify-since 2026-08-18
+
+# Step 4 -- the report. Deterministic (--seed 42); ~60s, the day-block bootstraps dominate.
+# --compare-scores is optional: it diffs an earlier score file into a "what changed" table.
+/home/tom/venv/bin/python compare_xgb_vs_orch52.py \
+  --input outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter_orch52cols_gateReplay.tsv \
+  --compare-scores outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores.tsv
+# Next validation window: the same 5 steps, plus --report <new date>_... on step 4.

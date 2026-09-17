@@ -34,7 +34,7 @@ TARGET_COL = "DailyHigh(%)"
 
 # Columns coerced to numeric for correlation/modeling.
 NUMERIC_COLS = [
-    "Float", "positive", "negative", "neutral", "sentiment_score",
+    "Float", "Prosus_pos_hd", "Prosus_neg_hd", "Prosus_neu_hd", "Prosus_ss_hd",
     "nocoref_neutral_filter", "nocoref_confidence_weighted", "nocoref_net_score",
     "nocoref_top_k", "nocoref_positional", "nocoref_recommended", "Headline-RBscore",
     "Trades/sec", "body_sentiment", "body_duration_ms", "LastDailyClose",
@@ -51,14 +51,14 @@ NUMERIC_COLS = [
 
 # Always-present signals used for the model (see NaN-coverage analysis).
 MODEL_FEATURES = [
-    "Float", "LastDailyClose", "positive", "negative", "neutral",
-    "sentiment_score", "nocoref_net_score", "nocoref_positional",
+    "Float", "LastDailyClose", "Prosus_pos_hd", "Prosus_neg_hd", "Prosus_neu_hd",
+    "Prosus_ss_hd", "nocoref_net_score", "nocoref_positional",
     "nocoref_confidence_weighted", "Headline-RBscore",
     "model_proba", "kw_add_lin", "kw_mult_nb_log", "n_kw_hits",
     "model_proba_hl",
 ]
 
-CATEGORICAL_COLS = ["label", "Trigger", "Exchange", "Author", "Sentiment",
+CATEGORICAL_COLS = ["Prosus_lab_hd", "Trigger", "Exchange", "Author", "Sentiment",
                     "ClerkSentiment", "boilerplate_category"]
 
 DEDUP_KEYS = ["Symbol", "Headline", "ArrivalDate"]

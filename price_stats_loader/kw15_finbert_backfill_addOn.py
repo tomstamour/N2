@@ -1,10 +1,16 @@
-"""Backfill the kw15 body/headline probabilities and the FinBERT_* headline columns
+"""Backfill the kw15 body/headline probabilities and the Prosus_*_hd headline columns
 onto an older enriched TSV, so it lines up with the post-2026-07-24 corpus.
 
-Why this exists: Orchestrator5.2 only started writing `kw15_body_proba` /
-`kw15_head_proba` on 2026-07-29, and the `FinBERT_*`-prefixed columns are an offline
-rescore that never touched the older files.  Rows captured before then are missing
-both, which makes them unusable in an AND-rule search alongside the newer rows.
+Why this exists: Orchestrator5.2 only started writing the kw15 probabilities on
+2026-07-29, and the ProsusAI-FinBERT columns are an offline rescore that never
+touched the older files.  Rows captured before then are missing both, which makes
+them unusable in an AND-rule search alongside the newer rows.
+
+⚠ 2026-08-09: the emitted column names changed to the unified
+`{Model}_{channel}_{hd|bd}` convention — `FinBERT_positive` -> `Prosus_pos_hd`,
+`kw15_body_proba` -> `kw15_proba_bd`, and so on. Values are unchanged. A TSV
+backfilled before that date carries the old names; migrate it with
+tools/Encoder_Models/rename_encoder_cols.py rather than re-running this.
 
 Both scorers are the SAME artefacts the live orchestrator uses:
   * kw15  — the two frozen joblib pipelines named in Orchestrator5.2.py:109-112,
@@ -42,9 +48,11 @@ KW15_HEAD_PIPELINE = KW15_DIR / "classify_fromPRhigh_ge15_headline" / "tfidf_fit
 # dropping the cap flips fire decisions.  Headlines are never capped.
 KW15_BODY_MAX_WORDS = 400
 
-FINBERT_COLS = ["FinBERT_negative", "FinBERT_neutral", "FinBERT_positive",
-                "FinBERT_sentiment_score", "FinBERT_label", "FinBERT_elapsed_ms"]
-KW15_COLS = ["kw15_body_proba", "kw15_head_proba"]
+# Unified {Model}_{channel}_{hd|bd} column names (2026-08-09) — the same names
+# Orchestrator5.2 and tools/Encoder_Models/ emit. `Prosus` = ProsusAI/finbert.
+FINBERT_COLS = ["Prosus_neg_hd", "Prosus_neu_hd", "Prosus_pos_hd",
+                "Prosus_ss_hd", "Prosus_lab_hd", "Prosus_ms_hd"]
+KW15_COLS = ["kw15_proba_bd", "kw15_proba_hd"]
 
 
 def _load_hyphenated(name: str, path: Path):
@@ -140,8 +148,8 @@ def main() -> None:
 
     t0 = time.monotonic()
     # 6 decimals matches the live orchestrator and the backtest TSVs.
-    df["kw15_body_proba"] = [round(float(p), 6) for p in body_pipe.predict_proba(bodies)[:, 1]]
-    df["kw15_head_proba"] = [round(float(p), 6) for p in head_pipe.predict_proba(heads)[:, 1]]
+    df["kw15_proba_bd"] = [round(float(p), 6) for p in body_pipe.predict_proba(bodies)[:, 1]]
+    df["kw15_proba_hd"] = [round(float(p), 6) for p in head_pipe.predict_proba(heads)[:, 1]]
     logger.info("kw15 scored %d rows in %.1fs", len(df), time.monotonic() - t0)
 
     # ── FinBERT ──────────────────────────────────────────────────────────────
@@ -155,17 +163,19 @@ def main() -> None:
         t1 = time.monotonic()
         r = fb.analyze_headline(headline)
         ms.append(round((time.monotonic() - t1) * 1000.0, 1))
-        neg.append(r["negative"])
-        neu.append(r["neutral"])
-        pos.append(r["positive"])
-        score.append(r["sentiment_score"])
-        label.append(r["label"])
-    df["FinBERT_negative"] = neg
-    df["FinBERT_neutral"] = neu
-    df["FinBERT_positive"] = pos
-    df["FinBERT_sentiment_score"] = score
-    df["FinBERT_label"] = label
-    df["FinBERT_elapsed_ms"] = ms
+        neg.append(r["neg"])
+        neu.append(r["neu"])
+        pos.append(r["pos"])
+        score.append(r["ss"])
+        label.append(r["lab"])
+    df["Prosus_neg_hd"] = neg
+    df["Prosus_neu_hd"] = neu
+    df["Prosus_pos_hd"] = pos
+    df["Prosus_ss_hd"] = score
+    df["Prosus_lab_hd"] = label
+    # Wall time measured HERE, not r["ms"]: this loop's timing has always included
+    # the call overhead, and changing it would silently shift the column's meaning.
+    df["Prosus_ms_hd"] = ms
     logger.info("FinBERT scored %d rows in %.1fs", len(df), time.monotonic() - t0)
 
     tmp_path = out_path.with_name(out_path.name + ".tmp")

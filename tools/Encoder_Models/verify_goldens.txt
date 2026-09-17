@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "captured_on": "2026-07-18",
+    "captured_on": "2026-08-09",
     "host": "tom-Latitude-5420",
     "onnxruntime": "1.23.2",
     "python": "3.12.3"
@@ -8,306 +8,422 @@
   "models": {
     "DeBERTa": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9998,
-        "neutral": 0.0001,
-        "positive": 0.0001,
-        "sentiment_score": -0.9997
+        "lab": "negative",
+        "neg": 0.9998,
+        "neu": 0.0001,
+        "pos": 0.0001,
+        "ss": -0.9997
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0005,
-        "neutral": 0.9987,
-        "positive": 0.0008,
-        "sentiment_score": 0.0003
+        "lab": "neutral",
+        "neg": 0.0005,
+        "neu": 0.9987,
+        "pos": 0.0008,
+        "ss": 0.0003
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0003,
-        "neutral": 0.0004,
-        "positive": 0.9994,
-        "sentiment_score": 0.9991
+        "lab": "positive",
+        "neg": 0.0003,
+        "neu": 0.0004,
+        "pos": 0.9994,
+        "ss": 0.9991
       },
       "delisting": {
-        "label": "negative",
-        "negative": 0.9997,
-        "neutral": 0.0002,
-        "positive": 0.0001,
-        "sentiment_score": -0.9996
+        "lab": "negative",
+        "neg": 0.9997,
+        "neu": 0.0002,
+        "pos": 0.0001,
+        "ss": -0.9996
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0007,
-        "neutral": 0.006,
-        "positive": 0.9933,
-        "sentiment_score": 0.9926
+        "lab": "positive",
+        "neg": 0.0007,
+        "neu": 0.006,
+        "pos": 0.9933,
+        "ss": 0.9926
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0438,
-        "neutral": 0.5053,
-        "positive": 0.4509,
-        "sentiment_score": 0.4071
+        "lab": "neutral",
+        "neg": 0.0438,
+        "neu": 0.5053,
+        "pos": 0.4509,
+        "ss": 0.4071
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0001,
-        "positive": 0.9997,
-        "sentiment_score": 0.9996
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0001,
+        "pos": 0.9997,
+        "ss": 0.9996
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.0087,
-        "neutral": 0.8697,
-        "positive": 0.1216,
-        "sentiment_score": 0.1129
+        "lab": "neutral",
+        "neg": 0.0087,
+        "neu": 0.8697,
+        "pos": 0.1216,
+        "ss": 0.1129
       }
     },
-    "FLANG-BERT": {
+    "DistilRo": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9738,
-        "neutral": 0.0041,
-        "positive": 0.0221,
-        "sentiment_score": -0.9517
+        "lab": "negative",
+        "neg": 0.9807,
+        "neu": 0.0188,
+        "pos": 0.0005,
+        "ss": -0.9802
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0472,
-        "neutral": 0.7039,
-        "positive": 0.2488,
-        "sentiment_score": 0.2016
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9999,
+        "pos": 0.0,
+        "ss": -0.0001
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0382,
-        "neutral": 0.0067,
-        "positive": 0.9551,
-        "sentiment_score": 0.9169
+        "lab": "positive",
+        "neg": 0.0003,
+        "neu": 0.0002,
+        "pos": 0.9996,
+        "ss": 0.9993
       },
       "delisting": {
-        "label": "negative",
-        "negative": 0.9695,
-        "neutral": 0.0058,
-        "positive": 0.0247,
-        "sentiment_score": -0.9448
+        "lab": "neutral",
+        "neg": 0.004,
+        "neu": 0.9959,
+        "pos": 0.0001,
+        "ss": -0.0039
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0207,
-        "neutral": 0.0361,
-        "positive": 0.9432,
-        "sentiment_score": 0.9225
+        "lab": "positive",
+        "neg": 0.0012,
+        "neu": 0.3869,
+        "pos": 0.6119,
+        "ss": 0.6107
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0912,
-        "neutral": 0.5027,
-        "positive": 0.4061,
-        "sentiment_score": 0.3149
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9998,
+        "pos": 0.0001,
+        "ss": 0.0
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0051,
-        "neutral": 0.0158,
-        "positive": 0.979,
-        "sentiment_score": 0.9739
+        "lab": "positive",
+        "neg": 0.0002,
+        "neu": 0.0001,
+        "pos": 0.9997,
+        "ss": 0.9995
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.003,
-        "neutral": 0.7098,
-        "positive": 0.2872,
-        "sentiment_score": 0.2842
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9998,
+        "pos": 0.0001,
+        "ss": 0.0
       }
     },
-    "FLANG-ELECTRA": {
+    "FLANG": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9976,
-        "neutral": 0.0012,
-        "positive": 0.0012,
-        "sentiment_score": -0.9964
+        "lab": "negative",
+        "neg": 0.9738,
+        "neu": 0.0041,
+        "pos": 0.0221,
+        "ss": -0.9517
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9996,
-        "positive": 0.0003,
-        "sentiment_score": 0.0002
+        "lab": "neutral",
+        "neg": 0.0472,
+        "neu": 0.7039,
+        "pos": 0.2488,
+        "ss": 0.2016
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0005,
-        "neutral": 0.0013,
-        "positive": 0.9982,
-        "sentiment_score": 0.9977
+        "lab": "positive",
+        "neg": 0.0382,
+        "neu": 0.0067,
+        "pos": 0.9551,
+        "ss": 0.9169
       },
       "delisting": {
-        "label": "negative",
-        "negative": 0.7993,
-        "neutral": 0.1843,
-        "positive": 0.0164,
-        "sentiment_score": -0.7829
+        "lab": "negative",
+        "neg": 0.9695,
+        "neu": 0.0058,
+        "pos": 0.0247,
+        "ss": -0.9448
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0005,
-        "neutral": 0.0014,
-        "positive": 0.9981,
-        "sentiment_score": 0.9976
+        "lab": "positive",
+        "neg": 0.0207,
+        "neu": 0.0361,
+        "pos": 0.9432,
+        "ss": 0.9225
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9997,
-        "positive": 0.0003,
-        "sentiment_score": 0.0002
+        "lab": "neutral",
+        "neg": 0.0912,
+        "neu": 0.5027,
+        "pos": 0.4061,
+        "ss": 0.3149
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0006,
-        "neutral": 0.0012,
-        "positive": 0.9982,
-        "sentiment_score": 0.9976
+        "lab": "positive",
+        "neg": 0.0051,
+        "neu": 0.0158,
+        "pos": 0.979,
+        "ss": 0.9739
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9994,
-        "positive": 0.0005,
-        "sentiment_score": 0.0004
+        "lab": "neutral",
+        "neg": 0.003,
+        "neu": 0.7098,
+        "pos": 0.2872,
+        "ss": 0.2842
+      }
+    },
+    "FLElectra": {
+      "bankruptcy": {
+        "lab": "negative",
+        "neg": 0.9976,
+        "neu": 0.0012,
+        "pos": 0.0012,
+        "ss": -0.9964
+      },
+      "conference": {
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9996,
+        "pos": 0.0003,
+        "ss": 0.0002
+      },
+      "contract_win": {
+        "lab": "positive",
+        "neg": 0.0005,
+        "neu": 0.0013,
+        "pos": 0.9982,
+        "ss": 0.9977
+      },
+      "delisting": {
+        "lab": "negative",
+        "neg": 0.7993,
+        "neu": 0.1843,
+        "pos": 0.0164,
+        "ss": -0.7829
+      },
+      "fda_approval": {
+        "lab": "positive",
+        "neg": 0.0005,
+        "neu": 0.0014,
+        "pos": 0.9981,
+        "ss": 0.9976
+      },
+      "offering": {
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9997,
+        "pos": 0.0003,
+        "ss": 0.0002
+      },
+      "record_profit": {
+        "lab": "positive",
+        "neg": 0.0006,
+        "neu": 0.0012,
+        "pos": 0.9982,
+        "ss": 0.9976
+      },
+      "veea_example": {
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9994,
+        "pos": 0.0005,
+        "ss": 0.0004
       }
     },
     "FinMarBa": {
       "bankruptcy": {
-        "indecisive": 0.0409,
-        "label": "negative",
-        "negative": 0.9044,
-        "positive": 0.0547,
-        "sentiment_score": -0.8497
+        "ind": 0.0409,
+        "lab": "negative",
+        "neg": 0.9044,
+        "pos": 0.0547,
+        "ss": -0.8497
       },
       "conference": {
-        "indecisive": 0.2703,
-        "label": "positive",
-        "negative": 0.2975,
-        "positive": 0.4322,
-        "sentiment_score": 0.1347
+        "ind": 0.2703,
+        "lab": "positive",
+        "neg": 0.2975,
+        "pos": 0.4322,
+        "ss": 0.1347
       },
       "contract_win": {
-        "indecisive": 0.1304,
-        "label": "positive",
-        "negative": 0.0809,
-        "positive": 0.7886,
-        "sentiment_score": 0.7077
+        "ind": 0.1304,
+        "lab": "positive",
+        "neg": 0.0809,
+        "pos": 0.7886,
+        "ss": 0.7077
       },
       "delisting": {
-        "indecisive": 0.2323,
-        "label": "negative",
-        "negative": 0.4666,
-        "positive": 0.3011,
-        "sentiment_score": -0.1655
+        "ind": 0.2323,
+        "lab": "negative",
+        "neg": 0.4666,
+        "pos": 0.3011,
+        "ss": -0.1655
       },
       "fda_approval": {
-        "indecisive": 0.2215,
-        "label": "positive",
-        "negative": 0.2448,
-        "positive": 0.5337,
-        "sentiment_score": 0.2889
+        "ind": 0.2215,
+        "lab": "positive",
+        "neg": 0.2448,
+        "pos": 0.5337,
+        "ss": 0.2889
       },
       "offering": {
-        "indecisive": 0.2136,
-        "label": "positive",
-        "negative": 0.2722,
-        "positive": 0.5142,
-        "sentiment_score": 0.242
+        "ind": 0.2136,
+        "lab": "positive",
+        "neg": 0.2722,
+        "pos": 0.5142,
+        "ss": 0.242
       },
       "record_profit": {
-        "indecisive": 0.1994,
-        "label": "positive",
-        "negative": 0.1872,
-        "positive": 0.6134,
-        "sentiment_score": 0.4262
+        "ind": 0.1994,
+        "lab": "positive",
+        "neg": 0.1872,
+        "pos": 0.6134,
+        "ss": 0.4262
       },
       "veea_example": {
-        "indecisive": 0.1583,
-        "label": "positive",
-        "negative": 0.1453,
-        "positive": 0.6964,
-        "sentiment_score": 0.5511
+        "ind": 0.1583,
+        "lab": "positive",
+        "neg": 0.1453,
+        "pos": 0.6964,
+        "ss": 0.5511
       }
     },
-    "FinancialBERT": {
+    "FinTone": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9995,
-        "neutral": 0.0003,
-        "positive": 0.0002,
-        "sentiment_score": -0.9993
+        "lab": "negative",
+        "neg": 0.9999,
+        "neu": 0.0001,
+        "pos": 0.0,
+        "ss": -0.9999
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0002,
-        "neutral": 0.9997,
-        "positive": 0.0002,
-        "sentiment_score": 0.0
+        "lab": "neutral",
+        "neg": 0.0,
+        "neu": 1.0,
+        "pos": 0.0,
+        "ss": 0.0
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0001,
-        "positive": 0.9998,
-        "sentiment_score": 0.9997
+        "lab": "positive",
+        "neg": 0.0,
+        "neu": 0.0,
+        "pos": 1.0,
+        "ss": 1.0
       },
       "delisting": {
-        "label": "neutral",
-        "negative": 0.0002,
-        "neutral": 0.9996,
-        "positive": 0.0002,
-        "sentiment_score": 0.0
+        "lab": "negative",
+        "neg": 0.5298,
+        "neu": 0.4618,
+        "pos": 0.0085,
+        "ss": -0.5213
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0001,
-        "positive": 0.9998,
-        "sentiment_score": 0.9997
+        "lab": "positive",
+        "neg": 0.0004,
+        "neu": 0.0058,
+        "pos": 0.9938,
+        "ss": 0.9934
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9992,
-        "positive": 0.0008,
-        "sentiment_score": 0.0007
+        "lab": "neutral",
+        "neg": 0.0,
+        "neu": 0.9999,
+        "pos": 0.0,
+        "ss": 0.0
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0,
-        "positive": 0.9998,
-        "sentiment_score": 0.9997
+        "lab": "positive",
+        "neg": 0.0,
+        "neu": 0.0,
+        "pos": 1.0,
+        "ss": 1.0
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9998,
-        "positive": 0.0002,
-        "sentiment_score": 0.0001
+        "lab": "neutral",
+        "neg": 0.0,
+        "neu": 0.9372,
+        "pos": 0.0628,
+        "ss": 0.0628
       }
     },
-    "LouMcD-SDict": {
+    "FinancialB": {
       "bankruptcy": {
-        "constraining": 0,
-        "label": "negative",
-        "litigious": 0,
+        "lab": "negative",
+        "neg": 0.9995,
+        "neu": 0.0003,
+        "pos": 0.0002,
+        "ss": -0.9993
+      },
+      "conference": {
+        "lab": "neutral",
+        "neg": 0.0002,
+        "neu": 0.9997,
+        "pos": 0.0002,
+        "ss": 0.0
+      },
+      "contract_win": {
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0001,
+        "pos": 0.9998,
+        "ss": 0.9997
+      },
+      "delisting": {
+        "lab": "neutral",
+        "neg": 0.0002,
+        "neu": 0.9996,
+        "pos": 0.0002,
+        "ss": 0.0
+      },
+      "fda_approval": {
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0001,
+        "pos": 0.9998,
+        "ss": 0.9997
+      },
+      "offering": {
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9992,
+        "pos": 0.0008,
+        "ss": 0.0007
+      },
+      "record_profit": {
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0,
+        "pos": 0.9998,
+        "ss": 0.9997
+      },
+      "veea_example": {
+        "lab": "neutral",
+        "neg": 0.0001,
+        "neu": 0.9998,
+        "pos": 0.0002,
+        "ss": 0.0001
+      }
+    },
+    "LouMcD": {
+      "bankruptcy": {
+        "cons": 0,
+        "lab": "negative",
+        "lit": 0,
         "matched_words": {
           "negative": [
             "BANKRUPTCY"
           ]
         },
-        "negative": 1,
-        "positive": 0,
+        "neg": 1,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -317,19 +433,19 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": -1.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": -1.0,
         "total_tokens": 8,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "conference": {
-        "constraining": 0,
-        "label": "neutral",
-        "litigious": 0,
+        "cons": 0,
+        "lab": "neutral",
+        "lit": 0,
         "matched_words": {},
-        "negative": 0,
-        "positive": 0,
+        "neg": 0,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -339,23 +455,23 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 0.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 0.0,
         "total_tokens": 10,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "contract_win": {
-        "constraining": 0,
-        "label": "neutral",
-        "litigious": 1,
+        "cons": 0,
+        "lab": "neutral",
+        "lit": 1,
         "matched_words": {
           "litigious": [
             "CONTRACT"
           ]
         },
-        "negative": 0,
-        "positive": 0,
+        "neg": 0,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.1,
@@ -365,16 +481,16 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 0.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 0.0,
         "total_tokens": 10,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "delisting": {
-        "constraining": 1,
-        "label": "negative",
-        "litigious": 0,
+        "cons": 1,
+        "lab": "negative",
+        "lit": 0,
         "matched_words": {
           "constraining": [
             "REQUIREMENTS"
@@ -384,8 +500,8 @@
             "FAILING"
           ]
         },
-        "negative": 2,
-        "positive": 0,
+        "neg": 2,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0909,
           "litigious": 0.0,
@@ -395,19 +511,19 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": -1.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": -1.0,
         "total_tokens": 11,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "fda_approval": {
-        "constraining": 0,
-        "label": "neutral",
-        "litigious": 0,
+        "cons": 0,
+        "lab": "neutral",
+        "lit": 0,
         "matched_words": {},
-        "negative": 0,
-        "positive": 0,
+        "neg": 0,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -417,19 +533,19 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 0.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 0.0,
         "total_tokens": 10,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "offering": {
-        "constraining": 0,
-        "label": "neutral",
-        "litigious": 0,
+        "cons": 0,
+        "lab": "neutral",
+        "lit": 0,
         "matched_words": {},
-        "negative": 0,
-        "positive": 0,
+        "neg": 0,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -439,19 +555,19 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 0.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 0.0,
         "total_tokens": 10,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "record_profit": {
-        "constraining": 0,
-        "label": "neutral",
-        "litigious": 0,
+        "cons": 0,
+        "lab": "neutral",
+        "lit": 0,
         "matched_words": {},
-        "negative": 0,
-        "positive": 0,
+        "neg": 0,
+        "pos": 0,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -461,23 +577,23 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 0.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 0.0,
         "total_tokens": 11,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       },
       "veea_example": {
-        "constraining": 0,
-        "label": "positive",
-        "litigious": 0,
+        "cons": 0,
+        "lab": "positive",
+        "lit": 0,
         "matched_words": {
           "positive": [
             "ENABLING"
           ]
         },
-        "negative": 0,
-        "positive": 1,
+        "neg": 0,
+        "pos": 1,
         "proportions": {
           "constraining": 0.0,
           "litigious": 0.0,
@@ -487,301 +603,185 @@
           "uncertainty": 0.0,
           "weak_modal": 0.0
         },
-        "sentiment_score": 1.0,
-        "strong_modal": 0,
+        "smod": 0,
+        "ss": 1.0,
         "total_tokens": 19,
-        "uncertainty": 0,
-        "weak_modal": 0
+        "unc": 0,
+        "wmod": 0
       }
     },
-    "ModernBERT": {
+    "ModernB": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9897,
-        "neutral": 0.0058,
-        "positive": 0.0045,
-        "sentiment_score": -0.9852
+        "lab": "negative",
+        "neg": 0.9897,
+        "neu": 0.0058,
+        "pos": 0.0045,
+        "ss": -0.9852
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0375,
-        "neutral": 0.8243,
-        "positive": 0.1381,
-        "sentiment_score": 0.1006
+        "lab": "neutral",
+        "neg": 0.0375,
+        "neu": 0.8243,
+        "pos": 0.1381,
+        "ss": 0.1006
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0119,
-        "neutral": 0.0611,
-        "positive": 0.9269,
-        "sentiment_score": 0.915
+        "lab": "positive",
+        "neg": 0.0119,
+        "neu": 0.0611,
+        "pos": 0.9269,
+        "ss": 0.915
       },
       "delisting": {
-        "label": "negative",
-        "negative": 0.9815,
-        "neutral": 0.0157,
-        "positive": 0.0028,
-        "sentiment_score": -0.9787
+        "lab": "negative",
+        "neg": 0.9815,
+        "neu": 0.0157,
+        "pos": 0.0028,
+        "ss": -0.9787
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0103,
-        "neutral": 0.1322,
-        "positive": 0.8575,
-        "sentiment_score": 0.8472
+        "lab": "positive",
+        "neg": 0.0103,
+        "neu": 0.1322,
+        "pos": 0.8575,
+        "ss": 0.8472
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0132,
-        "neutral": 0.9162,
-        "positive": 0.0706,
-        "sentiment_score": 0.0574
+        "lab": "neutral",
+        "neg": 0.0132,
+        "neu": 0.9162,
+        "pos": 0.0706,
+        "ss": 0.0574
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0076,
-        "neutral": 0.0214,
-        "positive": 0.971,
-        "sentiment_score": 0.9634
+        "lab": "positive",
+        "neg": 0.0076,
+        "neu": 0.0214,
+        "pos": 0.971,
+        "ss": 0.9634
       },
       "veea_example": {
-        "label": "positive",
-        "negative": 0.0242,
-        "neutral": 0.4293,
-        "positive": 0.5465,
-        "sentiment_score": 0.5223
+        "lab": "positive",
+        "neg": 0.0242,
+        "neu": 0.4293,
+        "pos": 0.5465,
+        "ss": 0.5223
       }
     },
     "RoBERTa": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.7767,
-        "neutral": 0.2099,
-        "positive": 0.0134,
-        "sentiment_score": -0.7633
+        "lab": "negative",
+        "neg": 0.7767,
+        "neu": 0.2099,
+        "pos": 0.0134,
+        "ss": -0.7633
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0066,
-        "neutral": 0.7573,
-        "positive": 0.2361,
-        "sentiment_score": 0.2295
+        "lab": "neutral",
+        "neg": 0.0066,
+        "neu": 0.7573,
+        "pos": 0.2361,
+        "ss": 0.2295
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0058,
-        "neutral": 0.4826,
-        "positive": 0.5116,
-        "sentiment_score": 0.5058
+        "lab": "positive",
+        "neg": 0.0058,
+        "neu": 0.4826,
+        "pos": 0.5116,
+        "ss": 0.5058
       },
       "delisting": {
-        "label": "negative",
-        "negative": 0.6363,
-        "neutral": 0.3463,
-        "positive": 0.0174,
-        "sentiment_score": -0.6189
+        "lab": "negative",
+        "neg": 0.6363,
+        "neu": 0.3463,
+        "pos": 0.0174,
+        "ss": -0.6189
       },
       "fda_approval": {
-        "label": "neutral",
-        "negative": 0.006,
-        "neutral": 0.5959,
-        "positive": 0.3981,
-        "sentiment_score": 0.3921
+        "lab": "neutral",
+        "neg": 0.006,
+        "neu": 0.5959,
+        "pos": 0.3981,
+        "ss": 0.3921
       },
       "offering": {
-        "label": "positive",
-        "negative": 0.0045,
-        "neutral": 0.4033,
-        "positive": 0.5923,
-        "sentiment_score": 0.5878
+        "lab": "positive",
+        "neg": 0.0045,
+        "neu": 0.4033,
+        "pos": 0.5923,
+        "ss": 0.5878
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0043,
-        "neutral": 0.1335,
-        "positive": 0.8622,
-        "sentiment_score": 0.8579
+        "lab": "positive",
+        "neg": 0.0043,
+        "neu": 0.1335,
+        "pos": 0.8622,
+        "ss": 0.8579
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.0067,
-        "neutral": 0.7319,
-        "positive": 0.2614,
-        "sentiment_score": 0.2547
+        "lab": "neutral",
+        "neg": 0.0067,
+        "neu": 0.7319,
+        "pos": 0.2614,
+        "ss": 0.2547
       }
     },
-    "Trading-Hero": {
+    "TradeHero": {
       "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9952,
-        "neutral": 0.0041,
-        "positive": 0.0006,
-        "sentiment_score": -0.9946
+        "lab": "negative",
+        "neg": 0.9952,
+        "neu": 0.0041,
+        "pos": 0.0006,
+        "ss": -0.9946
       },
       "conference": {
-        "label": "neutral",
-        "negative": 0.0014,
-        "neutral": 0.9955,
-        "positive": 0.0031,
-        "sentiment_score": 0.0017
+        "lab": "neutral",
+        "neg": 0.0014,
+        "neu": 0.9955,
+        "pos": 0.0031,
+        "ss": 0.0017
       },
       "contract_win": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0002,
-        "positive": 0.9997,
-        "sentiment_score": 0.9996
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0002,
+        "pos": 0.9997,
+        "ss": 0.9996
       },
       "delisting": {
-        "label": "neutral",
-        "negative": 0.0004,
-        "neutral": 0.9992,
-        "positive": 0.0003,
-        "sentiment_score": -0.0001
+        "lab": "neutral",
+        "neg": 0.0004,
+        "neu": 0.9992,
+        "pos": 0.0003,
+        "ss": -0.0001
       },
       "fda_approval": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0004,
-        "positive": 0.9995,
-        "sentiment_score": 0.9994
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0004,
+        "pos": 0.9995,
+        "ss": 0.9994
       },
       "offering": {
-        "label": "neutral",
-        "negative": 0.0006,
-        "neutral": 0.99,
-        "positive": 0.0094,
-        "sentiment_score": 0.0088
+        "lab": "neutral",
+        "neg": 0.0006,
+        "neu": 0.99,
+        "pos": 0.0094,
+        "ss": 0.0088
       },
       "record_profit": {
-        "label": "positive",
-        "negative": 0.0001,
-        "neutral": 0.0001,
-        "positive": 0.9998,
-        "sentiment_score": 0.9997
+        "lab": "positive",
+        "neg": 0.0001,
+        "neu": 0.0001,
+        "pos": 0.9998,
+        "ss": 0.9997
       },
       "veea_example": {
-        "label": "neutral",
-        "negative": 0.0002,
-        "neutral": 0.9988,
-        "positive": 0.001,
-        "sentiment_score": 0.0008
-      }
-    },
-    "distilroberta": {
-      "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9807,
-        "neutral": 0.0188,
-        "positive": 0.0005,
-        "sentiment_score": -0.9802
-      },
-      "conference": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9999,
-        "positive": 0.0,
-        "sentiment_score": -0.0001
-      },
-      "contract_win": {
-        "label": "positive",
-        "negative": 0.0003,
-        "neutral": 0.0002,
-        "positive": 0.9996,
-        "sentiment_score": 0.9993
-      },
-      "delisting": {
-        "label": "neutral",
-        "negative": 0.004,
-        "neutral": 0.9959,
-        "positive": 0.0001,
-        "sentiment_score": -0.0039
-      },
-      "fda_approval": {
-        "label": "positive",
-        "negative": 0.0012,
-        "neutral": 0.3869,
-        "positive": 0.6119,
-        "sentiment_score": 0.6107
-      },
-      "offering": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9998,
-        "positive": 0.0001,
-        "sentiment_score": 0.0
-      },
-      "record_profit": {
-        "label": "positive",
-        "negative": 0.0002,
-        "neutral": 0.0001,
-        "positive": 0.9997,
-        "sentiment_score": 0.9995
-      },
-      "veea_example": {
-        "label": "neutral",
-        "negative": 0.0001,
-        "neutral": 0.9998,
-        "positive": 0.0001,
-        "sentiment_score": 0.0
-      }
-    },
-    "finbert-tone": {
-      "bankruptcy": {
-        "label": "negative",
-        "negative": 0.9999,
-        "neutral": 0.0001,
-        "positive": 0.0,
-        "sentiment_score": -0.9999
-      },
-      "conference": {
-        "label": "neutral",
-        "negative": 0.0,
-        "neutral": 1.0,
-        "positive": 0.0,
-        "sentiment_score": 0.0
-      },
-      "contract_win": {
-        "label": "positive",
-        "negative": 0.0,
-        "neutral": 0.0,
-        "positive": 1.0,
-        "sentiment_score": 1.0
-      },
-      "delisting": {
-        "label": "negative",
-        "negative": 0.5298,
-        "neutral": 0.4618,
-        "positive": 0.0085,
-        "sentiment_score": -0.5213
-      },
-      "fda_approval": {
-        "label": "positive",
-        "negative": 0.0004,
-        "neutral": 0.0058,
-        "positive": 0.9938,
-        "sentiment_score": 0.9934
-      },
-      "offering": {
-        "label": "neutral",
-        "negative": 0.0,
-        "neutral": 0.9999,
-        "positive": 0.0,
-        "sentiment_score": 0.0
-      },
-      "record_profit": {
-        "label": "positive",
-        "negative": 0.0,
-        "neutral": 0.0,
-        "positive": 1.0,
-        "sentiment_score": 1.0
-      },
-      "veea_example": {
-        "label": "neutral",
-        "negative": 0.0,
-        "neutral": 0.9372,
-        "positive": 0.0628,
-        "sentiment_score": 0.0628
+        "lab": "neutral",
+        "neg": 0.0002,
+        "neu": 0.9988,
+        "pos": 0.001,
+        "ss": 0.0008
       }
     }
   }

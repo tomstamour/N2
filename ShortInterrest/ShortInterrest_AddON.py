@@ -73,6 +73,13 @@ HTTP_HEADERS = {
     "Accept": "*/*",
 }
 IBORROW_SLEEP_SECONDS = 0.8   # politeness delay between per-symbol calls
+# Consecutive iBorrowDesk failures after which the endpoint is treated as down
+# for the rest of the run. It has answered every request with a 403/hangup
+# since 2026-07-22, and at 0.8 s per call a full universe costs ~15 min of
+# waiting to learn that. Reset by any success, so a transient blip won't trip
+# it. The IBKR-API path (enrich_dataframe's ibkr_borrow=) bypasses this
+# entirely and is what the nightly pipeline uses.
+IBORROW_FAILURE_BUDGET = 20
 YF_SLEEP_SECONDS = 0.7
 
 SHVOL_DAYS = 6                # trading days of short-volume history (1 today + 5 trend)
@@ -538,7 +545,16 @@ def compute_symbol_metrics(symbol: str, float_shares: float | None,
                            svr_series: list[tuple[str, float]] | None,
                            ftp_borrow: dict | None,
                            borrow_hist: dict,
-                           regsho: tuple[bool | None, int | None]) -> dict:
+                           regsho: tuple[bool | None, int | None],
+                           snapshot_label: str = 'ibkr_ftp',
+                           history_label: str = 'iborrowdesk') -> dict:
+    """`snapshot_label` / `history_label` name the provenance recorded in
+    Borrow_Source for the `ftp_borrow` snapshot and the `borrow_hist` deltas.
+    They default to the historical pair so the standalone CLI and
+    ShortInterrest_backfill_AddON.py are unaffected; daily_universe_pipeline-2.py
+    passes 'ibkr_api' for both, since the IBKR API supplies both halves (see
+    ibkr_borrow_addOn.py, which replaced the two dead web sources).
+    """
     m: dict = {c: None for c in OUTPUT_COLUMNS}
     coverage = []
 
@@ -580,13 +596,16 @@ def compute_symbol_metrics(symbol: str, float_shares: float | None,
     if ftp_borrow:
         fee, rebate, available = (ftp_borrow['fee'], ftp_borrow['rebate'],
                                   ftp_borrow['available'])
-        borrow_src.append('ibkr_ftp')
+        borrow_src.append(snapshot_label)
     if fee is None and borrow_hist['fee_now'] is not None:
         fee = borrow_hist['fee_now']
     if available is None and borrow_hist['available_now'] is not None:
         available = borrow_hist['available_now']
     if any(v is not None for v in borrow_hist.values()):
-        borrow_src.append('iborrowdesk')
+        borrow_src.append(history_label)
+    # When one provider supplies both halves (the IBKR-API path does), the two
+    # labels are identical and Borrow_Source must not read 'ibkr_api+ibkr_api'.
+    borrow_src = list(dict.fromkeys(borrow_src))
     if borrow_src:
         coverage.append('borrow')
     m['CTB_FeePct'] = fee
@@ -654,7 +673,8 @@ def compute_symbol_metrics(symbol: str, float_shares: float | None,
 
 # ------------------------------------------------------------- enrichment
 def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
-                     skip_borrow_history: bool = False) -> pd.DataFrame:
+                     skip_borrow_history: bool = False,
+                     ibkr_borrow: dict | None = None) -> pd.DataFrame:
     """Append the SI_*/SVR_*/CTB_*/Borrow_*/RegSHO_*/Squeeze columns to `df`.
 
     `df` must have a 'Symbol' column; 'Float_M' (millions of shares) and
@@ -664,6 +684,15 @@ def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
 
     This is the library entry point used by daily_universe_pipeline-2.py;
     the CLI in main() is a thin wrapper around it.
+
+    `ibkr_borrow` — {SYMBOL: {fee, rebate, available, fee_delta_5d,
+    avail_delta_5d_pct, util_proxy}}, as built by
+    universe_finder/ibkr_borrow_addOn.build_borrow_map. When supplied it is the
+    sole borrow source: BOTH web fetches are skipped entirely, because both are
+    dead (iBorrowDesk blocks us with HTTP 403 since 2026-07-22; the shortstock
+    FTP has never been reachable from this network, which is why CTB_RebatePct
+    was blank in every file ever written). The pipeline fetches this from the
+    IBKR connection it already holds, at Step 3.6, and hands it over here.
     """
     if 'Symbol' not in df.columns:
         raise ValueError("DataFrame has no 'Symbol' column.")
@@ -683,10 +712,20 @@ def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
         log.info(f"FINRA SI missing for {len(missing_si)} symbols — trying yfinance.")
         si_map.update(fetch_yfinance_short_interest(missing_si))
     svr_map = fetch_short_volume_history(cache_dir)
-    ftp_map = fetch_ibkr_borrow_file(cache_dir)
     regsho_lists = fetch_regsho_membership(cache_dir)
 
+    use_ibkr = ibkr_borrow is not None
+    if use_ibkr:
+        log.info(f"Borrow: using the IBKR-API map for {len(ibkr_borrow)} "
+                 "symbols; skipping the shortstock FTP and iBorrowDesk.")
+        ftp_map = {}
+        snapshot_label = history_label = 'ibkr_api'
+    else:
+        ftp_map = fetch_ibkr_borrow_file(cache_dir)
+        snapshot_label, history_label = 'ibkr_ftp', 'iborrowdesk'
+
     # per-symbol assembly (iBorrowDesk is the only per-symbol network call)
+    ibd_failures = 0
     metrics: dict[str, dict] = {}
     for n, sym in enumerate(symbols, 1):
         row = df[df['Symbol'].astype(str).str.strip().str.upper() == sym].iloc[0]
@@ -694,11 +733,40 @@ def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
         float_shares = float_m * 1e6 if float_m else None
         last_close = to_float(row.get('LastDailyClosePrice'))
 
-        if skip_borrow_history:
+        snapshot = ftp_map.get(sym)
+        if use_ibkr:
+            entry = ibkr_borrow.get(sym)
+            # Both halves come from the one provider: the fee/rebate/available
+            # snapshot goes in as `ftp_borrow` (the only slot that reaches
+            # CTB_RebatePct) and the three derived values as `borrow_hist`.
+            if entry:
+                snapshot = {'fee': entry['fee'], 'rebate': entry['rebate'],
+                            'available': entry['available']}
+                hist = {'fee_now': entry['fee'],
+                        'available_now': entry['available'],
+                        'fee_delta_5d': entry['fee_delta_5d'],
+                        'avail_delta_5d_pct': entry['avail_delta_5d_pct'],
+                        'util_proxy': entry['util_proxy']}
+            else:
+                snapshot, hist = None, borrow_history_metrics(None)
+        elif skip_borrow_history or ibd_failures >= IBORROW_FAILURE_BUDGET:
             hist = borrow_history_metrics(None)
         else:
             log.info(f"[{n}/{len(symbols)}] {sym}: fetching borrow history...")
-            hist = borrow_history_metrics(fetch_iborrowdesk(sym, cache_dir))
+            data = fetch_iborrowdesk(sym, cache_dir)
+            hist = borrow_history_metrics(data)
+            # Circuit breaker: iBorrowDesk answers with a 403/hangup for every
+            # symbol now, and the 0.8 s courtesy sleep between calls turned
+            # that into ~15 min of guaranteed-to-fail waiting per run. Give up
+            # after a run of consecutive failures rather than paying it in full.
+            ibd_failures = 0 if data else ibd_failures + 1
+            if ibd_failures == IBORROW_FAILURE_BUDGET:
+                log.warning(
+                    f"iBorrowDesk: {IBORROW_FAILURE_BUDGET} consecutive "
+                    f"failures — treating the endpoint as down and skipping "
+                    f"the remaining {len(symbols) - n} symbols. The borrow "
+                    f"columns will be blank; pass ibkr_borrow= to source them "
+                    f"from the IBKR API instead.")
 
         metrics[sym] = compute_symbol_metrics(
             symbol=sym,
@@ -706,9 +774,11 @@ def enrich_dataframe(df: pd.DataFrame, cache_dir: str | None = None,
             last_close=last_close,
             si=si_map.get(sym),
             svr_series=svr_map.get(sym),
-            ftp_borrow=ftp_map.get(sym),
+            ftp_borrow=snapshot,
             borrow_hist=hist,
             regsho=regsho_flag_and_streak(sym, regsho_lists),
+            snapshot_label=snapshot_label,
+            history_label=history_label,
         )
 
     for col in OUTPUT_COLUMNS:

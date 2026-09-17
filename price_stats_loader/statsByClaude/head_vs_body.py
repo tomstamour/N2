@@ -5,7 +5,7 @@ the headline, and does it add anything on top?
 Two questions, one script, because both need the same paired machinery:
 
   SECTION A -- who wins each channel?
-      For every `<enc>_<chan>` / `<enc>_Body_<chan>` pair, the oriented AUC of
+      For every `<enc>_<chan>_hd` / `<enc>_<chan>_bd` pair, the oriented AUC of
       each and the difference, with a PAIRED BOOTSTRAP CI on that difference.
       The pairing is the whole point: both scores are computed on the same rows
       against the same labels, so the two AUCs are strongly correlated. Two
@@ -20,14 +20,13 @@ Two questions, one script, because both need the same paired machinery:
       Spearman(head, body) is reported alongside to show how much room there is.
 
 ORIENTATION IS A PRIORI, NOT FITTED. Each channel gets a fixed sign from its
-semantics (`positive`/`sentiment_score` -> +1; `negative`/`neutral`/
-`indecisive`/the LouMcD hedging counts -> -1), applied identically to the
-headline and body member of a pair. Orienting each member by its own observed
-AUC (`max(a, 1-a)`) would be a winner's curse: it can only ever push an AUC up
-toward 0.5+, so a pure-noise column scores ~0.51 instead of ~0.50 and the
-head-body difference is biased. The a priori rule reproduces the orientations
-used in report-Headline-11encoders.md (FinMarBa_indecisive and
-FinancialBERT_negative both invert) without looking at the target.
+semantics (`pos`/`ss` -> +1; `neg`/`neu`/`ind`/the LouMcD hedging counts -> -1),
+applied identically to the headline and body member of a pair. Orienting each
+member by its own observed AUC (`max(a, 1-a)`) would be a winner's curse: it can
+only ever push an AUC up toward 0.5+, so a pure-noise column scores ~0.51 instead
+of ~0.50 and the head-body difference is biased. The a priori rule reproduces the
+orientations used in report-Headline-11encoders.md (FinMarBa_ind_* and
+FinancialB_neg_* both invert) without looking at the target.
 
 MULTIPLE COMPARISONS: ~44 pairs x 2 thresholds. At a nominal 95% level, 2-4
 "significant" differences are expected from noise alone, so a Bonferroni-
@@ -52,22 +51,26 @@ from scipy.stats import norm, rankdata, spearmanr
 TARGET_DEFAULT = "fromPR_High(%)"
 TSV_DEFAULT = ("../outputs/PRstats_2026-06-20-2026-07-16_CoffeeFilter_"
                "11EncScored_Classed_kwScored_BodyEnc.tsv")
-BODY_MARKER = "_Body_"
+# Since the 2026-08-09 column unification, head/body is a terminal SUFFIX
+# (`FinMarBa_ind_hd` / `FinMarBa_ind_bd`) rather than the old `_Body_` infix, so a
+# pair differs only in its last token and no marker-splitting is needed.
+HEAD_SUFFIX = "_hd"
+BODY_SUFFIX = "_bd"
 
 # A priori sign per channel: +1 = higher value should mean a bigger spike.
 CHANNEL_SIGN = {
-    "positive": +1,
-    "sentiment_score": +1,
-    "negative": -1,
-    "neutral": -1,
-    "indecisive": -1,
-    "uncertainty": -1,
-    "litigious": -1,
-    "strong_modal": -1,
-    "weak_modal": -1,
-    "constraining": -1,
+    "pos": +1,
+    "ss": +1,
+    "neg": -1,
+    "neu": -1,
+    "ind": -1,
+    "unc": -1,
+    "lit": -1,
+    "smod": -1,
+    "wmod": -1,
+    "cons": -1,
 }
-SKIP_CHANNELS = {"label", "elapsed_ms"}
+SKIP_CHANNELS = {"lab", "ms", "at"}
 
 
 # ----------------------------- metrics --------------------------------------
@@ -140,7 +143,7 @@ def pct_rank(v):
     Unsupervised (the target is never consulted), so computing it on the full
     column is not leakage -- it is the same transform the `_pctl` columns in the
     corpus already use. It exists because the logistic below is sensitive to
-    heavy tails that the rank-based AUC is immune to: `LouMcD-SDict_Body_negative`
+    heavy tails that the rank-based AUC is immune to: `LouMcD_neg_bd`
     is a raw word count with skew 3.3 and a +6.4 sigma maximum, and a couple of
     long PRs would otherwise dominate the fit.
     """
@@ -184,20 +187,20 @@ def cv_auc(X, y, folds=5, seed=42):
 
 # ----------------------------- pairing --------------------------------------
 def split_body_col(col):
-    """`FinMarBa_Body_indecisive` -> ('FinMarBa', 'indecisive')."""
-    enc, chan = col.split(BODY_MARKER, 1)
+    """`FinMarBa_ind_bd` -> ('FinMarBa', 'ind')."""
+    enc, chan = col[:-len(BODY_SUFFIX)].rsplit("_", 1)
     return enc, chan
 
 
 def find_pairs(columns):
     pairs = []
     for col in columns:
-        if BODY_MARKER not in col:
+        if not col.endswith(BODY_SUFFIX):
             continue
         enc, chan = split_body_col(col)
         if chan in SKIP_CHANNELS or chan not in CHANNEL_SIGN:
             continue
-        head = f"{enc}_{chan}"
+        head = f"{enc}_{chan}{HEAD_SUFFIX}"
         if head in columns:
             pairs.append((enc, chan, head, col))
     return pairs

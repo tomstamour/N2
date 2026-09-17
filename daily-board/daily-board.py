@@ -15,6 +15,18 @@ SSH, no browser needed). Four columns are added immediately after Symbol:
     Surge          — the local market time when the trade-mole detected a price/volume surge,
                      or "None" if no surge was detected.
 
+The columns the trade gate reads (../orchestrator5/orchestrator_trigger_rules.txt)
+are grouped together immediately after ArrivalTime — for the current rules that is
+FineClass, Prosus_pos_hd, FinMarBa_ind_hd, kw15_proba_bd, kw15_proba_hd,
+FLANG_ss_hd, EarningScore — so the whole trade decision reads at a glance;
+ClerkSentiment, the gate's fired-rule verdict, follows immediately after the
+group (to the right of EarningScore). A trigger cell is suffixed with "*" when
+its value clears the bar for at least one
+gate rule (e.g. Prosus_pos_hd >= 0.5). Both the column set and the thresholds are
+read from the rules file at startup, so they track the live gate — restart the
+board after editing the rules. If the rules file cannot be parsed the board still
+runs, just without the grouping and the "*".
+
 Data sourcing (chosen to respect IBKR pacing while refreshing every 30s):
   * ONE historical backfill per symbol at startup  → high & price since ArrivalTime.
   * Then a live streaming market-data subscription per symbol keeps a running max.
@@ -56,14 +68,24 @@ from ib_insync import IB, Stock
 
 # Default directory to scan for the latest news_output_*.tsv. Resolved relative
 # to this script's location so it works from any working directory.
-# NOTE: the original brief said ".../orchestrator3/tables/", but the files this
-# project actually produces live in ".../orchestrator3/outputs/", so that is the
-# default here. Override with --dir if needed.
+# The trigger-involved columns (Prosus_pos_hd, FineClass, ... — see
+# TRIGGER_RULES_FILE) exist ONLY in the Orchestrator5.2 schema written to
+# ".../orchestrator5/tables/", so that is the default. The old
+# ".../orchestrator3/outputs/" files are the pre-2026 11-column schema without
+# any of those columns. Override with --dir if needed.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_INPUT_DIR = os.path.normpath(
-    os.path.join(_SCRIPT_DIR, '..', 'orchestrator3', 'outputs')
+    os.path.join(_SCRIPT_DIR, '..', 'orchestrator5', 'tables')
 )
 INPUT_GLOB_PREFIX = 'news_output_'
+# The trade gate. daily-board parses this ONCE at startup to learn which columns
+# the gate reads (they get grouped right after ArrivalTime) and at what
+# thresholds (a cell that clears its bar is marked with '*'). See
+# parse_trigger_rules(). Kept in sync with the live gate for free: edit the rules
+# file, restart the board. Override with --trigger-rules.
+TRIGGER_RULES_FILE = os.path.normpath(
+    os.path.join(_SCRIPT_DIR, '..', 'orchestrator5', 'orchestrator_trigger_rules.txt')
+)
 MOLE_OUTPUT_DIR = os.path.normpath(
     os.path.join(_SCRIPT_DIR, '..', 'x-wing-mole', 'mole-outputs')
 )
@@ -192,6 +214,151 @@ def parse_arrival_utc(arrival_str: str, arrival_date: str = ''):
 
 
 # --------------------------------------------------------------------------- #
+# Trigger-rules parsing (mirror of the Orchestrator5.2 gate, for display only)
+# --------------------------------------------------------------------------- #
+#
+# daily-board reads ../orchestrator5/orchestrator_trigger_rules.txt to learn two
+# things: WHICH columns the live trade gate reads (they get grouped after
+# ArrivalTime) and at WHAT threshold each condition passes (a cell that clears
+# its bar is marked '*'). This is a deliberately tolerant re-implementation of
+# the DSL that Orchestrator5.2.py parses with hard-fail discipline: a trading
+# process must refuse to start on a malformed gate, but a read-only viewer must
+# not — so anything unparseable here just disables the feature for the run (log a
+# warning, render the board without the grouping / '*'). It is intentionally NOT
+# imported from O5.2: that would drag the whole model/IB import graph into a
+# standalone viewer.
+
+_TRIGGER_OPS = ('>=', '<=', '==', '!=', '>', '<')   # 2-char before 1-char
+
+
+def _coerce_rhs(op, raw):
+    """Coerce a condition's right-hand side once, at parse time.
+
+    in / not in -> frozenset of lowercased tokens (braces optional, comma list).
+    numeric comparators -> float.
+    == / != -> float when it parses, else lowercased string (case-insensitive).
+    """
+    raw = raw.strip()
+    if op in ('in', 'not in'):
+        body = raw.lstrip('{').rstrip('}')
+        return frozenset(t.strip().lower() for t in body.split(',') if t.strip())
+    if op in ('>=', '<=', '>', '<'):
+        return float(raw)
+    try:                                 # == / !=
+        return float(raw)
+    except ValueError:
+        return raw.lower()
+
+
+def _split_condition(text):
+    """'field op value' -> (field, op, raw_value). Raises ValueError if no op."""
+    field, _, rest = text.strip().partition(' ')
+    rest = rest.strip()
+    low = rest.lower()
+    if low.startswith('not in '):
+        return field, 'not in', rest[len('not in '):]
+    if low.startswith('in '):
+        return field, 'in', rest[len('in '):]
+    for op in _TRIGGER_OPS:
+        if rest.startswith(op):
+            return field, op, rest[len(op):]
+    raise ValueError(f"no operator in condition {text!r}")
+
+
+def parse_trigger_rules(path):
+    """orchestrator_trigger_rules.txt -> (field_order, conds_by_field).
+
+    field_order   : distinct field names in first-appearance order across every
+                    rule (ordinary AND REQUIRE) — the columns to group after
+                    ArrivalTime, in the order O5.2's _load_trigger_rules uses.
+    conds_by_field: field -> list[(op, coerced_rhs)] — every condition reading
+                    that field, for the per-cell '*' test.
+
+    Tolerant: on ANY problem, logs a warning and returns ([], {}) so the caller
+    just renders the board without the trigger grouping or the '*'. (O5.2 fails
+    closed here; a viewer fails open.)
+    """
+    field_order = []
+    conds_by_field = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        log.warning("trigger rules unreadable (%s) — no trigger grouping/'*'", exc)
+        return [], {}
+
+    try:
+        for line in lines:
+            line = line.split('#', 1)[0].strip()      # drop comments + blanks
+            if not line or ':' not in line:
+                continue
+            # A REQUIRE precondition contributes its fields/conditions exactly
+            # like an ordinary rule for display (that is how FineClass from the
+            # ClassWhitelist precondition earns a '*'); the rule NAME before the
+            # ':' is irrelevant to a viewer, so it is simply discarded.
+            _name, _, cond_part = line.partition(':')
+            for chunk in re.split(r'\s+AND\s+', cond_part.strip(), flags=re.IGNORECASE):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                field, op, raw = _split_condition(chunk)
+                rhs = _coerce_rhs(op, raw)
+                if field not in conds_by_field:
+                    conds_by_field[field] = []
+                    field_order.append(field)
+                conds_by_field[field].append((op, rhs))
+    except (ValueError, TypeError) as exc:
+        log.warning("trigger rules unparseable (%s) — no trigger grouping/'*'", exc)
+        return [], {}
+
+    # Mirror O5.2 _load_trigger_rules: EarningScore's NA logic reads FineClass, so
+    # FineClass is always in the field set whenever EarningScore is referenced.
+    if 'EarningScore' in conds_by_field and 'FineClass' not in conds_by_field:
+        field_order.append('FineClass')
+        conds_by_field.setdefault('FineClass', [])
+
+    return field_order, conds_by_field
+
+
+def _cond_holds(op, rhs, cell_raw):
+    """True when a raw TSV cell value satisfies one (op, rhs) condition.
+
+    Tolerant: a blank or non-numeric cell against a numeric op simply returns
+    False (never raises), so a missing score just goes unmarked.
+    """
+    s = ('' if cell_raw is None else str(cell_raw)).strip()
+    if op in ('in', 'not in'):
+        member = s.lower() in rhs
+        return member if op == 'in' else not member
+    if isinstance(rhs, str):                 # string == / !=
+        if op == '==':
+            return s.lower() == rhs
+        if op == '!=':
+            return s.lower() != rhs
+        return False
+    try:                                     # numeric comparison
+        v = float(s)
+    except (TypeError, ValueError):
+        return False
+    return {
+        '>=': v >= rhs, '<=': v <= rhs, '>': v > rhs,
+        '<': v < rhs, '==': v == rhs, '!=': v != rhs,
+    }.get(op, False)
+
+
+def _row_star_cols(row, conds_by_field):
+    """Set of trigger fields whose cell in `row` clears at least one of its bars."""
+    starred = set()
+    for field, conds in conds_by_field.items():
+        cell = row.get(field)
+        if cell is None or str(cell).strip() == '':
+            continue
+        if any(_cond_holds(op, rhs, cell) for op, rhs in conds):
+            starred.add(field)
+    return starred
+
+
+# --------------------------------------------------------------------------- #
 # Surge detection lookup
 # --------------------------------------------------------------------------- #
 
@@ -272,25 +439,63 @@ def _read_surge_time(path):
 class DataManager:
     """Owns the IB connection, per-row backfill, and the live running highs."""
 
-    def __init__(self, ib: IB, columns, rows, file_label, refresh=REFRESH_SECONDS):
+    def __init__(self, ib: IB, columns, rows, file_label, refresh=REFRESH_SECONDS,
+                 trigger_rules_path=TRIGGER_RULES_FILE):
         self.ib = ib
         self.file_label = file_label
         self.refresh = refresh
 
-        # Display column order: Symbol, computed columns, Headline, then positioned
-        # and remaining columns (minus Symbol itself and any hidden columns).
+        # Learn the trade gate's columns + thresholds from the rules file. Both are
+        # empty on any parse failure, which turns the whole feature off cleanly.
+        self.trigger_field_order, self.trigger_conds = parse_trigger_rules(
+            trigger_rules_path)
+
+        # Display column order: Symbol, computed columns, then the rest (minus
+        # Symbol itself and any hidden columns).
         rest = [c for c in columns if c not in HIDDEN_COLS and c != 'Symbol']
 
-        # Position specific columns right after Headline
+        # Group the gate's columns together immediately after ArrivalTime, in the
+        # order the rules read them, so the whole trade decision reads at a glance.
+        trigger_group = [c for c in self.trigger_field_order if c in rest]
+        rest = [c for c in rest if c not in trigger_group]
+        if trigger_group:
+            if 'ArrivalTime' in rest:
+                at_idx = rest.index('ArrivalTime')
+                rest = rest[:at_idx + 1] + trigger_group + rest[at_idx + 1:]
+            else:
+                rest = trigger_group + rest
+
+        # Place ClerkSentiment (the gate's fired-rule verdict) immediately to the
+        # right of EarningScore, so the outcome sits beside the scores that drove
+        # it. Only when both are present (a no-op on schemas/rules lacking either).
+        if 'ClerkSentiment' in rest and 'EarningScore' in rest:
+            rest = [c for c in rest if c != 'ClerkSentiment']
+            es_idx = rest.index('EarningScore')
+            rest = rest[:es_idx + 1] + ['ClerkSentiment'] + rest[es_idx + 1:]
+
+        # Position specific columns right after Headline. With the grouping above
+        # ON, the gate columns were already pulled out of `rest`, so this now only
+        # bites as the graceful fallback — an old-schema TSV, or a rules file that
+        # failed to parse — where it still groups the sentiment cols after Headline
+        # exactly as before.
         # 'model_proba_PLUS_kw_mult_nb' is the pre-2026-07-28 keyword score, kept
         # here so older TSVs still position it; O5.2 now writes kw15_*_proba
         # instead. Entries absent from the file are filtered out just below, so
         # listing both schemas is safe.
-        positioned_after_headline = ['positive', 'FMB_indecisive',
+        positioned_after_headline = ['Prosus_pos_hd', 'FinMarBa_ind_hd',
+                                     'kw15_proba_bd', 'kw15_proba_hd',
+                                     'FLANG_ss_hd',
+                                     # pre-2026-08-09 spellings, still listed so an
+                                     # unmigrated TSV keeps its column ordering
+                                     'positive', 'FMB_indecisive',
                                      'kw15_body_proba', 'kw15_head_proba',
                                      'FLANG_sentiment_score',
                                      'model_proba_PLUS_kw_mult_nb']
-        to_reposition = [c for c in positioned_after_headline if c in rest]
+        # Exclude the trigger group: those were just placed after ArrivalTime and
+        # are back in `rest`, so without this they'd be yanked to after Headline
+        # again, splitting the group.
+        to_reposition = [c for c in positioned_after_headline
+                         if c in rest and c not in trigger_group]
         remaining = [c for c in rest if c not in to_reposition]
 
         # Find Headline and insert positioned columns after it
@@ -304,6 +509,13 @@ class DataManager:
 
         # Per-row state.  Each entry mirrors a source row plus computed fields.
         self.rows = rows
+        # Precompute the '*' set per row ONCE: trigger-field values come straight
+        # from the TSV and never change with live ticks (only PostPR/Surge do).
+        # Stored under a private key so it is never treated as a column — never
+        # rendered as one, never written to the exported TSV.
+        if self.trigger_conds:
+            for r in rows:
+                r['__stars__'] = frozenset(_row_star_cols(r, self.trigger_conds))
         self.symbols = []                 # unique, ordered
         self.contracts = {}               # symbol -> qualified Contract
         self.arrival_price = [None] * len(rows)   # price ~at ArrivalTime, per row
@@ -577,14 +789,21 @@ def _fmt_cell(col, row):
     if val is None:
         return ''
     s = str(val).replace('\t', ' ').replace('\n', ' ').strip()
+    # A trigger cell whose value clears at least one gate bar gets a '*' — the
+    # same marker _fmt_cell_tsv writes to the exported file, so screen and table
+    # match. __stars__ is empty/absent for every non-trigger cell.
+    if col in row.get('__stars__', ()):
+        s += '*'
     return s
 
 
 def _fmt_cell_tsv(col, row):
     """File-oriented cell formatting: plain numbers, no sign/%, empty when missing.
 
-    Distinct from _fmt_cell (which adds +/%/— for the screen) so the written TSV
-    stays machine-readable and re-importable.
+    Distinct from _fmt_cell (which adds +/%/— for the screen), but it DOES share
+    the trigger '*' marker: a gate cell that clears its bar is written as e.g.
+    '0.6183*', so the exported table matches the board. Note the '*' makes those
+    trigger columns non-numeric, so a consumer that re-parses them must strip it.
     """
     val = row.get(col)
     if col in DOLLAR_COLS or col in PCT_COLS:
@@ -592,7 +811,13 @@ def _fmt_cell_tsv(col, row):
     if val is None:
         return ''
     # keep the full value (no truncation) but never break the TSV grid
-    return str(val).replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+    s = str(val).replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+    # Same trigger marker the screen shows (see _fmt_cell), so the saved table
+    # matches the board. Never a DOLLAR/PCT col (those returned above); __stars__
+    # is empty/absent for every non-trigger cell.
+    if col in row.get('__stars__', ()):
+        s += '*'
+    return s
 
 
 def _sort_value(col, row):
@@ -691,6 +916,9 @@ def _cell_attr(col, row):
                 return curses.color_pair(C_RED)
     if col in DOLLAR_COLS:
         return curses.A_BOLD
+    # A trigger cell that cleared its bar (has a '*') — make the value pop.
+    if col in row.get('__stars__', ()):
+        return curses.color_pair(C_GREEN) | curses.A_BOLD
     return 0
 
 
@@ -928,6 +1156,10 @@ def main():
     parser.add_argument('--out', default=None,
                         help=f"TSV file written (overwritten) every {WRITE_SECONDS}s "
                              f"(default: daily-board_<input-date>.tsv in {_SCRIPT_DIR})")
+    parser.add_argument('--trigger-rules', default=TRIGGER_RULES_FILE,
+                        help="trade-gate rules file; its columns are grouped "
+                             "after ArrivalTime and each cell is starred when it "
+                             f"clears a gate bar (default: {TRIGGER_RULES_FILE})")
     parser.add_argument('--rth', action='store_true',
                         help="regular trading hours only (default: all hours)")
     parser.add_argument('--stop-time', default='20:00',
@@ -996,7 +1228,8 @@ def main():
         return
     print("[daily-board] Connected. Qualifying + backfilling highs...")
 
-    dm = DataManager(ib, columns, rows, os.path.basename(path), refresh=args.refresh)
+    dm = DataManager(ib, columns, rows, os.path.basename(path), refresh=args.refresh,
+                     trigger_rules_path=args.trigger_rules)
     dm.out_path = args.out or _default_out_path(path)
     try:
         dm.prepare(max_symbols=args.max_symbols)

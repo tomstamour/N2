@@ -23,7 +23,25 @@ path/to/venv/bin/python trade-mole-2.1.py --symbol JWEL --clientID 1112 \
 
 
 ### 3. X-WING — standalone (own connection; capital/account/limits/etc. hard-coded in script)
-#   2.1 is the LIVE driven version (adds Price Management Algo on the BUY entry); 2.0 kept on disk.
-path/to/venv/bin/python x-wing-2.1.py --symbol YYGH --last-close-price 0.15
+#   3.0 is the current version (entry limit TRACKS the ask); clerk-1.2 loads it.
+#   2.1 is what clerk-1.1 (the live duo fallback) still loads; 2.0 kept on disk.
+path/to/venv/bin/python x-wing-3.0.py --symbol YYGH --last-close-price 0.15
 #   then FIRE the entry (manual buy-signal):
-pkill -USR1 -f "x-wing-2.1.py --symbol JWEL"
+pkill -USR1 -f "x-wing-3.0.py --symbol JWEL"
+
+### 3b. X-WING 3.0 — ask-tracking knobs (all default from the top-of-file block)
+#   offset above the LIVE ask (also the opening pad), percent of price:
+path/to/venv/bin/python x-wing-3.0.py --symbol YYGH --last-close-price 0.15 \
+  --max-limit-entry-percent-price 2.5 --entry-track-max-pct 6.0 \
+  --entry-track-up-window 3.0
+#   revert to 2.1 single-shot pricing (price once, then rest) WITHOUT swapping files:
+path/to/venv/bin/python x-wing-3.0.py --symbol YYGH --last-close-price 0.15 --no-entry-track
+#   NOTE --max-cap-entry-percent (the old last_close+30% clamp) defaults to None in
+#   3.0; pass it explicitly only if you want the legacy clamp back for a test.
+
+### 3c. X-WING 3.0 — offline verification (no Gateway, no orders)
+path/to/venv/bin/python analyze_trade_mole/verify_xwing3_tracking.py
+
+### 4. CLERK 1.2 (TRIO: trade-mole + T47 + a sequence of x-wing runs)
+#   Loads x-wing-3.0.py since 2026-08-12. RUN ON THE PAPER GW (4002) until verified.
+path/to/venv/bin/python clerk-1.2.py --client-qty 5 --port 4002 --listen-port 8765

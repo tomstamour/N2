@@ -47,8 +47,8 @@ Library usage (filename contains a hyphen, so use importlib):
 
     mod.load_model()                      # optional pre-warm
     result = mod.analyze_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.91, "negative": 0.02, "neutral": 0.07,
-    #  "sentiment_score": 0.89, "label": "positive", "inference_ms": 110.3}
+    # {"headline": "...", "pos": 0.91, "neg": 0.02, "neu": 0.07,
+    #  "ss": 0.89, "lab": "positive", "ms": 110.3}
 """
 
 import argparse
@@ -268,12 +268,12 @@ def analyze_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     Returns:
         {
             "headline":        str,
-            "positive":        float,
-            "negative":        float,
-            "neutral":         float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax of the three classes
-            "inference_ms":    float,   # tokenize + forward + decode wall time
+            "pos":             float,
+            "neg":             float,
+            "neu":             float,
+            "ss":              float,   # positive - negative
+            "lab":             str,     # argmax of the three classes
+            "ms":              float,   # tokenize + forward + decode wall time
         }
     """
     load_model(model_dir)
@@ -284,12 +284,15 @@ def analyze_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
 
     return {
         "headline":        headline,
-        "positive":        scores["positive"],
-        "negative":        scores["negative"],
-        "neutral":         scores["neutral"],
-        "sentiment_score": round(scores["positive"] - scores["negative"], 4),
-        "label":           max(LABEL_ORDER, key=lambda k: scores[k]),
-        "inference_ms":    round(elapsed_ms, 1),
+        # Unified 2026-08-09 key names; internals keep full words (see FinMarBa).
+        # `ms` also unifies what this file used to call `inference_ms` with the
+        # `elapsed_ms` the other headliners returned.
+        "pos": scores["positive"],
+        "neg": scores["negative"],
+        "neu": scores["neutral"],
+        "ss":  round(scores["positive"] - scores["negative"], 4),
+        "lab": max(LABEL_ORDER, key=lambda k: scores[k]),
+        "ms":  round(elapsed_ms, 1),
     }
 
 
@@ -331,7 +334,7 @@ def _run_benchmark(headline: str, repeats: int) -> None:
 
     timings = []
     for _ in range(repeats):
-        timings.append(analyze_headline(headline)["inference_ms"])
+        timings.append(analyze_headline(headline)["ms"])
 
     t = np.array(timings)
     print(json.dumps({

@@ -30,15 +30,15 @@ TARGET = "DailyHigh(%)"
 # Score columns as named in the current PR-stats TSVs (nocoref_* FinBERT
 # derivatives plus the keyword/model scores from keyword_scorer).
 SENTIMENT_COLUMNS = [
-    "sentiment_score",
+    "Prosus_ss_hd",
     "nocoref_neutral_filter",
     "nocoref_confidence_weighted",
     "nocoref_net_score",
     "nocoref_top_k",
     "nocoref_positional",
-    "positive",
-    "negative",
-    "neutral",
+    "Prosus_pos_hd",
+    "Prosus_neg_hd",
+    "Prosus_neu_hd",
     "positive_minus_neutral",
     "Headline-RBscore",
     "model_proba",
@@ -63,7 +63,7 @@ def load_data(tsv_path: pathlib.Path) -> pd.DataFrame:
         if col == "positive_minus_neutral":
             continue
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["positive_minus_neutral"] = df["positive"] - df["neutral"]
+    df["positive_minus_neutral"] = df["Prosus_pos_hd"] - df["Prosus_neu_hd"]
     df = df.dropna(subset=[TARGET])
     df = df.dropna(subset=SENTIMENT_COLUMNS, how="all")
     return df

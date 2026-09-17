@@ -30,13 +30,13 @@ TARGET = "DailyHigh(%)"
 
 NUMERIC_COLS = [
     "Float",
-    "positive", "negative", "neutral", "sentiment_score",
+    "Prosus_pos_hd", "Prosus_neg_hd", "Prosus_neu_hd", "Prosus_ss_hd",
     "body_duration_ms",
     "neutral_filter", "confidence_weighted", "net_score", "top_k", "positional",
     "recommended",
 ]
 
-CATEGORICAL_COLS = ["Author", "Exchange", "label"]
+CATEGORICAL_COLS = ["Author", "Exchange", "Prosus_lab_hd"]
 
 HEADLINE_KEYWORDS = [
     "class action", "investor alert", "shareholder alert", "lawsuit",

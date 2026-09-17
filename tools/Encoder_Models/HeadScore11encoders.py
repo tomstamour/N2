@@ -13,13 +13,19 @@ Usage:
         --input ../../price_stats_loader/outputs/01_PR-stats-...tsv
     # quick test on a subset:
     /home/tom/venv/bin/python HeadScore11encoders.py --input FILE \
-        --limit 5 --models FinMarBa,LouMcD-SDict
+        --limit 5 --models FinMarBa,LouMcD
 
-Appended columns, in model order below (70 total for all 11 models):
-  transformers: {M}_negative {M}_neutral {M}_positive {M}_sentiment_score
-                {M}_label {M}_elapsed_ms   (FinMarBa's middle class is
-                `indecisive`, kept under its real name)
-  LouMcD-SDict: the 7 category counts + sentiment_score + label + elapsed_ms
+Appended columns, in model order below (70 total for all 11 models). Since
+2026-08-09 every column follows the unified convention `{Model}_{channel}_hd`,
+identical to what Orchestrator5.2 writes live — see tools/Encoder_Models/CLAUDE.md:
+  transformers: {M}_neg_hd {M}_neu_hd {M}_pos_hd {M}_ss_hd {M}_lab_hd {M}_ms_hd
+                (FinMarBa's middle class is `ind`, NOT `neu` — a low value means
+                confident in EITHER direction, so the distinct name is load-bearing)
+  LouMcD-SDict: the 7 category counts + _ss_hd + _lab_hd + _ms_hd
+
+The `_hd` suffix is applied HERE, not in the headliners: a headliner scoring a
+body string cannot know which channel it got, which is exactly how
+BodyScore11encoders.py reuses this same registry to emit `_bd`.
 """
 
 import argparse
@@ -33,25 +39,30 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # Same registry as verify_headliners.py: script filename + scoring-fn name.
-# `keys` = result-dict keys written out, in column order, prefixed "{name}_".
-_STD_KEYS = ["negative", "neutral", "positive", "sentiment_score", "label", "elapsed_ms"]
+# The MODEL NAMES here are the column tokens of the unified 2026-08-09 convention
+# (hyphen-free, so a column is a legal pandas attribute), and `keys` are the
+# headliners' result-dict keys, written out in column order as
+# "{name}_{key}_{hd|bd}". Keep this list in step with verify_headliners.py's own
+# registry — the model names are the shared contract between the two.
+_STD_KEYS = ["neg", "neu", "pos", "ss", "lab", "ms"]
 MODELS = {
-    "FinMarBa":      {"script": "FinMarBa_headliner.py",      "fn": "score_headline",
-                      "keys": ["negative", "indecisive", "positive",
-                               "sentiment_score", "label", "elapsed_ms"]},
-    "FLANG-BERT":    {"script": "FLANG-BERT_headliner.py",    "fn": "analyze_headline", "keys": _STD_KEYS},
-    "FLANG-ELECTRA": {"script": "FLANG-ELECTRA_headliner.py", "fn": "analyze_headline", "keys": _STD_KEYS},
-    "RoBERTa":       {"script": "RoBERTa_headliner.py",       "fn": "score_headline",   "keys": _STD_KEYS},
-    "ModernBERT":    {"script": "ModernBERT_headliner.py",    "fn": "analyze_headline", "keys": _STD_KEYS},
-    "DeBERTa":       {"script": "DeBERTa_headliner.py",       "fn": "analyze_headline", "keys": _STD_KEYS},
-    "finbert-tone":  {"script": "finbert-tone_headliner.py",  "fn": "score_headline",   "keys": _STD_KEYS},
-    "FinancialBERT": {"script": "FinancialBERT_headliner.py", "fn": "score_headline",   "keys": _STD_KEYS},
-    "distilroberta": {"script": "distilroberta_headliner.py", "fn": "score_headline",   "keys": _STD_KEYS},
-    "Trading-Hero":  {"script": "Trading-Hero_headliner.py",  "fn": "score_headline",   "keys": _STD_KEYS},
-    "LouMcD-SDict":  {"script": "LouMcD-SDict_headliner.py",  "fn": "score_headline",
-                      "keys": ["negative", "positive", "uncertainty", "litigious",
-                               "strong_modal", "weak_modal", "constraining",
-                               "sentiment_score", "label", "elapsed_ms"]},
+    "FinMarBa":   {"script": "FinMarBa_headliner.py",      "fn": "score_headline",
+                   # `ind`, not `neu`: FinMarBa's middle class is `indecisive`, and a
+                   # low value means confident in EITHER direction. The distinct token
+                   # is what stops it being read as an ordinary neutral probability.
+                   "keys": ["neg", "ind", "pos", "ss", "lab", "ms"]},
+    "FLANG":      {"script": "FLANG-BERT_headliner.py",    "fn": "analyze_headline", "keys": _STD_KEYS},
+    "FLElectra":  {"script": "FLANG-ELECTRA_headliner.py", "fn": "analyze_headline", "keys": _STD_KEYS},
+    "RoBERTa":    {"script": "RoBERTa_headliner.py",       "fn": "score_headline",   "keys": _STD_KEYS},
+    "ModernB":    {"script": "ModernBERT_headliner.py",    "fn": "analyze_headline", "keys": _STD_KEYS},
+    "DeBERTa":    {"script": "DeBERTa_headliner.py",       "fn": "analyze_headline", "keys": _STD_KEYS},
+    "FinTone":    {"script": "finbert-tone_headliner.py",  "fn": "score_headline",   "keys": _STD_KEYS},
+    "FinancialB": {"script": "FinancialBERT_headliner.py", "fn": "score_headline",   "keys": _STD_KEYS},
+    "DistilRo":   {"script": "distilroberta_headliner.py", "fn": "score_headline",   "keys": _STD_KEYS},
+    "TradeHero":  {"script": "Trading-Hero_headliner.py",  "fn": "score_headline",   "keys": _STD_KEYS},
+    "LouMcD":     {"script": "LouMcD-SDict_headliner.py",  "fn": "score_headline",
+                   "keys": ["neg", "pos", "unc", "lit", "smod", "wmod", "cons",
+                            "ss", "lab", "ms"]},
 }
 
 PROGRESS_EVERY = 250
@@ -89,8 +100,9 @@ def score_table(rows, headline_idx, model_names):
             headline = row[headline_idx].strip() if headline_idx < len(row) else ""
             if headline:
                 result = score_fn(headline)
-                # zero-shot/FLANG scripts name their timing key inference_ms
-                result.setdefault("elapsed_ms", result.get("inference_ms"))
+                # No timing-key normalisation needed since 2026-08-09: every
+                # headliner returns `ms`, where 7 used to say `elapsed_ms` and 4
+                # `inference_ms`.
                 row.extend(_fmt(result[k]) for k in keys)
             else:
                 row.extend([""] * len(keys))
@@ -150,7 +162,8 @@ def main() -> int:
     print(f"Models: {', '.join(model_names)}")
 
     for name in model_names:
-        header.extend(f"{name}_{k}" for k in MODELS[name]["keys"])
+        # `_hd` = the scored text was the HEADLINE (BodyScore11encoders emits `_bd`).
+        header.extend(f"{name}_{k}_hd" for k in MODELS[name]["keys"])
 
     t0 = time.perf_counter()
     score_table(rows, headline_idx, model_names)

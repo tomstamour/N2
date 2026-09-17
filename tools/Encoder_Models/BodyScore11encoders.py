@@ -7,16 +7,23 @@ Each Body cell is prepped with body_prep.prep_body(): newswire cleaning
 (CSV-escape artifact, repeated headline, "CITY, Date (WIRE) --" dateline,
 tracker URLs/vendor tokens) then capped at the first 200 words (~260–290
 tokens; each model's own tokenizer enforces its final 512/256/128-token max).
-Model outputs are appended as `{Model}_Body_*` columns so they never collide
-with the `{Model}_*` headline columns of an already-scored file. Output file is
-the input filename with `.tsv` replaced by `_11EncBodyScored.tsv`.
+Model outputs are appended as `{Model}_{channel}_bd` columns so they never
+collide with the `{Model}_{channel}_hd` headline columns of an already-scored
+file. Output file is the input filename with `.tsv` replaced by
+`_11EncBodyScored.tsv`.
+
+⚠ 2026-08-09: the body marker moved from the `_Body_` INFIX to a terminal `_bd`
+SUFFIX, so head and body columns now differ only in their last token and every
+column matches what Orchestrator5.2 writes live. Files scored before that date
+carry the old `{Model}_Body_{key}` names — migrate them with
+rename_encoder_cols.py rather than re-scoring.
 
 Usage:
     /home/tom/venv/bin/python BodyScore11encoders.py \
         --input ../../price_stats_loader/outputs/PRstats_..._11EncScored.tsv
     # quick test on a subset:
     /home/tom/venv/bin/python BodyScore11encoders.py --input FILE \
-        --limit 5 --models distilroberta,LouMcD-SDict
+        --limit 5 --models DistilRo,LouMcD
 """
 
 import argparse
@@ -99,7 +106,11 @@ def main() -> int:
     print(f"Prep done in {time.perf_counter() - t0:.1f} s")
 
     for name in model_names:
-        header.extend(f"{name}_Body_{k}" for k in MODELS[name]["keys"])
+        # `_bd` = the scored text was the BODY. Since 2026-08-09 this is a terminal
+        # SUFFIX matching HeadScore's `_hd`, replacing the old `_Body_` infix — which
+        # is why head_vs_body.py / merge_body_encoder_cols.py no longer need a
+        # BODY_MARKER split.
+        header.extend(f"{name}_{k}_bd" for k in MODELS[name]["keys"])
 
     t0 = time.perf_counter()
     score_table(rows, prep_idx, model_names)

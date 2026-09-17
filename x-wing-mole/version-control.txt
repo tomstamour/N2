@@ -6,7 +6,9 @@ as an in-process "duo" on ONE shared, pre-warmed ibapi client from a pool.
 
 Live chain (three separate processes):
     RTPR_connector3 ─tcp8900─► orchestrator5 ─tcp8765─► clerk-1.1 ─► Gateway
-Current live scripts: clerk-1.1.py, trade-mole-2.1.py, x-wing-2.1.py.
+Current live scripts: clerk-1.1.py, trade-mole-2.2.py, x-wing-2.1.py.
+clerk-1.2.py (trio, paper-verify pending) loads trade-mole-2.2.py,
+T47-airspeeder-2.0.py and x-wing-3.0.py.
 Run everything with the venv python (system python3 lacks ibapi).
 Ports: 4001 = LIVE Gateway, 4002 = paper GW, 7497 = paper TWS.
 
@@ -45,7 +47,7 @@ Constant across versions:
         yield or the protective stop).
 
 --------------------------------------------------------------------------------
-2.0  ->  2.1     (x-wing-2.1.py)                                        [CURRENT]
+2.0  ->  2.1     (x-wing-2.1.py)                        [clerk-1.1 fallback only]
 --------------------------------------------------------------------------------
   - ADDED the IBKR Price Management Algo on the BUY ENTRY ONLY:
     Order.usePriceMgmtAlgo = True, gated by the module constant
@@ -70,6 +72,309 @@ Constant across versions:
   - STATUS: local verification passes (the placed entry carries the flag; stop /
     exit orders do not; pricing constants intact). Live effectiveness against the
     pre-market reject is still to be confirmed on the paper GW (4002).
+  - VERDICT 2026-08-12: PMA does NOT do the job it was added for. NCRA 2026-07-29
+    was silently deactivated WITH the flag attached (first Part-B case in the 2.1
+    era), and 2161 caps predate 2.1 entirely (seen 07-20 and 07-22), so it
+    addresses neither failure mode. 3.0 turns it off.
+
+--------------------------------------------------------------------------------
+2.1  ->  3.0     (x-wing-3.0.py)                                        [CURRENT]
+--------------------------------------------------------------------------------
+  Loaded by clerk-1.2.py:135 since 2026-08-12. clerk-1.1.py stays on 2.1 as the
+  live duo fallback until 3.0 is paper-GW verified. A RUNNING clerk keeps its
+  imported module — the loader change takes effect on the next clerk restart.
+
+  THE CHANGE: the entry limit is no longer priced once and left resting. It is
+  re-priced IN PLACE on the SAME orderId so it holds ~2.5% above the LIVE ask,
+  in BOTH directions. Never cancel/replace: T47's late-fill guard keys on
+  ctl.active_buy_id and its ctl.orders lookup assumes one entry id per run, so a
+  second id would break the trio. (The protective ladder has always modified in
+  place, which is what proved the pattern works on this account/socket.)
+
+  WHY — two measured problems with "price once, then rest":
+    1. A static limit is a STALE CEILING that IBKR fills us into. Of 248 filled
+       entries, ALL 20 that took >10 s paid 100% of the pad; IBKR's price-cap
+       machinery ratchets a resting over-market limit up toward itself over
+       3-90 s. That is the population rejected-orders-findings.txt shows losing
+       9-13% (BAOS -13.40%, NIVF -11.54%, GWH -9.35%). Immediate fills consume
+       ~0% of the pad (70.2% fill at or below the reference ask). So 2.1 was
+       ALREADY chasing — just on IBKR's schedule, up to a number chosen before
+       the tape existed.
+    2. The last_close * 1.30 clamp priced 7 of 317 entries BELOW the market
+       (GLE -24.8%, UZX -19.8%, NUWE -43.2%, BYAH -41.7%, ICCM -70.4%,
+       OBAI -17.8%, BNRG -12.1%) and made T47 re-entries structurally unfillable
+       on any name that had run (GLE forfeited a +52.6% winner).
+
+  ASYMMETRIC BY DESIGN — this is the core of 3.0:
+    - UP is time-boxed to ENTRY_TRACK_UP_WINDOW_SEC = 3.0 s, then _track_up_frozen.
+      84.6% of fills land within 3 s and every deep-tail loser on record is >=7 s,
+      so bidding higher after that is exactly what the 30->10 s timeout cut removed.
+    - DOWN is NOT time-boxed; it runs to the 10 s ENTRY_FILL_TIMEOUT_SEC. It is
+      the only thing that stops a limit becoming the stale ceiling of problem 1.
+    - The UP window check is LAZY: it lives inside the "do we want to move up?"
+      branch, so it fires on the FIRST WANTED up-move after 3 s, not at t=3 s.
+
+  2026-08-13  ENTRY_CAP_RESCUE_ENABLED = True — one post-window UP move when a
+  2161 cap has the order parked UNDER the offer. Armed only while entry_capped_to
+  is set and the working price (entry_lmt_working via openOrder, else the 2161 cap
+  itself) is below the live ask; blocked by a 202; spent only when the modify
+  actually reaches the wire. New event CAP_RESCUE. Same day also: a 202 that is
+  the ack of OUR OWN cancel (_entry_abort_pending) no longer logs as the
+  aggressive-limit wall and no longer freezes tracking.
+    WHY — MGRX 2026-08-13 16:05 vs REBN 2026-08-13 07:30, same clerk, same cap,
+    opposite outcomes, differing only in when the ask legged up:
+      REBN  capped 1.63 vs a 1.64 ask; leg up at t=1.775 s (INSIDE the window)
+            -> CHASE_CEIL 1.70 -> 1.75 -> FILLED 1.72, 139 ms later.
+      MGRX  capped 0.5764 vs a 0.5770 ask; ask flat 4.5 s (tracker idle, n=0);
+            first leg up at t=4.539 s -> target 0.6117 computed AND REFUSED,
+            _track_up_frozen permanently; aborted at the 10 s timeout.
+            MGRX then traded 0.7347 (+27.3% off the trigger).
+    REBN filled ABOVE its own 1.70 limit, which is the point: IBKR works a capped
+    order up "to a more aggressive price still within your specified limit price",
+    so our limit is the ENVELOPE the release is bounded by. And a capped order is
+    INERT, not chasing — the 84.6%-of-fills-within-3 s evidence is about a WORKING
+    order, so the box was punishing MGRX for time it spent unable to do anything.
+    Bounds unchanged: +6% ceiling, 20-modify budget, 0.25 s throttle, 10 s timeout.
+    Replaying MGRX's recorded ask series gives exactly ONE CAP_RESCUE
+    (0.5915 -> 0.6117 against a 0.5970 ask); REBN replays unchanged.
+    Does NOT reopen "extend ENTRY_FILL_TIMEOUT_SEC" (still rejected) and would NOT
+    have saved PFSA (cap/ask 0.859 — a rescue still leaves it ~14% under the offer).
+    See rejected-orders-findings.txt PART A, "MGRX vs REBN, 2026-08-13".
+
+  2026-08-18  CAP_RESCUE REPAIRED — as shipped on 08-13 it could never fire, and
+  did not, across 10 capped entries in 6 days (BBLG x2, CAPS, DAIO, FEED, MGRX,
+  REBN, RCT, XOS, CAST). Three independent blockers, each fatal on its own:
+    (1) UNREACHABLE. The whole rescue was computed inside
+        `if target > working + delta_floor`, where working = entry_lmt. Our own
+        limit already sits offset% above the ask, so on a FLAT ask target EQUALS
+        working and the branch never opens.
+    (2) NEVER ARMED. working_px preferred entry_lmt_working (openOrder) over
+        entry_capped_to. But openOrder echoes the limit WE asked for, never IBKR's
+        cap — verified on every capped entry on record:
+            CAST openOrder 0.9943 / cap 0.9600     MGRX 0.5915 / 0.5764
+            REBN 1.70   / 1.63                     BBLG 1.01   / 0.9646
+            CAPS 0.3383 / 0.3254                   FEED 0.449  / 0.4346
+            RCT  0.244  / 0.2377                   XOS  2.31   / 2.24
+        Our limit is always ABOVE the ask, so `capped_inert = working_px < ask`
+        was permanently False in production.
+    (3) A NO-OP EVEN IF ARMED. It targeted min(ceil(ask + offset), ceiling), which
+        on a flat ask is the limit we already hold.
+    WHY — CAST 2026-08-18 05:00, a PRETRADE-SURGE with finbert_gate OFF:
+      05:00:00.544  entry BUY LMT 5 @ 0.9943 (id 45), ask 0.9700, ceiling 1.0300
+      05:00:00.819  2161: capped to 0.9600 — parked 1.03% UNDER the offer
+      05:00:10.587  entry_timeout (n=0, lmt=0.9943)   <- ZERO modifies sent
+      05:00:10.706  cancel -> entry_inactive
+    The ask was FROZEN at 0.9700 for the entire 10 s; only the bid moved
+    (0.9600 -> 0.9489). UP: 0.9943 > 0.9943 + 0.006063 = false.
+    DOWN: 0.9943 > 0.9700 x 1.05 = 1.0185 = false. Nothing could fire.
+  FIX, three parts, all in track_entry_limit:
+    - The rescue gets its OWN `elif`, between UP and DOWN, so a flat ask reaches
+      it. It sits BEFORE the DOWN ratchet on purpose: capped-and-inert means raise,
+      never lower. Self-limiting — once the ask falls to/below the cap the order is
+      no longer inert, capped_inert goes False and DOWN takes over.
+    - capped_inert reads entry_capped_to ALONE. entry_lmt_working keeps its own,
+      correct job in on_open_order as the rejected-modify detector (2026-08-14).
+    - The rescue is priced at entry_ceiling, not ask + offset.
+  The 3 s gate (_track_up_frozen or window_elapsed) is DELIBERATELY RETAINED, so
+  every path that works today is untouched — REBN, the only successful capped chase
+  on record, still takes the plain in-window CHASE_CEIL at 1.775 s. The room check
+  (ceiling > working + delta_floor) lives in the ARMING, not after the branch chain:
+  arming with no room would swallow the elif and strand the limit with no DOWN
+  ratchet for the rest of the run.
+  WHY CEILING PRICING IS NOT AS AGGRESSIVE AS IT SOUNDS: a LIMIT is not a FILL.
+  REBN's limit went to 1.75 and it filled 1.72 (the then-ask); CAPS filled at its
+  0.3254 cap, well under its 0.3383 limit. The bounded worst case is unchanged at
+  +ENTRY_TRACK_MAX_PCT over trigger_ref, which CHASE_CEIL already reaches routinely
+  (RCT, XOS, FEED and BBLG all ended their runs sitting at the ceiling).
+  ⚠ WHETHER THE RESCUE ACTUALLY FILLS IS UNKNOWN, AND THE LOGS CANNOT SAY.
+    cap/ask   over the 10 caps: 0.9873 .. 0.9990   (cv 0.0043)
+    cap/limit over the 10 caps: 0.9550 .. 0.9745   (cv 0.0071)
+    limit/ask over the 10 caps: 1.0251 .. 1.0366   (cv 0.0040)  <- near-constant
+  Because limit/ask barely varies, the two candidate anchors are COLLINEAR and no
+  amount of log analysis separates them. They predict opposite outcomes in every
+  single case: cap-follows-the-market => the rescue never fills; cap-is-a-haircut-
+  on-our-limit => CAST's cap goes 0.9600 -> ~0.9945 against a 0.9700 ask and fills.
+  THE RESCUE IS THE EXPERIMENT. Cost is one extra modify per capped run. Watch
+  several CAP_RESCUE rows before concluding anything from a single outcome; the
+  base rate to beat is 3 fills out of 10 capped entries.
+  ⚠ OUT OF SCOPE AND PROBABLY BIGGER: the +6% CEILING. RCT and XOS (both 08-17)
+  were capped AND chased AND still missed, because the ask ran past the ceiling —
+  RCT 0.2380 -> 0.2800 (+17.6%) against a 0.2523 ceiling, XOS 2.2500 -> 2.9500
+  against 2.3900. Of the 7 capped entries that never filled, the ceiling — not the
+  cap — is what bound RCT, XOS and FEED.
+  ⚠ CAST itself was NOT a winner: the launch tick was the high (max ask after
+  launch 0.9700, max bid 0.9600, both at 05:00:00.542), it decayed to 0.88/0.92 by
+  07:00, and the recording is labelled _neu_. This fix is justified by MGRX, whose
+  ask ran to 0.6100 against a 0.6117 ceiling and was genuinely fillable.
+
+  2026-08-14  ENTRY_MODIFY_RETRY_CODES = {103} — a REJECTED MODIFY no longer
+  blinds the tracker. New _track_prev_lmt (the limit each modify is REPLACING) and
+  _rollback_entry_lmt(); on 103 roll entry_lmt back to the price IBKR is really
+  working and KEEP tracking; on {104,105,161,10147,10148} roll back AND stop as
+  before. on_open_order becomes a second, slower trigger for the same rollback.
+  New table event MODIFY_REJECT_<code>.
+    WHY — SCNX 2026-08-14 08:08, the first x-wing-3.0 loss to this:
+      08:08:01.474  entry BUY LMT 11 @ 0.4481 (id 21), ask 0.4371, ceiling 0.4634
+      08:08:01.478  ask 0.4504 -> CHASE_UP 0.4481 -> 0.4617 (correct: inside the
+                    ceiling, inside the 3 s window, n=1)
+      08:08:01.480  IBKR: reqId=21 code=103 "Duplicate order id"  <- REJECTED
+      08:08:01.605  openOrder: id 21 still working at 0.4481
+      08:08:11.497  unfilled after 10 s -> cancel -> entry_inactive
+      SCNX then traded 0.6277 at 08:19:41 (+43.6% off the 0.4371 trigger).
+    103 is a REGISTRATION RACE, not a bad order: the re-price reached the Gateway
+    3 ms after the placement, before it had registered order 21, so the second
+    placeOrder was classified as a NEW order re-using a live id. Proven a true
+    in-place modify, not a cancel+new: both wire payloads are 353 bytes / 113
+    fields and differ in EXACTLY ONE field (lmtPrice 0.4481 -> 0.4617), and no
+    cancelOrder was sent for id 21 until the 10 s timeout.
+    THE DAMAGE WAS NOT THE REJECTION. 103 had no handler on the entry path at all
+    (it lives in MODIFY_REJECT_CODES, which is consulted only for the PROTECTIVE
+    order), so entry_lmt kept 0.4617 — a price that never existed. track_entry_limit
+    reads entry_lmt as `working`, so its test became
+        target 0.4617 > working 0.4617 + delta_floor 0.002815   -> FALSE, forever
+    A target can never exceed its own value plus a dead band, so the tracker
+    concluded it had ALREADY DONE THE JOB and went permanently silent. The order
+    rested 0.5% under a MOTIONLESS 0.4504 offer for 3.8 s (01.478 -> 05.233) while
+    the one component whose purpose is to fix exactly that had been silenced by its
+    own failed attempt. Restoring working=0.4481 flips the same test TRUE and the
+    existing tracker re-issues the identical modify — no new logic.
+    WHY A RETRY IS SAFE HERE: held >= ENTRY_TRACK_MIN_INTERVAL_SEC (0.25 s) by the
+    throttle, and the Gateway registers the order well inside that (orderStatus ack
+    latency over the 36 entries since 3.0: median 149 ms, p90 577 ms, max 1305 ms).
+    Bounded by ENTRY_TRACK_MAX_MODIFIES, the 3 s UP window and the token bucket.
+    Content errors (106 invalid trigger price, 110 tick conformance) are NOT in the
+    retry set — they recur identically.
+    NOT DETERMINISTIC BY GAP, so don't "fix" it by spacing the first modify:
+      CYCU 08-14  +0 ms   accepted     SCNX 08-14  +4 ms   103
+      NEXR 08-14  +46 ms  accepted     CAPS 08-12  +52 ms  103
+      FABC +255 ms, BBLG +980 ms, REBN +1775 ms, FEED +2281 ms — all accepted.
+    GATING THE FIRST MODIFY ON THE ORDER ACK WAS EVALUATED AND REJECTED: it pays
+    the full ack latency on every chasing run, at the start, where the tape moves
+    fastest and the ask is already 0.3-0.9 s stale, to avoid a race the rollback
+    clears in one 0.25 s interval; it binds on ~44% of chases (4 of 9 modifies were
+    <100 ms) to save ~250 ms on ~22%, a wash on the mean and worse in the tail
+    (1305 ms unavoidable vs 250 ms bounded); and it only addresses 103, where the
+    rollback covers every "the modify did not take" outcome including a silent drop.
+    2 of the 9 modifies since 3.0 drew a 103; ZERO in the logs before 3.0
+    (checked 07-15 -> 08-11) — the in-place re-price is what exposes the race.
+
+  2026-08-14  on_open_order's "price-capped by IBKR" warning was a MISNOMER.
+  openOrder echoes the limit WE ASKED FOR, never IBKR's 2161 cap, so that branch
+  has 0% sensitivity to what it was named for: all 7 genuine caps since 3.0 (REBN,
+  MGRX, CAPS, BBLG x2, FEED, DAIO) produced NO such warning because openOrder
+  reported our own limit straight back — MGRX's said 0.5915 while IBKR's cap was
+  0.5764. Conversely all 4 firings of the warning were REJECTED MODIFIES (SCNX
+  08-14, CAPS 08-12 — the only two 103s). It is therefore repurposed as the second
+  trigger for _rollback_entry_lmt, ~130 ms behind the error code but able to catch
+  a modify dropped with NO error code at all. Guarded by px == _track_prev_lmt
+  (+/- half a tick): we only claim the modify failed when IBKR is working EXACTLY
+  the price we tried to replace, so a stale echo — or a cap IBKR ever did report
+  honestly — cannot cause a false rollback.
+    CORRECTION: the standing note that "MGRX had no openOrder" is FALSE. MGRX did
+    receive one, at 16:05:01.751, reporting lmt=0.5915. The entry_capped_to
+    fallback in the CAP_RESCUE arming is still load-bearing, but for this echo
+    reason, not for a missing callback.
+
+  CONSTANTS (all top-of-file, all with their evidence in comments):
+    MAX_LIMIT_ENTRY_PERCENT_PRICE   2.9 -> 2.5   opening pad AND tracking offset
+    MAX_CAP_ENTRY_PERCENT          30.0 -> None  last_close clamp REMOVED
+    ENTRY_USE_PRICE_MGMT_ALGO      True -> False
+    ENTRY_TRACK_ENABLED             True         (--no-entry-track = 2.1 behaviour)
+    ENTRY_TRACK_MAX_PCT             6.0          ceiling = trigger_ref * 1.06
+    ENTRY_TRACK_UP_WINDOW_SEC       3.0
+    ENTRY_CAP_RESCUE_ENABLED        True         one UP move if 2161 has us under
+                                                 the ask (2026-08-13; own branch +
+                                                 ceiling-priced 2026-08-18)
+    ENTRY_MODIFY_RETRY_CODES        {103}        rejected modify -> roll back and
+                                                 retry (2026-08-14); empty it to
+                                                 keep the rollback without a retry
+    ENTRY_TRACK_DOWN_HYST_MULT      2.0          lower only when >5% over the ask
+    ENTRY_TRACK_MIN_OFFSET_TICKS    1
+    ENTRY_TRACK_MIN_INTERVAL_SEC    0.25         >= the reqMktData cadence
+    ENTRY_TRACK_MIN_DELTA_TICKS     1            dead band = max(1 tick, 25% offset)
+    ENTRY_TRACK_MIN_DELTA_FRAC      0.25
+    ENTRY_TRACK_MAX_MODIFIES        20           per run
+    ENTRY_TRACK_STATUS_GRACE_SEC    0.75
+    GLOBAL_ORDER_MSG_PER_SEC        30.0         process-wide token bucket
+
+  WHY 2.5% AND WHY PERCENT (both measured, don't re-litigate from intuition):
+    - Required-offset CDF over the 199 entries that filled within 1 s (fill price
+      vs entry reference): +1.0% -> 82.9%, +1.5% -> 85.4%, +2.0% -> 91.0%,
+      +2.5% -> 96.0%, +2.9% -> 97.0%, +4.0% -> 99.0%. Sharp knee at 2.5%.
+    - The knee is FEED STALENESS, not policy: the ask is 0.3-0.9 s old (0.507 s
+      median exchange->local lag + reqMktData's 250 ms aggregation) and the p90
+      ask move in 1 s is +3.74%.
+    - Going TIGHTER buys nothing back: on the 12 caps pairable with an entry
+      IBKR's 2161 band ceiling sat at cap/ask 0.985-1.030 (essentially ON the
+      offer), so even a +1.5% limit would have been capped in 11 of 12.
+    - PERCENT, not cents/ticks: spread in CENTS varies 27x across the price
+      buckets (0.40c median under $0.50 vs 11.0c at $2-5), in PERCENT only 1.9x
+      (1.81% vs 3.55%); 45% of entries are sub-$1 where minTick is $0.0001, so
+      "2 ticks" there is 0.03% — inert. Ticks/cents survive only as the floor.
+    - CEILING 6.0 is an OPERATOR CHOICE (2026-08-11) over the price-neutral 2.9:
+      worst-case entry price is deliberately allowed ABOVE 2.1's. Basis: only 14
+      of 317 entries (4.4%) genuinely failed because the ask outran the pad, they
+      needed +3.50%..+25.0%, and 6% converts about half; the fill-rate simulation
+      runs 75.2% @2.9% -> 84.4% @6% -> 85.1% @9%, i.e. flat past 6%. Hard stop:
+      IBKR CANCELS with code 202 at ~+9.80% over ITS reference (4 observed,
+      MHH/MTVA), and its reference can be a stale last_close (PFSA cap/ask 0.859).
+
+  NEW ERROR / STATUS HANDLING (all reached only because we now send modifies):
+    - 2161: parsed for IBKR's capped price (_parse_capped_price), stored in
+      entry_capped_to, written as an ENTRY_CAPPED row, logged ONCE per run.
+      Still NOT in ENTRY_REJECT_CODES — a capped order is alive.
+    - 202 on the entry: freezes the UP follow only; the DOWN ratchet stays live.
+    - {104,105,161,10147,10148} on the entry: stop tracking, keep the order,
+      resync from orderStatus. Never blind-retry. (2.1 consulted
+      MODIFY_REJECT_CODES only for the protective order, so these were dropped.)
+    - 100 "max rate of messages": process-wide 5 s brake on ALL tracking. Nothing
+      in the repo handled error 100 before.
+    - Cancelled/ApiCancelled within 0.75 s of a re-price: DEFERRED one grace
+      period, taken only if no live status follows (guards the documented
+      Submitted->Modified->Cancelled desync). *** Deliberately NOT applied to
+      "Inactive": Part B is a sub-second Inactive and its 12-event/2790-run
+      series must stay directly comparable across the 2.1->3.0 boundary. ***
+    - PARTIAL entry: tracking stops at the FIRST fill (bidding higher for the
+      remainder only worsens the average the yield ladder is measured against),
+      and the residual is CANCELLED at the timeout. 2.1's timeout was guarded by
+      pos <= 0, so a partial left the residual working GTC all session and T47
+      then hard-stopped the trio on t47:residual_position.
+
+  THREADING: all entry order traffic stays on the per-run control-loop thread.
+    update_quote() only sets ctl.wake on an ask change while ENTRY_PENDING — it
+    runs on the ibapi reader, which in driven mode is SHARED by every duo on that
+    client, so a blocking placeOrder there would stall tick delivery for every
+    concurrent session. This also means no orphan sends after T47 swaps
+    session.xwing (run_trade has already returned by then). The loop's sleep
+    tightens to 0.25 s while ENTRY_PENDING and returns to loop_interval after.
+
+  INSTRUMENTATION: 5 columns APPENDED after why_held (entry_order_id, entry_lmt,
+    entry_status, track_n, capped_to) so 2.1-era parsers still read the file —
+    analyze_trade_mole/analyze_firstrade_outcomes.py set-matches on `event`, and
+    entry_failed still wins the event cell over any CHASE_*/ENTRY_CAPPED label.
+    Until now the entry limit was not in the tables AT ALL (lmt_price is the
+    protective stop). New events: CHASE_UP, CHASE_DOWN, CHASE_CEIL, ENTRY_CAPPED.
+    Both clerks forward openOrder -> ctl.on_open_order (getattr-guarded, so
+    clerk-1.1 keeps loading 2.1): it carries the only copy of the price IBKR is
+    ACTUALLY working, which is how a 2161 cap becomes visible live.
+
+  UNCHANGED: the ratchet ladder and its limits TSV, every other timeout, the
+    stale-ask reference selection (max of ask/print/last, 4.0% stale pad on the
+    OPENING SHOT only — the tracker self-corrects within one interval after
+    that), and the entire public API the clerk and T47 import.
+
+  STATUS: offline verification passes —
+    analyze_trade_mole/verify_xwing3_tracking.py, 60 checks over 11 cases,
+    including a replay of the real ask series from
+    xwing_tables/xwing-table_GLE_2026-08-11_09-04-11.tsv (ask 0.6698 -> 0.7066
+    while the entry sat unfilled; 2.1's limit 0.6892 never reached it, 3.0 tracks
+    to the 0.7100 ceiling). Driven-mode smoke test confirms the clerk/T47 API
+    surface and that a T47 run-2 re-entry that 2.1 clamped to 1.95 under a 2.10
+    bid is priced at 2.18 by 3.0.
+    *** NOT YET RUN AGAINST A GATEWAY. Paper GW (4002) verification pending:
+    modify-in-place on the same orderId, cumulative `filled` semantics across
+    modifies, the modify-after-partial path (totalQuantity must stay ORIGINAL),
+    and both the 2161 and 202 handlers exercised deliberately. ***
 
 
 ================================================================================
@@ -247,6 +552,186 @@ Current: clerk-1.1.py (clerk-1.0.py superseded; not on disk).
   ends the trio; flat lifetime expiry -> t47:lifetime; no-surge session leaves no
   file; TSV shape + post-close write dropped. PAPER-GW VERIFY STILL PENDING (as
   it was for 1.0 / clerk-1.2 as a whole).
+
+
+--------------------------------------------------------------------------------
+2026-08-19  clerk-trigger-conditions.txt — the 04:00-06:59 WINDOW line REMOVED
+            (config only; NO .py file changed)
+--------------------------------------------------------------------------------
+  DELETED:  WINDOW 04:00-06:59   lifeTime=00:10  finbert_gate=off
+  The file now holds one line: DEFAULT lifeTime=02:30 finbert_gate=on.
+
+  WHY: finbert_gate=off meant the clerk DISCARDED Orchestrator5.2's "BAD" and
+  traded on the surge alone, so a PR the O5.2 gate had REJECTED could still
+  trade. The operator's requirement is that every PR trade only per
+  orchestrator_trigger_rules.txt, at every hour, with no surge-only path.
+
+  ⚠ Its reach was WIDER than 04:00-06:59. conditions_instant() (added by the
+  2026-07-28 BUGFIX above) resolves a closed-market arm against its DEFERRED
+  collection start (04:00), not its arrival — so overnight and weekend PRs were
+  governed by the gate-off window too. Measured over orchestrator5/tables/*.tsv,
+  88 rows carry ClerkSentiment = BAD:sentiment_ignored_gate_off, by arrival hour:
+      21h:5  23h:2  00h:2  01h:1  02h:1  03h:2  04h:5  05h:20  06h:50
+  i.e. 75 arrived inside the window and 13 were overnight deferrals. Of those 88,
+  21 actually reached a surge and TRADED — clerk_logs/ carries 21 "launching
+  x-wing without sentiment gate" lines over 2026-07-20..08-18 (~1.5/week), each
+  one an entry placed on a PR the O5.2 gate had rejected. The other 67 simply
+  never surged inside the 10s watch.
+
+  ⚠ THIS REVERSES the "BEHAVIOUR CHANGE (intended)" of the 2026-07-28 entry
+  above: an overnight BAD-sentiment PR no longer survives to 04:00. It is now
+  torn down at sentiment arrival (session.finish("sentiment_bad")) and the warm
+  client returns to the pool immediately instead of being held for hours. That
+  bugfix itself stands — conditions_instant() is still correct and still used;
+  only the window whose gate-off setting it resolved to is gone.
+
+  SECOND, INDEPENDENT KNOB: that same line also set lifeTime=00:10. Deleting it
+  restores the DEFAULT 02:30, so the early-premarket mole watch goes 10s -> 150s.
+  Deliberate (operator's call) but worth knowing when reading 04:00-06:59
+  sessions from before/after this date: more armed PRs now reach a surge — every
+  one of which must also pass the sentiment gate.
+
+  WHY DELETE rather than set the keys to the DEFAULT values: an all-DEFAULT
+  WINDOW line is a no-op that still echoes a "trigger-conditions: WINDOW ... ET"
+  line at startup, falsely implying a special regime is in force. With zero
+  windows, TriggerConditions.at() falls through to Resolved(default..., "DEFAULT")
+  and load_trigger_conditions echoes exactly one line. The deleted line is kept
+  COMMENTED OUT in the file header with its rationale, so reinstating it is one
+  uncomment + restart.
+
+  SAFETY PROPERTY: MOLE_LIFETIME_STR = "02:30" and TriggerConditions.builtin()
+  (gate True) make the built-in fallback EXACTLY EQUAL to the DEFAULT line, and
+  load_trigger_conditions soft-fails to those built-ins on a missing OR malformed
+  file. So with the WINDOW line gone, NO parse outcome can re-enable the bypass —
+  typo, truncation or a deleted file all land on gate-on.
+
+  NOT CHANGED: clerk-1.2.py / clerk-1.1.py (the finbert_gate mechanism —
+  Window.finbert_gate, _sentiment_bypassed, the gate_on arg of
+  _await_sentiment_and_launch, the sentiment_ignored_bypass /
+  sentiment_ignored_gate_off replies — all remain, now only ever taking their
+  gate-on branches); Orchestrator5.2.py (it never had a clock rule near its gate,
+  and needed no edit); orchestrator_trigger_rules.txt. Both clerks read this same
+  file, so whichever is run picks the change up.
+
+  VERIFIED before restart: the real parser loaded out of clerk-1.2.py by
+  importlib resolves gate=on / lifeTime=150s / window=DEFAULT at 04:00, 05:30,
+  06:30, 06:58:59, 06:59, 10:00 and 23:00 ET, with source=file and 0 windows
+  loaded. AFTER RESTART confirm in clerk_logs/: the "DEFAULT lifeTime=150s
+  finbert_gate=on" line is present and NO "WINDOW ..." line follows it, and
+  `grep -c "bypassing sentiment gate"` stays 0. The 88-row
+  BAD:sentiment_ignored_gate_off count in orchestrator5/tables/ should now be
+  frozen; those rows become BAD:sentiment_bad_released instead.
+  ⚠ Rules are read ONCE at startup — a clerk started before this edit keeps the
+  old window until restarted.
+
+
+--------------------------------------------------------------------------------
+2026-08-27  x-wing-3.0.py -> IBKR PRICE-WALL clamp + bounded re-place ("3.1")
+            (+ 1 guarded line in clerk-1.2.py, 3 lines in T47-airspeeder-2.0.py)
+--------------------------------------------------------------------------------
+  WHY. Two entries died to IBKR's regulatory price cap on the SAME DAY, in two
+  different ways:
+    YAAS 07:30:24 — the OPENING shot was over the wall. The ask was a 21.5 s
+      stale 1-lot phantom at 3.05 (bid 2.45, a 24.5% spread) while the surge
+      printed 2.66/2.70; _select_entry_reference takes max(ask,print,last), so
+      the limit was 3.05*1.025 = 3.13 against a 2.99 wall -> 202, dead in 269 ms,
+      track_n=0. YAAS then ran to a 4.33 bid (+60.4%). T47's EP2 watch never
+      re-entered: DIP maxed at 9.26% against the 10% threshold, short by 0.74 pp.
+    CJMB 08:15:03 — opening 2.36 was ACCEPTED and 2161-capped to 2.25, i.e. live
+      and working, and then OUR OWN CHASE_CEIL to the 2.44 ceiling crossed the
+      2.40396 wall and killed it. EHGO 2026-08-19 is the same shape (cap 1.91,
+      chase 2.10, wall 2.093).
+
+  THE BAND IS EXACT. Mined over every clerk log by
+  analyze_trade_mole/calibrate_price_wall.py:
+      BUY   wall = IBKR_ref * 1.196   (n=3, all ETH)
+      SELL  wall = IBKR_ref * 0.902   (n=10 events / 3 refs, RTH)
+  i.e. +19.6% / -9.8%: the Clearly-Erroneous outside-RTH guideline (20% sub-$25)
+  less a haircut. NOTE the pre-existing "202 wall at +9.8%" note was the SELL
+  side. ⚠ IBKR's reference is ITS OWN and LAGS the tape by seconds.
+
+  ⚠⚠ THE STRUCTURAL BUG. Whenever a 2161 has fired, the +6% ceiling sits AT OR
+  ABOVE the wall — CJMB +1.5%, EHGO +3.0%, CAST +0.5%, FEED +0.04%, XOS -0.09%.
+  So CHASE_CEIL and CAP_RESCUE (which targeted entry_ceiling verbatim) were 202
+  GENERATORS on every capped run. CAST's shipped 08-18 rescue would have gone to
+  1.0300 against a wall near 1.0252 and killed the order it was rescuing.
+
+  WHAT CHANGED
+  Stage 0, instrumentation, behaviour-neutral:
+    tick 37 (mark) is now consumed (genericTick 221 was already on the wire and
+    thrown away); per-field quote ARRIVAL stamps (ibapi L1 carries no quote
+    timestamp at all, so nothing could see YAAS's 21.5 s stale ask);
+    _ref_snapshot()/_ref_snapshot_str(); _parse_wall_prices() for the 202 text;
+    on_order_status_ex() picks up IBKR's mktCapPrice, which both clerks accepted
+    and DISCARDED (⚠ expect 0.0 while ENTRY_USE_PRICE_MGMT_ALGO=False — the 2161
+    regex stays primary); TSV gains wall_obs + ref_snapshot (append-only, now 26
+    columns). clerk-1.2.py forwards mktCapPrice behind a getattr guard, the same
+    precedent as openOrder -> on_open_order, so clerk-1.1 -> x-wing-2.1 is
+    untouched.
+  Stage 2, the fix:
+    _wall_bound() = observed 202 wall (exact) ELIF observed 2161 cap *
+    ENTRY_WALL_OVER_CAP_MULT ELIF a dark estimate; _entry_upper() =
+    min(entry_ceiling, _wall_bound()) now replaces EVERY bare entry_ceiling on
+    the entry path (opening shot, tracker target, rescue arming, event naming,
+    CHASE_DOWN, CAP_RESCUE target). New event CHASE_WALL distinguishes "hit OUR
+    ceiling" from "hit IBKR's wall".
+    _wall_step_down(): the 202 says "at or MORE AGGRESSIVE THAN X", so X itself
+    is refused and an exact tick multiple must give up one more tick (2.99->2.98).
+    retry_entry_after_wall(): ONE bounded re-place on a NEW orderId (a 202 is a
+    confirmed cancel; re-using the id is error 103), priced at min(wall,
+    ceiling), qty = REMAINING. ⚠ entry_ts is NOT reset — the 10 s fill timeout
+    stays anchored on the FIRST placement, so a retry cannot quietly undo the
+    30->10 s cut. UP stays frozen and the cap rescue stays blocked: IBKR has just
+    said we are too aggressive.
+    ⚠ THE ORDERING FIX, without which the retry can never fire on the YAAS
+    shape: the 202 arrives AFTER the Cancelled it explains, so the abort has to
+    be held open (reusing the existing 0.75 s ENTRY_TRACK_STATUS_GRACE_SEC) long
+    enough for the error to classify it. CJMB/EHGO only survived because a modify
+    happened to be in flight, which is luck. A Part-B "Inactive" still aborts
+    immediately so that series stays comparable.
+  Also fixed, same pass — THE SELL-SIDE STORM:
+    on_order_error's protective cancel+replace had NO counter, NO throttle and NO
+    gap and re-sent the IDENTICAL price. IVF 2026-08-17 09:40:59.627 ->
+    09:41:01.284 burned orderIds 34..44 — ELEVEN orders in 1.66 s, each
+    202-rejected and each also drawing a 10148 — while the position sat
+    UNPROTECTED ~6.4 s. The same 2.39 was accepted 5 s later once IBKR's
+    reference caught up. Now: budget 3, 0.5 s gap, ORDER_THROTTLE, and on a 202
+    the exit is lifted ABOVE the sell wall via _wall_step_up() instead of
+    re-sending a refused price.
+  T47-airspeeder-2.0.py (3 lines, getattr-guarded): on_run_done arms the
+    late-fill guard on {active_buy_id} | _retired_entry_ids, not one id. Without
+    it a retired id escapes the guard AND, still carrying role=="entry", could be
+    misread as a normal entry fill of the current run.
+
+  THE CONSTANT. ENTRY_WALL_OVER_CAP_MULT = 1.06, and it is NOT a theory — the
+  corpus bounds it on both sides:
+      must PREVENT: CJMB cap 2.25 / wall 2.40396  -> mult <  1.06843
+      must PRESERVE: REBN cap 1.63, FILLED at 1.72 -> mult >= 1.05521
+      => SAFE WINDOW [1.05521, 1.06843), and 1.06 is inside it.
+  ⚠ The window over ALL capped runs is EMPTY ([1.09358, 1.06843)) and that is a
+  REAL property of the data, not a mining bug: a cap and a later chase are priced
+  off DIFFERENT references because IBKR's moves between them. Only the
+  FILL-REACHING bound is economically binding (a limit is not a fill: REBN chased
+  to 1.75 and filled 1.72; CAPS and SGLY filled AT their caps), and only 3-4 of
+  10 capped entries ever filled at all. Err LOW: too low leaves the order ALIVE
+  at a worse limit, too high gets it CANCELLED.
+
+  VERIFIED OFFLINE: analyze_trade_mole/verify_xwing3_tracking.py 125 -> 185
+  checks, 0 failed. New case_price_wall replays YAAS (incl. the production
+  Cancelled-before-202 ORDER), CJMB, EHGO; new case_protective_storm replays IVF.
+  Both carry PRE-FIX assertions — neutralise the multiplier and CJMB targets 2.44
+  and trips the real wall; disable the retry and YAAS aborts with one send. GLE
+  still passes byte-identically (no cap, no 202 => _wall_bound() is +inf =>
+  every call site degenerates to 3.0). calibrate_price_wall.py --self-check
+  reproduces the 3 BUY walls, the 10 SELL events and both bands from raw logs.
+  ⚠ PAPER-GW VERIFY STILL PENDING (as it was for 3.0 / clerk-1.2 / T47-2.0).
+
+  KILL SWITCHES: --no-entry-wall reverts to full 3.0; --no-entry-wall-retry keeps
+  the clamp but never re-places; --entry-wall-over-cap-mult / -retry-max tune it.
+  ENTRY_WALL_ESTIMATE_ENABLED is FALSE — Stage 3 ships dark. calibrate report (C)
+  says the only zero-veto candidate is ref=last at 1.06 (prevents 4/4, softens 32
+  of 121 entries); min(last,mark,close) puts 28 entries BELOW THE BID, which is
+  exactly the MAX_CAP_ENTRY_PERCENT failure 3.0 deleted. Operator's call.
 
 
 ================================================================================

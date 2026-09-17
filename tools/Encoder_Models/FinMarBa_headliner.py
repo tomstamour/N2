@@ -22,9 +22,9 @@ Library usage:
     from FinMarBa_headliner import score_headline
 
     result = score_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.49, "indecisive": 0.30,
-    #  "negative": 0.21, "sentiment_score": 0.28, "label": "positive",
-    #  "elapsed_ms": 42.1}
+    # {"headline": "...", "pos": 0.49, "ind": 0.30,
+    #  "neg": 0.21, "ss": 0.28, "lab": "positive",
+    #  "ms": 42.1}
 """
 
 import argparse
@@ -241,26 +241,32 @@ def score_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     Returns:
         {
             "headline":        str,
-            "positive":        float,
-            "indecisive":      float,
-            "negative":        float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax of the three classes
-            "elapsed_ms":      float,   # tokenize + forward wall time
+            "pos":             float,
+            "ind":             float,
+            "neg":             float,
+            "ss":              float,   # positive - negative
+            "lab":             str,     # argmax of the three classes
+            "ms":              float,   # tokenize + forward wall time
         }
     """
     load_model(model_dir)
 
     scores = _inferencer.predict(headline)
     label = max(LABEL_ORDER, key=lambda k: scores[k])
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). Only the
+    # OUTPUT keys are short; LABEL_ORDER and the internal `scores` dict keep their
+    # full words, because `label` is one of those words and renaming them would
+    # change the VALUE, not just the key. `indecisive` -> `ind` stays distinct from
+    # every other model's `neu` on purpose: a low value means confident in EITHER
+    # direction, which is why a standalone indecisive rule is banned.
     return {
-        "headline":        headline,
-        "positive":        scores["positive"],
-        "indecisive":      scores["indecisive"],
-        "negative":        scores["negative"],
-        "sentiment_score": scores["sentiment_score"],
-        "label":           label,
-        "elapsed_ms":      scores["elapsed_ms"],
+        "headline": headline,
+        "pos":      scores["positive"],
+        "ind":      scores["indecisive"],
+        "neg":      scores["negative"],
+        "ss":       scores["sentiment_score"],
+        "lab":      label,
+        "ms":       scores["elapsed_ms"],
     }
 
 

@@ -132,8 +132,13 @@ def _load_module(mod_name: str, filename: str):
     return mod
 
 
-xwing = _load_module("xwing2", "x-wing-2.1.py")
-trademole = _load_module("trademole2", "trade-mole-2.2.py")
+# 2026-08-12: x-wing-2.1.py -> x-wing-3.0.py (entry limit tracks the ask).
+# This loader line is the whole wiring change; the "xwing2" alias is only a
+# sys.modules key and nothing reads it. clerk-1.1.py deliberately stays on 2.1
+# as the live duo fallback until 3.0 is paper-verified. A RUNNING clerk keeps
+# its imported module — this takes effect on the next clerk restart.
+xwing = _load_module("xwing2", "x-wing-3.0.py")
+trademole = _load_module("trademole2", "trade-mole-2.3.py")
 t47mod = _load_module("t47_airspeeder", "T47-airspeeder-2.0.py")
 
 
@@ -368,9 +373,21 @@ class SharedIBClient(EWrapper, EClient):
                     mktCapPrice=0.0):
         s = self.session
         if s is not None:
-            s.xwing.on_order_status(orderId, status, float(filled),
-                                    float(avgFillPrice), float(lastFillPrice),
-                                    why_held=whyHeld or "")
+            # x-wing-3.1 wants IBKR's mktCapPrice (the machine-readable twin of
+            # the price we otherwise regex out of the 2161 prose); 3.0 and 2.1
+            # do not have on_order_status_ex, so this is getattr-guarded exactly
+            # like the openOrder -> ctl.on_open_order forward below. That guard
+            # is what lets clerk-1.1 keep loading x-wing-2.1 unchanged.
+            _ex = getattr(s.xwing, "on_order_status_ex", None)
+            if _ex is not None:
+                _ex(orderId, status, float(filled),
+                    float(avgFillPrice), float(lastFillPrice),
+                    why_held=whyHeld or "",
+                    mkt_cap_price=float(mktCapPrice or 0.0))
+            else:
+                s.xwing.on_order_status(orderId, status, float(filled),
+                                        float(avgFillPrice), float(lastFillPrice),
+                                        why_held=whyHeld or "")
             # T47 echo AFTER x-wing processed it (same thread, so reading the
             # controller's orders dict is race-free): stamps ENTRY_FILL /
             # EXIT_FILL rows, captures EP/SP, enforces the late-fill guard.
@@ -385,11 +402,25 @@ class SharedIBClient(EWrapper, EClient):
     def openOrder(self, orderId, contract, order, orderState):
         # INFO, not DEBUG: on a silent "Inactive" entry (rejected-orders-findings
         # PART B) warningText/completedStatus is the only reason IBKR ever sends.
-        logger.info("client %d openOrder %d %s %s status=%s completed=%s warn=%r",
+        logger.info("client %d openOrder %d %s %s lmt=%s status=%s completed=%s warn=%r",
                     self.client_id, orderId, order.action, order.orderType,
+                    getattr(order, "lmtPrice", ""),
                     orderState.status,
                     getattr(orderState, "completedStatus", ""),
                     getattr(orderState, "warningText", "") or "")
+        # x-wing 3.0 tracks the ask by re-pricing the entry, and openOrder carries
+        # the only copy of the price IBKR is ACTUALLY working — orderStatus never
+        # reports one, so a 2161 cap is otherwise invisible to x-wing. getattr-
+        # guarded so reverting the loader line above to x-wing-2.1 (no
+        # on_open_order) still works without touching this handler.
+        s = self.session
+        if s is not None:
+            cb = getattr(s.xwing, "on_open_order", None)
+            if cb is not None:
+                try:
+                    cb(orderId, getattr(order, "lmtPrice", None), orderState.status)
+                except Exception as e:
+                    logger.error("on_open_order routing failed: %s", e, exc_info=True)
 
     def execDetails(self, reqId, contract, execution):
         logger.debug("client %d exec %s %s @ %.4f", self.client_id,
@@ -794,7 +825,7 @@ class TrioSession:
                 return
             self._finished = True
         self._sentiment_ok.set()                    # unblock sentinel if waiting
-        self.clerk.unregister_session(self.symbol)  # remove from routing table
+        self.clerk.unregister_session(self)         # remove from routing table
         self.clerk.store.remove(self.symbol)        # drop durable record (catch-all)
         logger.info("[%s] finishing trio on client %d (%s)",
                     self.symbol, self.client.client_id, reason)
@@ -1014,6 +1045,13 @@ class Clerk:
         self._server_sock = None
         self._watchdog_thread = None
         self._sessions: dict[str, "TrioSession"] = {}  # ticker → active TrioSession
+        # Tickers whose session is being built right now: claimed under
+        # _sessions_lock by handle_trigger BEFORE it acquires a client, and
+        # dropped once the session is in _sessions (or the arm failed). Without
+        # it the already-armed check would be racy — handle_trigger runs on a
+        # thread per connection, and the duplicate arms we actually see land
+        # ~90 ms apart, well inside the acquire+construct window.
+        self._arming: set[str] = set()
         self._sessions_lock = threading.Lock()
         # durable queue of deferred duos (survives restarts); loaded here,
         # replayed in replay_pending() after the pool is warm.
@@ -1134,9 +1172,17 @@ class Clerk:
         with self._sessions_lock:
             self._sessions[session.symbol] = session
 
-    def unregister_session(self, symbol: str):
+    def unregister_session(self, session: "TrioSession"):
+        """Drop `session` from the routing table — but ONLY if it is still the
+        session registered under its symbol. Popping by symbol alone let the
+        first of two same-symbol sessions delete the second's entry when it
+        finished, after which a live session was unreachable and any late
+        Sentiment for it fell through to 'sentiment_ignored'. handle_trigger's
+        already-armed guard should now make two live sessions impossible; this
+        keeps the registry correct regardless."""
         with self._sessions_lock:
-            self._sessions.pop(symbol, None)
+            if self._sessions.get(session.symbol) is session:
+                del self._sessions[session.symbol]
 
     def release_client(self, client):
         self.pool.release(client)
@@ -1170,27 +1216,59 @@ class Clerk:
         iti = payload.get("itiBaseline")
         trade_size = payload.get("tradeSizeBaseline")
 
-        client = self._acquire_healthy_client()
-        if client is None:
-            logger.warning("[%s] no healthy free client; trigger rejected", ticker)
-            return {"status": "rejected", "reason": "no_free_client"}
+        # One live session per symbol. The orchestrator arms per ARTICLE, and the
+        # news wire re-publishes the same PR under a new ID often enough that this
+        # fires for real: on 2026-08-12 four PRs arrived twice and three armed
+        # twice, so e.g. NEXR ran two independent sessions (clients 1014 and 1015)
+        # that each entered and each stopped out — 2x size, 2x commission, two
+        # ladders competing on the exit. Nothing downstream can catch it: every
+        # session has its own clientId, and x-wing tracks position from its OWN
+        # fills only (no reqPositions), so session B starts at position 0.
+        #
+        # O5.2's dedup is the first line of defence; this is the backstop that
+        # holds for duplicate shapes it cannot see. Claim the symbol atomically —
+        # a bare `ticker in self._sessions` read would race, since duplicates land
+        # ~90 ms apart and the acquire+construct below is not instant.
+        with self._sessions_lock:
+            incumbent = self._sessions.get(ticker)
+            if incumbent is not None or ticker in self._arming:
+                logger.warning("[%s] already armed on client %s; duplicate trigger "
+                               "rejected", ticker,
+                               incumbent.client.client_id if incumbent else "(arming)")
+                return {"status": "rejected", "reason": "already_armed"}
+            self._arming.add(ticker)
 
-        session = TrioSession(self, client, ticker, last_close, iti, trade_size)
-        self.register_session(session)
         try:
-            ok = session.start()
-        except Exception as e:
-            logger.error("[%s] session start failed: %s", ticker, e, exc_info=True)
-            ok = False
-        if not ok:
-            client.session = None
-            self.release_client(client)
-            return {"status": "rejected", "reason": "session_start_failed"}
-        reply = {"status": "accepted", "clientId": client.client_id,
-                 "symbol": session.symbol}
-        if session._defer_target is not None:
-            reply["deferredUntilET"] = session._defer_target.isoformat()
-        return reply
+            client = self._acquire_healthy_client()
+            if client is None:
+                logger.warning("[%s] no healthy free client; trigger rejected", ticker)
+                return {"status": "rejected", "reason": "no_free_client"}
+
+            session = TrioSession(self, client, ticker, last_close, iti, trade_size)
+            self.register_session(session)
+            try:
+                ok = session.start()
+            except Exception as e:
+                logger.error("[%s] session start failed: %s", ticker, e, exc_info=True)
+                ok = False
+            if not ok:
+                # MUST unregister: register_session ran above, and a stale entry
+                # would now block this symbol for the life of the process.
+                self.unregister_session(session)
+                client.session = None
+                self.release_client(client)
+                return {"status": "rejected", "reason": "session_start_failed"}
+            reply = {"status": "accepted", "clientId": client.client_id,
+                     "symbol": session.symbol}
+            if session._defer_target is not None:
+                reply["deferredUntilET"] = session._defer_target.isoformat()
+            return reply
+        finally:
+            # Safe to drop the claim on every path: on success register_session
+            # has already put the symbol in _sessions, so the guard above stays
+            # satisfied with no gap between the two.
+            with self._sessions_lock:
+                self._arming.discard(ticker)
 
     # ---- crash-recovery replay ----
     def replay_pending(self):

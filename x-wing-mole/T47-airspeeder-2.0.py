@@ -377,9 +377,18 @@ class T47Controller:
                 ctl.original_avg_fill is not None
                 or ctl.running_entry_avg is not None)
             if ctl is not None and not entry_filled:
-                oid = getattr(ctl, "active_buy_id", None)
-                if oid is not None:      # aborted entry: arm the late-fill guard
-                    self._prior_entry_ids[oid] = self._run_no
+                # Arm the late-fill guard on EVERY entry orderId this run used,
+                # not just the last one. x-wing-3.1 re-places a wall-rejected
+                # (IBKR 202) entry on a FRESH orderId and retires the dead one
+                # into ctl._retired_entry_ids, so keying only on active_buy_id
+                # would let a late fill on a retired id slip past the guard
+                # entirely. getattr-guarded: x-wing-2.1/3.0 have no such set and
+                # this collapses to the original single-id behaviour there.
+                ids = {getattr(ctl, "active_buy_id", None)}
+                ids |= set(getattr(ctl, "_retired_entry_ids", ()) or ())
+                for oid in ids:
+                    if oid is not None:  # aborted entry: arm the late-fill guard
+                        self._prior_entry_ids[oid] = self._run_no
 
             if pos > 0:
                 # flatten incomplete: shares (and possibly a resting SELL) are

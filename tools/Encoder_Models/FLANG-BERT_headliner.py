@@ -36,8 +36,8 @@ Library usage (filename has a hyphen — load via importlib):
 
     mod.load_model()                  # optional pre-warm
     result = mod.analyze_headline("Apple reports record quarterly earnings")
-    # {"headline": "...", "positive": 0.82, "negative": 0.03, "neutral": 0.15,
-    #  "sentiment_score": 0.79, "label": "positive", "inference_ms": 14.2}
+    # {"headline": "...", "pos": 0.82, "neg": 0.03, "neu": 0.15,
+    #  "ss": 0.79, "lab": "positive", "ms": 14.2}
 """
 
 import argparse
@@ -324,13 +324,13 @@ def analyze_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
 
     Returns:
         {
-            "headline":        str,
-            "positive":        float,
-            "negative":        float,
-            "neutral":         float,
-            "sentiment_score": float,   # positive - negative
-            "label":           str,     # argmax of the three classes
-            "inference_ms":    float,   # tokenize + forward + decode wall time
+            "headline": str,
+            "pos":      float,
+            "neg":      float,
+            "neu":      float,
+            "ss":       float,   # positive - negative
+            "lab":      str,     # argmax of the three classes
+            "ms":       float,   # tokenize + forward + decode wall time
         }
     """
     load_model(model_dir)
@@ -339,11 +339,18 @@ def analyze_headline(headline: str, model_dir: Path = MODEL_DIR) -> Dict:
     scores = _inferencer.predict(headline)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+    # Unified 2026-08-09 key names (see tools/Encoder_Models/CLAUDE.md). `scores` is
+    # keyed by self.label_order — full words straight off the model config — and is
+    # mapped explicitly rather than update()d, so `lab` keeps yielding "positive" /
+    # "neutral" / "negative" instead of the short key. `ms` unifies what this file
+    # called `inference_ms` with the other headliners' `elapsed_ms`.
     result: Dict = {"headline": headline}
-    result.update(scores)
-    result["sentiment_score"] = round(scores["positive"] - scores["negative"], 4)
-    result["label"]           = max(scores, key=scores.get)
-    result["inference_ms"]    = round(elapsed_ms, 1)
+    result["pos"] = scores["positive"]
+    result["neg"] = scores["negative"]
+    result["neu"] = scores["neutral"]
+    result["ss"]  = round(scores["positive"] - scores["negative"], 4)
+    result["lab"] = max(scores, key=scores.get)
+    result["ms"]  = round(elapsed_ms, 1)
     return result
 
 
@@ -385,7 +392,7 @@ def _run_benchmark(headline: str, repeats: int) -> None:
 
     timings = []
     for _ in range(repeats):
-        timings.append(analyze_headline(headline)["inference_ms"])
+        timings.append(analyze_headline(headline)["ms"])
 
     t = np.array(timings)
     print(json.dumps({

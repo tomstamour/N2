@@ -1,4 +1,4 @@
-# Entry-order failure modes — findings (last updated 2026-07-27)
+# Entry-order failure modes — findings (last updated 2026-08-13)
 
 Two DISTINCT failure modes make a marketable BUY LMT entry come back with no
 fill. Part A is now CONFIRMED. Part B remains unexplained.
@@ -104,19 +104,128 @@ ceiling'd by MAX_CAP_ENTRY_PERCENT). Considered 2026-07-27, rejected because:
      what the "FULL LIMIT, cap released" rows above are.
   3. It manufactures the late chased-up fills that lost money 3 times out of 3.
 
+  ** SUPERSEDED 2026-08-12 by x-wing-3.0.py — but only points 1 and 3, and only
+     because 3.0 is a different mechanism from the one rejected here. **
+  All three points above stand as written about an UP-ONLY, un-time-boxed chase.
+  What this paragraph never considered is that point 2 is the PROBLEM, not the
+  consolation: IBKR chasing for us, bounded above by a limit we priced once
+  minutes ago, IS the stale-ceiling ratchet. Measured over all 248 filled
+  entries, every one of the 20 that took >10 s paid 100% of the pad. The static
+  limit is already an uncontrolled chase; it is simply run by IBKR, on IBKR's
+  schedule, up to a number we chose before the tape existed.
+  3.0 therefore keeps a limit ~2.5% above the LIVE ask in BOTH directions:
+    - re: point 1 — agreed, and 3.0 does not try to beat the cap. It stays near
+      the offer, which is where the band is anyway (cap/ask 0.985-1.030 on 11 of
+      the 12 pairable caps), and it now RECORDS the cap: 2161's price is parsed
+      out of the warning and openOrder is routed through so the working limit is
+      visible. That closes the "Known gap in our instrumentation" below.
+    - re: point 3 — the UP follow is time-boxed to 3 s (ENTRY_TRACK_UP_WINDOW_SEC)
+      and ceiling'd at trigger_ref +6%, so it cannot reach the 7-23 s window the
+      three losers filled in. The DOWN ratchet is what is new and is not
+      time-boxed: it is the only thing that prevents a limit from becoming the
+      stale ceiling that produced BAOS/NIVF/GWH.
+  The caveat below ("n=3 in the cap-release group. Small.") still applies, and
+  now cuts both ways: the case FOR the down ratchet rests on the same 3 fills.
+  Operator decision 2026-08-11: ceiling +6%, not the price-neutral +2.9%, i.e.
+  worst-case entry price is deliberately allowed above 2.1's. Watch it.
+
 REJECTED — extending ENTRY_FILL_TIMEOUT_SEC past 10 s to let the cap ratchet.
 This is what would have "fixed" PFSA, and it is precisely what bought BAOS
 (-13.40%), NIVF (-11.54%) and GWH (-9.35%).
 
 Caveat: n=3 in the cap-release group. Small. Revisit if it grows and reverses.
 
-## Known gap in our instrumentation
+## MGRX vs REBN, 2026-08-13 — the cap meets the 3 s UP-window
+** The matched pair that motivated ENTRY_CAP_RESCUE_ENABLED (x-wing-3.0). **
+
+Both ran the SAME day on the SAME clerk-1.2 (client pool, x-wing-3.0), both drew
+a 2161 that parked them UNDER the offer, and they ended opposite ways. The only
+difference is WHEN the ask legged up relative to ENTRY_TRACK_UP_WINDOW_SEC=3.0.
+
+  REBN 07:30:00.685  entry 1.7000 (ask 1.6400 x1.025), ceiling 1.7500
+       07:30:01.260  2161 -> working 1.6300  (cap/ask 0.994, under the offer)
+       07:30:02.460  ask legs 1.64 -> 1.72 at t=1.775 s, INSIDE the window
+                     -> CHASE_CEIL 1.7000 -> 1.7500
+       07:30:02.599  FILLED 2 sh @ 1.7200, 139 ms later
+
+  MGRX 16:05:01.450  entry 0.5915 (ask 0.5770 x1.025), ceiling 0.6117
+       16:05:01.750  2161 -> working 0.5764  (cap/ask 0.999, under the offer)
+       16:05:01-05.9 ask FLAT at 0.5770 -> tracker correctly idle, n=0
+       16:05:05.989  ask legs 0.5770 -> 0.5970 at t=4.539 s, OUTSIDE the window
+                     -> target computed as 0.6117 (marketable!), then refused:
+                        _track_up_frozen = True, PERMANENTLY
+       16:05:06-11   ask runs 0.5970 -> 0.6000 -> 0.6100, we never bid again
+       16:05:11.651  ENTRY_FILL_TIMEOUT_SEC -> our cancel -> "entry_inactive"
+       later         MGRX traded 0.7347 by 16:47 (+27.3% off the trigger)
+
+Three things this pair establishes:
+
+1. REBN FILLED AT 1.7200 — ABOVE its own original 1.70 limit. Raising our limit
+   is therefore exactly what produces the fill while capped, and point 1 of the
+   2026-07-27 rejection above ("chasing cannot beat a cap") needs its scope
+   stated precisely: chasing cannot move IBKR's REFERENCE, but our limit is the
+   ENVELOPE IBKR is allowed to work inside ("...or a more aggressive price still
+   within your specified limit price"). A limit left at 1.70 caps the release at
+   1.70. That is a real, measured lever, and it is the one MGRX never pulled.
+
+2. The window check is LAZY (x-wing-3.0.py, inside `if target > working +
+   delta_floor`). It does not fire at t=3.0 s; it fires on the FIRST up-move the
+   tracker actually WANTS after t=3.0 s. On a flat-then-jump tape that is the
+   very move that would have filled — the window does not expire quietly, it
+   expires ONTO the rescue. Any future reasoning about the box must use this
+   shape, not "3 seconds of chasing then stop".
+
+3. The "don't chase after 3 s" evidence (84.6% of fills land <=3 s; BAOS 7.2 s
+   -13.40%, NIVF 9.3 s -11.54%, GWH 23.0 s -9.35%) is about a WORKING order. A
+   capped order is not working: IBKR holds it below the offer, so it can neither
+   fill nor chase while the clock runs out on it. MGRX spent its whole window
+   inert (n=0 modifies) and was then punished as though it had been chasing.
+
+FIX (2026-08-13, x-wing-3.0.py): ENTRY_CAP_RESCUE_ENABLED — ONE post-window UP
+move, armed only while entry_capped_to is set AND the price IBKR is working sits
+below the live ask (entry_lmt_working when openOrder was forwarded, else the 2161
+cap itself; MGRX had no openOrder, so the fallback is load-bearing). Blocked
+outright by a 202. Still bounded by the +6% ceiling, the 20-modify budget, the
+0.25 s throttle and the 10 s timeout. Replaying MGRX's recorded ask series
+through the patched controller yields exactly one CAP_RESCUE at the leg-up,
+0.5915 -> 0.6117 against a 0.5970 ask (+2.46% marketable), covering the 0.6100
+ask peak for the rest of the pending window. REBN replays UNCHANGED — it chased
+inside the window, so the rescue never arms. Runs with no 2161 are untouched.
+
+⚠ This does NOT reopen "extend the timeout to let the cap ratchet", still
+REJECTED above: the rescue is one bounded re-price inside the same 10 s, not
+more time. And it does not contradict PFSA — PFSA's cap/ask was 0.859, so a
+rescue there would still have left it ~14% under the offer and unfillable.
+The pattern this converts is cap/ask ~= 1.0 (11 of 12 caps) plus a late leg up.
+
+⚠ Also fixed here: a 202 arriving as the ACK OF OUR OWN CANCEL was being logged
+as "hit IBKR's aggressive-limit wall (202)". MGRX logged that 96 ms after its own
+timeout-cancel. Harmless as a log line; not harmless once 202 blocks the rescue.
+The wall branch is now gated on `not _entry_abort_pending`.
+
+## Known gap in our instrumentation  ** CLOSED in x-wing-3.0, 2026-08-12 **
 2161 is not in ENTRY_REJECT_CODES (x-wing-2.1.py:148), so x-wing's
 on_order_error (:955) drops it. Only the clerk's catch-all error() handler
 (clerk-1.1.py:340-347) logs it. Consequence: x-wing's own log, its price table,
 and the clerk's "finishing duo (xwing:entry_inactive)" line record a capped run
 with the SAME label as a genuine IBKR deactivation (Part B) — two completely
 different problems, indistinguishable in every historical grep.
+
+FIXED in x-wing-3.0.py (still open for anything running 2.1, i.e. clerk-1.1):
+  - on_order_error now handles 2161 explicitly, parses IBKR's capped price out
+    of the warning text (_parse_capped_price) and writes an ENTRY_CAPPED row.
+    Still deliberately NOT in ENTRY_REJECT_CODES — a capped order is alive.
+    Logged ONCE per run: a tracked entry can draw a fresh ~1 kB 2161 on every
+    re-price.
+  - Both clerks now forward openOrder to ctl.on_open_order (getattr-guarded, so
+    clerk-1.1 keeps loading 2.1 unchanged). openOrder carries the only copy of
+    the price IBKR is ACTUALLY working — orderStatus never reports one — so a
+    cap that lowers the working price below our limit is now visible live,
+    not reconstructed from clerk.log afterwards.
+  - New price-table columns: entry_order_id, entry_lmt, entry_status, track_n,
+    capped_to (appended after why_held, so 2.1-era parsers still read the file).
+    `capped_to` non-empty is the discriminator this section asks for; a run with
+    entry_status=Inactive and capped_to empty is Part B.
 
 To identify a capped run today you must cross-reference clerk.log for a "code=2161"
 line on the same reqId. Diagnostic signature: cap/ask well below 1.0 means a stale
@@ -125,6 +234,53 @@ early-session reference; cap/ask ~= 1.0 is a routine cap that usually fills fast
 Open idea (NOT implemented): abort immediately when cap/ask is far below 1.0, so
 the run frees its pooled clerk client instead of resting 10 s at an unfillable
 price. On the evidence above this forgoes nothing.
+
+## How to tell the two apart in practice (added 2026-08-11)
+The collision above is not theoretical — it bit this month. As of 2026-08-11,
+  grep -l entry_inactive xwing_tables/*2026-08*.tsv
+returns 10 files, of which only 6 are Part B. The other 4 are OUR OWN
+ENTRY_FILL_TIMEOUT_SEC cancels, IBKR status "Cancelled", not "Inactive":
+  ORIO 2026-08-06 07:39:01.8 -> 07:39:11.9  (+10.2 s)
+  UZX  2026-08-11 05:05:36.4 -> 05:05:46.5  (+10.1 s, clerk code=202)
+  CYAB 2026-08-11 09:00:13.7 -> 09:00:23.8  (+10.1 s)
+  GLE  2026-08-11 09:04:11.2 -> 09:04:21.2  (+10.1 s)
+
+Two reliable discriminators, neither needing clerk.log:
+  1. The x-wing log string. Part B says "Inactive with no fill"; a timeout cancel
+     says "Cancelled with no fill". The IBKR status differs (Inactive vs
+     Cancelled) even though ENTRY_DEAD_STATUSES maps both to "entry_inactive".
+  2. Time from ENTRY to death. Part B is sub-second (47-809 ms observed); a
+     timeout cancel lands at ~10 s by construction.
+So: sweep xwing-logs/ for "Inactive with no fill", NOT xwing_tables/ for
+"entry_inactive". The 2026-08-11 Part-B table was built that way.
+
+Second trap, specific to the T47 era: a trio writes ONE x-wing log but ONE TABLE
+PER RUN, so table names and log names do not map 1:1. AIHS 2026-08-11 has tables
+..._06-58-00.tsv and ..._06-58-19.tsv but a single log ..._06-58-00.log holding
+both deactivations. Naive per-table lookup misfiles run 2. Count events by
+grepping the LOGS, then attribute to runs via the "ENTRY: ... orderId=N" line.
+
+## Why 3 of those 4 cancels were unfillable from the start (FIXED in 3.0)
+ORIO aside, UZX / CYAB / GLE all rested at a price MAX_CAP_ENTRY_PERCENT=30.0
+(x-wing-2.1.py:120) had clamped below the market, so the 10 s timeout was a
+formality. GLE is the clearest and most expensive: T47 run 1 filled 11 @ 0.4387
+and exited stop_filled at 0.6693 (+52.6%) — and the run-2 re-entry was then priced
+at 0.5034 against a 0.6693 bid, 25% under, because the clamp is anchored to
+last_close and the name had already doubled off it. T47 relaunches BY DESIGN only
+after price recovers to the frozen SP1, so on any name that ran far from
+last_close the re-entry cannot fill. Same mechanism produced the passive AIHS
+run 2 in the Part B table below. Recorded here only so the pattern is on paper;
+fixing it is deliberately not part of this update.
+
+** FIXED 2026-08-12 in x-wing-3.0.py. ** MAX_CAP_ENTRY_PERCENT now defaults to
+None; the entry ceiling is trigger_ref * (1 + ENTRY_TRACK_MAX_PCT/100), anchored
+on the price we actually decided to buy at rather than on a close the name has
+already left. Swept over all 317 entries, the last_close clamp priced SEVEN of
+them below the market — GLE -24.8%, UZX -19.8%, NUWE -43.2%, BYAH -41.7%,
+ICCM -70.4%, OBAI -17.8%, BNRG -12.1% — i.e. it was not a GLE quirk. Verified on
+the GLE shape in analyze_trade_mole/verify_xwing3_tracking.py: with last_close
+1.50 and a 2.10 bid, 2.1 clamps run 2 to 1.95 (unfillable) and 3.0 prices it at
+2.18. The --max-cap-entry-percent flag still exists for standalone experiments.
 
 ================================================================================
 PART B — SILENT "Inactive" ENTRY  ** STILL UNEXPLAINED **
@@ -136,18 +292,62 @@ x-wing's ENTRY_DEAD_STATUSES guard (x-wing-2.1.py:154, handled in
 on_order_status :928-941) aborts the run ("entry_inactive"). The order was never
 live — this is IBKR deactivating it, not our code cancelling it.
 
-## Confirmed occurrences (5 of ~1822 x-wing runs)
-Re-swept 2026-07-29 across xwing_tables/ + xwing-logs/ (match: table event
-"entry_inactive" AND log "Inactive with no fill"). The earlier list of 3 was
-incomplete — AIHS 2026-07-20 was always on disk and had been missed.
+## Confirmed occurrences (12 events / 11 symbol-days, of 2790 x-wing runs)
+Re-swept 2026-08-11 over ALL of xwing-logs/ (match: log "Inactive with no fill",
+parsed back to its "ENTRY: BUY LMT ... orderId=N" line). This supersedes the
+2026-07-29 sweep, which stopped at 5 and whose "~1822 runs" denominator is
+replaced by the 2790 log files on disk today.
 
-  symbol  date        fire (ET)   entry                    pad     -> Inactive
-  ------  ----------  ----------  -----------------------  ------  ----------
-  JZXN    2026-07-10  (pre-guard) marketable BUY LMT       —       +110 ms
-  OFAL    2026-07-14  08:00:03.4  30 @ 0.1633 (ask 0.157)  4.00%   +519 ms
-  CLIK    2026-07-17  07:00:03.3   2 @ 1.9200 (ask 1.85)   4.00%   +215 ms
-  AIHS    2026-07-20  07:00:09.4   3 @ 1.6000 (ask 1.54)   4.00%    +97 ms
-  NCRA    2026-07-29  08:00:01.6   3 @ 1.6500 (ask 1.64)   0.40%   +427 ms
+  symbol  date        fire (ET)   entry                     pad     sess -> Inactive
+  ------  ----------  ----------  ------------------------  ------  ---- ----------
+  JZXN    2026-07-10  09:15 ish   marketable BUY LMT        —       ETH    +110 ms
+  OFAL    2026-07-14  08:00:03.4  30 @ 0.1633 (ask 0.157)   4.00%   ETH    +519 ms
+  CLIK    2026-07-17  07:00:03.3   2 @ 1.9200 (ask 1.85)    4.00%   ETH    +215 ms
+  AIHS    2026-07-20  07:00:09.4   3 @ 1.6000 (ask 1.54)    4.00%   ETH     +97 ms
+  NCRA    2026-07-29  08:00:01.6   3 @ 1.6500 (ask 1.64)    0.40%   ETH    +427 ms
+  DXST    2026-07-30  09:30:10.9   1 @ 2.5100 (ask 2.50)    0.40%   RTH    +192 ms
+  DXST    2026-08-04  09:00:10.2   1 @ 2.9400 (ask 2.90)    2.90% c ETH     +87 ms
+  LHAI    2026-08-05  08:00:07.3   5 @ 0.8540 (ask 0.8299)  2.90%   ETH    +809 ms
+  TJGC    2026-08-10  06:00:00.7   1 @ 4.7400 (ask 4.70)    2.90% c ETH    +317 ms
+  AIHS    2026-08-11  06:58:02.9   2 @ 1.9500 (ask 1.91)    2.90% c ETH     +78 ms
+  AIHS    2026-08-11  06:58:19.5   2 @ 1.9500 (BID 1.99!)   2.90% c ETH     +47 ms
+  NCRA    2026-08-11  08:00:04.4   2 @ 2.0500 (ask 1.99)    2.90%   ETH    +278 ms
+
+  "c" = our own MAX_CAP_ENTRY_PERCENT clamp (last_close +30%) bound the limit.
+  JZXN predates the log guard, so the sweep cannot match it; it is carried over
+  from the 2026-07-29 list on that list's authority, not re-verified here.
+
+The two AIHS rows are runs 1 and 2 of ONE T47 trio (XWING_REENTRY_NUMBER=1), not
+two independent triggers.
+
+## The rate is climbing — this is not a static background fault
+Same sweep, bucketed by month (denominator = xwing-logs/*.log for that month):
+
+  2026-06   1323 runs    0 events   0.00%
+  2026-07   1026 runs    5 events   0.49%   (+ JZXN, unmatchable — so 6)
+  2026-08    437 runs    6 events   1.37%   (8 trading days)
+
+June is CLEAN across 1323 runs. Whatever this is, it started in July and has
+roughly tripled in rate since. Any explanation has to account for the June zero.
+
+AIHS 2026-08-11 detail (clerk.log:687-740, xwing_AIHS_2026-08-11_06-58-00.log,
+T47-tables/AIHS-2026-08-11-06-t47v2.tsv): PR 06:58:00.109 -> armed on client 1006
+06:58:00.233 (lastClose 1.50); Rule-E TRADE surge 06:58:02.979 @ 1.91
+($rate_5s=17.3>=10 & price_chg=+12.35%>=+1.2%; 3 prints, not a Rule-F pretrade).
+Run 1: BUY LMT 2 @ 1.9500 orderId 23 at 06:58:02.987 (GTC, outsideRth=1,
+usePriceMgmtAlgo=1) -> Inactive filled=0 whyHeld='' at 06:58:03.065. T47 then
+latched a Valid-DIP (LP 1.58, 17.28%) and relaunched at 06:58:19.531 on the bid
+re-crossing 1.91. Run 2: BUY LMT 2 @ 1.9500 orderId 24 -> Inactive at
+06:58:19.578. `grep code=` over that day's clerk.log: no 2161, 202, 201 or 110 on
+AIHS at all (the day's only 2161 is CMND 08:05, its only 202 is UZX 05:05).
+
+  ** Run 2 is the most informative case in this whole table. ** Both AIHS entries
+  were clamped to 1.9500 by MAX_CAP_ENTRY_PERCENT=30.0 (x-wing-2.1.py:120,
+  last_close 1.50). By the relaunch the quote had run to 1.99 x 2.00, so the
+  clamped limit sat BELOW THE BID — a passive, resting, entirely unremarkable buy
+  order. IBKR deactivated it in 47 ms, faster than any marketable case on record.
+  (That the clamp also makes T47 re-entries structurally unfillable on a name that
+  has already run is a separate, purely local defect — out of scope for this file.)
 
 NCRA detail (clerk.log:991-1075, xwing_NCRA_2026-07-29_08-00-00.log): armed on
 client 1018 08:00:00.913; Rule-F pretrade surge 08:00:01.603
@@ -158,14 +358,38 @@ clerk.log = 0 hits; no 202/201/110 either. The 10 s ENTRY_FILL_TIMEOUT_SEC never
 ran — the order died at +427 ms, so the abort is a CONSEQUENCE of the Inactive,
 not our cancel.
 
-## Shared fingerprint (updated 2026-07-29)
-- Marketable BUY LMT priced ABOVE the ask, pre-market / ETH
-- Low-priced small-cap ($0.157 - $1.85)
-- Deactivated within ~100-520 ms, NO error reason
-- ALL FIVE fire 1.6-9.4 s after a top-of-hour boundary that is also a pre-market
-  session open (07:00 or 08:00). NCRA at +1.6 s is the closest yet.
+## Shared fingerprint — MOSTLY FALSIFIED (rewritten 2026-08-11)
+The 2026-07-29 fingerprint was fitted to 5 cases. The 7 new ones break four of
+its five clauses. Recorded here in full, because knowing what is NOT true is the
+main thing this sweep bought:
 
-## What NCRA newly rules out
+  "Marketable BUY LMT priced ABOVE the ask"
+      -> FALSIFIED by AIHS 2026-08-11 run 2: limit 1.9500 against a 1.9900 bid,
+         i.e. PASSIVE, and killed faster (+47 ms) than any marketable case.
+  "pre-market / ETH"
+      -> FALSIFIED by DXST 2026-07-30, which x-wing logged as RTH at 09:30:10.9.
+  "Low-priced small-cap ($0.157 - $1.85)"
+      -> FALSIFIED at both ends of the new data: TJGC @ 4.7400, DXST @ 2.9400,
+         NCRA @ 2.0500, AIHS @ 1.9500.
+  "Deactivated within ~100-520 ms"
+      -> FALSIFIED both ways: AIHS run 2 at 47 ms, LHAI at 809 ms.
+  "ALL FIVE fire 1.6-9.4 s after a top-of-hour boundary that is also a
+   pre-market session open (07:00 or 08:00)"
+      -> FALSIFIED by AIHS 2026-08-11, which fired at 06:58:02 — two minutes
+         BEFORE 07:00, not after it — and weakened by DXST 2026-08-04 at
+         +10.2 s past 09:00. Most cases still cluster near a top-of-hour mark,
+         but it is a tendency, not a rule, and it cannot carry a theory.
+
+What actually survives across all 12:
+- BUY entry, filled=0, status Inactive, whyHeld='' and NO error() callback
+- Dies sub-second: the whole observed range is now 47 ms - 809 ms
+- Small-cap US equity on SMART, order GTC + outsideRth
+- Never seen before 2026-07 (1323 clean June runs)
+
+Note the surviving set says nothing about price, session, or aggressiveness. We
+do not currently have a discriminating feature.
+
+## What the cases rule out (1-2 from NCRA 2026-07-29, 3 from AIHS 2026-08-11)
 1. The Price Management Algo does NOT prevent Part B. ENTRY_USE_PRICE_MGMT_ALGO
    is True (x-wing-2.1.py:129 -> :699 -> :815) and orderId 40's placeOrder wire
    dump carries it. x-wing-2.1 has been live since 2026-07-23, so NCRA is the
@@ -184,14 +408,43 @@ not our cancel.
    every future run stays on the tight pad until those constants are committed or
    reverted, which changes fill behaviour well beyond this investigation.
 
-## Status of the candidate causes
+   ** STALE as of 2026-08-11 — do not read the 0.40% as current. ** `git diff
+   HEAD x-wing-2.1.py` is clean and HEAD now holds MAX_LIMIT_ENTRY_PERCENT_PRICE
+   = 2.9 (:106), STALE_QUOTE_ENTRY_PERCENT_PRICE = 4.0 (:118), MAX_CAP_ENTRY_
+   PERCENT = 30.0 (:120). Only NCRA 2026-07-29 and DXST 2026-07-30 ran on the
+   0.40% pad; every August case in the table ran on the committed 2.90%.
+
+3. Aggressiveness is not the driver in ANY form — strengthened 2026-08-11.
+   The NCRA argument above only narrowed the DEGREE of aggressiveness (4.00% ->
+   0.40%). AIHS run 2 removes the variable entirely: a limit BELOW the prevailing
+   bid is not aggressive by any definition, and it was deactivated fastest of all.
+   Any surviving theory must explain the death of a passive resting buy order.
+
+## Status of the candidate causes (revised 2026-08-11)
 1. Pre-market price cap on a marketable limit  -> SUPERSEDED. That mechanism is
    real but it is Part A, and it announces itself with 2161 and leaves the order
    Submitted. It does not produce a silent Inactive.
 2. Venue session had only just opened at the top-of-hour boundary and briefly
-   rejected the order -> STILL OPEN, and now clearly the leading candidate. All
-   FIVE occurrences sit within seconds of a session-open boundary, and #1/#2
-   above have removed the competing explanations.
+   rejected the order -> DEMOTED from "clearly the leading candidate" to weakly
+   supported. It was promoted on the strength of 5-for-5 clustering; that is now
+   10-of-12, and the two misses are damaging rather than marginal:
+     - AIHS 2026-08-11 fired at 06:58:02, BEFORE the 07:00 boundary. A session
+       that has not opened yet cannot have just opened.
+     - DXST 2026-07-30 fired at 09:30:10.9 in RTH, so if a boundary is involved
+       it is not a *pre-market* session open, and the clause loses its mechanism.
+   Clustering near the top of the hour is real but is also exactly when our own
+   PR flow peaks, so it is confounded with arrival rate and cannot be treated as
+   evidence about IBKR without controlling for that.
+3. NO CANDIDATE IS CURRENTLY LEADING. Constraints any new theory must satisfy:
+     - kills a PASSIVE buy limit resting under the bid (AIHS run 2), so nothing
+       about order aggressiveness, price bands or marketability can explain it
+     - works in RTH as well as ETH (DXST 2026-07-30)
+     - is price-independent over $0.16 - $4.74
+     - was absent for 1323 consecutive June runs and has tripled in rate since
+       2026-07, so it is more likely a change on IBKR's side (or in our order
+       shape / account state / clientId reuse) than a constant of the venue.
+   The June-to-August onset is the strongest untouched lead and nobody has yet
+   diffed what changed in our placeOrder wire shape across that boundary.
 
 ## Next step to confirm — CORRECTED 2026-07-29
 The previous text here said to enable "Create API message log file". IT IS
@@ -224,6 +477,19 @@ key). There is no jts.ini flag to write them in plaintext.
    and ask for the deactivation reason. That is the one route to a definitive
    answer, and it should settle all five occurrences at once.
 
+=> BETTER CASE, added 2026-08-11: lead with AIHS instead. File
+     ~/Jts/settings-live/pehghglnegcfnbchbdpcghnkjbmkglkilclcnofo/
+       api.1006.20260811.035930.ibgzenc
+   (clerk.log:338 "03:59:30.429 client 1006 connected; nextValidId=23" — matches
+   the scheme above), quoting account U18283054, AIHS conId 802469981, orderIds
+   23 AND 24, 2026-08-11 06:58:02.987 and 06:58:19.531 ET.
+
+   Why it is the stronger submission: one file holds TWO deactivations 16 s
+   apart, and the second (orderId 24, BUY LMT 1.9500 against a 1.9900 bid) was
+   PASSIVE. Support can plausibly wave NCRA away as a price-band or
+   marketability rejection; there is no such story for a resting bid four cents
+   under the market. Ask specifically why orderId 24 was deactivated.
+
 ## Meanwhile: we were also discarding reasons ourselves (fixed 2026-07-29)
 Independently of the encrypted logs, our own callbacks threw away the only fields
 IBKR does send on a deactivation:
@@ -240,6 +506,16 @@ NO_FILL_EVENTS set-match still works, and the new column is appended last so
 older TSVs still parse. If the NEXT occurrence carries a whyHeld or warningText,
 it will self-diagnose with no IBKR round-trip.
 
+RESULT (2026-08-11): the instrumentation works and IBKR sends nothing. Five
+post-fix occurrences (DXST 08-04, LHAI 08-05, TJGC 08-10, AIHS 08-11 x2, NCRA
+08-11) all log whyHeld='' , and the clerk's openOrder line reads
+"status=Inactive completed= warn=''" on every one. So the deactivation reason is
+genuinely absent from the API surface, not merely dropped by us — which kills the
+cheap route and leaves the encrypted api.*.ibgzenc escalation as the only one.
+(DXST 2026-07-30 shows no whyHeld field at all: the fix landed 07-29 but a running
+clerk keeps its imported x-wing until restarted, so that run was still on the old
+module.)
+
 ================================================================================
 Current handling (unchanged, no auto-retry)
 ================================================================================
@@ -251,3 +527,14 @@ terminal:
   - ENTRY_FILL_TIMEOUT_SEC=10 backstop (:1041-1055), cancel + confirm
 2161 is deliberately NOT in ENTRY_REJECT_CODES: a capped order is alive and may
 still fill, so treating it as a reject would be wrong.
+
+x-wing-3.0.py keeps all of the above and adds ONE deliberate exception, because
+it now sends modifies and a REJECTED MODIFICATION can surface as a transient
+"Cancelled" on an order that is in fact still live. A Cancelled/ApiCancelled
+landing within ENTRY_TRACK_STATUS_GRACE_SEC=0.75 s of a re-price is DEFERRED,
+and taken only if no live status follows. **This is scoped to Cancelled: a
+Part-B "Inactive" still aborts immediately**, so the 12-event/2790-run series
+above stays directly comparable across the 2.1->3.0 boundary. Do not widen it.
+Still no auto-retry anywhere: an entry is never re-placed under a new orderId
+(T47's late-fill guard keys on ctl.active_buy_id and assumes one entry id per
+run), and a modify-class error stops tracking rather than retrying.

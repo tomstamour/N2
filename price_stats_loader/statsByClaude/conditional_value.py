@@ -34,7 +34,7 @@ Run:
     /home/tom/venv/bin/python conditional_value.py \
         ../outputs/PRstats_..._kwScored.tsv \
         --gate "model_proba_PLUS_kw_mult_nb>=0.6" \
-        --condition "FinMarBa_indecisive<=0.1"
+        --condition "FinMarBa_ind_hd<=0.1"
 """
 import argparse
 import pathlib
@@ -117,9 +117,9 @@ def main():
     ap.add_argument("--target", default=TARGET_DEFAULT)
     ap.add_argument("--threshold", type=float, default=30.0)
     ap.add_argument("--gate", action="append", required=True,
-                    help="repeatable, e.g. 'positive>=0.8'")
+                    help="repeatable, e.g. 'Prosus_pos_hd>=0.8'")
     ap.add_argument("--condition", action="append", required=True,
-                    help="repeatable, e.g. 'FinMarBa_indecisive<=0.1'")
+                    help="repeatable, e.g. 'FinMarBa_ind_hd<=0.1'")
     ap.add_argument("--date-col", default="ArrivalDate")
     ap.add_argument("--split-date", default="2026-06-20")
     ap.add_argument("--max-outlier", type=float, default=500.0)

@@ -116,11 +116,13 @@ def main():
                 "Time": time_str,
                 "Headline": headline,
                 "Float": float_val,
-                "positive": sentiment["positive"],
-                "negative": sentiment["negative"],
-                "neutral": sentiment["neutral"],
-                "sentiment_score": sentiment["sentiment_score"],
-                "label": sentiment["label"],
+                # Unified {Model}_{channel}_hd names (2026-08-09); `Prosus` is
+                # ProsusAI/finbert. Same columns O5.2 and the batch scorers write.
+                "Prosus_pos_hd": sentiment["pos"],
+                "Prosus_neg_hd": sentiment["neg"],
+                "Prosus_neu_hd": sentiment["neu"],
+                "Prosus_ss_hd": sentiment["ss"],
+                "Prosus_lab_hd": sentiment["lab"],
             })
 
         if i % 50 == 0 or i == len(json_files):
@@ -128,7 +130,8 @@ def main():
 
     df = pd.DataFrame(rows, columns=[
         "Symbol", "Date", "Time", "Headline", "Float",
-        "positive", "negative", "neutral", "sentiment_score", "label"
+        "Prosus_pos_hd", "Prosus_neg_hd", "Prosus_neu_hd",
+        "Prosus_ss_hd", "Prosus_lab_hd"
     ])
 
     df.to_csv(args.output_name, sep="\t", index=False)
