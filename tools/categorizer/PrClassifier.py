@@ -10,6 +10,10 @@ First matching rule wins; rows matching nothing get Other/Other.
 Usage:
   /home/tom/venv/bin/python PrClassifier.py --input PRstats_....tsv [--output out.tsv]
 
+  # classify the body fallback on the Orchestrator5.3 200-word body_prep string
+  # instead of the first 1500 chars, into differently-named columns:
+  ... --body-200w --fine-col FineClass_200w --broad-col BroadClass_200w
+
 Default output: <input-stem>_Classed.tsv next to the input.
 """
 
@@ -25,6 +29,11 @@ from collections import Counter
 # boilerplate deeper in the text is full of false triggers (designations,
 # "forward-looking", law-firm footers...).
 BODY_LEAD_CHARS = 1500
+
+# The --body-200w window. 200 words is the Orchestrator5.3 operator decision of
+# 2026-09-18 (XGB_BODY_CAP_WORDS): the cap on every body its encoders, its
+# embedder and its classifier read. Keep the two numbers in step.
+BODY_PREP_WORDS = 200
 
 # Wire headlines carry NBSP (\xa0) and friends between words; the rules below are
 # written with literal spaces, so "Announces\xa0First\xa0Quarter\xa02026\xa0Results"
@@ -195,9 +204,39 @@ RULES = [
     ("Conference_Presentation", "Corporate",
      r"to present|presents? at|poster|symposium|\bsummit\b|investor conference"
      r"|fireside chat|annual meeting|to participate|to attend|rings? .{0,20}bell"),
+    # Widened 2026-09-19, and the reason is a lesson this file already teaches in
+    # the Regain_Compliance entry: a rule that is too LITERAL fails invisibly. The
+    # plaintiff's-firm notice family has a grammar this rule did not hold — it had
+    # the NOUN `investigation` but not "Johnson Fistel INVESTIGATES", `deadline
+    # alert` but not "ATRA DEADLINE NOTICE", and nothing for "Shareholders Are
+    # Encouraged to Reach Out to <firm>" or "Did X Insiders Breach their Fiduciary
+    # Duties?". Those headlines matched NOTHING, fell to the body, and came back
+    # classified by the ISSUER'S BUSINESS: every "Halper Sadeh is Investigating
+    # Whether X is Obtaining a Fair Price" PR was `MA`, AARD's notice was
+    # `Clinical_Data` on the biotech's own body, ANGI's was `Contract_Award`.
+    # Measured over the 4804-row 2026-08-28 corpus: 34 rows move in, ALL of them
+    # headline-decided and all genuine notices; 18 leave the O5 ClassWhitelist and
+    # ZERO enter it; no genuine catalyst PR is taken.
+    # ⚠ `investigat(e|es|ed|ing|ion|ions)\b` is spelled out deliberately — the old
+    # unanchored `investigation` matched **investigation**AL, which is why 8 biotech
+    # and mining PRs (TRAW, ADGM, OPTH, PBM, SURG…) carried this class on body prose
+    # alone. Same family as the `rmat` bug. `investigator`/`investigational` must
+    # not match, so never relax this to `investigat\w+`.
+    # ⚠ The investigate-family and the notice grammar are HEADLINE-strength only:
+    # over body prose a clinical study that "investigated" an endpoint, an SEC
+    # matter and a short-seller reply all fire. See BODY_OVERRIDES["Legal"].
     ("Legal", "Legal",
-     r"class action|investigation|law firm|lawsuit|litigation|settlement"
-     r"|court (rul|approv)|deadline alert"),
+     r"class action|law firm|lawsuit|litigation|settlement|court (rul|approv)"
+     r"|\binvestigat(?:e|es|ed|ing|ion|ions)\b"
+     r"|\b(encouraged|urged|reminded|advised|notified)\b[^.]{0,40}"
+     r"\bto (contact|reach out|call|speak|act)\b"
+     r"|\b(contact|reach out to)\b[^.]{0,30}\b(law offices?|llp|l\.l\.p\.|p\.c\.|attorney)"
+     r"|on behalf of[^.]{0,30}\b(shareholders?|investors?|purchasers?|stockholders?)\b"
+     r"|\b(deadline|investor)\b[^.]{0,15}\b(alert|notice|reminder)\b"
+     r"|\b(alert|notice|reminder)\b[^.]{0,15}\bdeadline\b"
+     r"|\blead plaintiff\b|\bclass period\b|\bsecurities fraud\b"
+     r"|\bbreach\w*[^.]{0,25}\bfiduciary\b|\bfiduciary (duty|duties)\b[^.]{0,25}\bbreach"
+     r"|\binvestor scrutiny\b"),
     # Bare `milestone` is furniture ("a significant milestone for the company"):
     # 71 of this rule's 79 body-decided rows fired on that one word alone. It now
     # needs a verb that makes the milestone the news.
@@ -448,6 +487,19 @@ BODY_OVERRIDES = {
         r"|" + _BODY_CATALYST + r"[^.]{0,60}\b(?:nda|bla)\b"
         r"|\binvestigational\b[^.]{0,40}"
         r"(?:drug|therap|product|agent|candidate|treatment|new drug)",
+
+    # Litigation NOUNS only. The widened headline rule above carries the
+    # plaintiff's-firm notice grammar and the investigate-family, and neither
+    # survives contact with body prose: a clinical study "investigated" an
+    # endpoint, an issuer "is cooperating with an SEC investigation", a reply to a
+    # short-seller report, "the Board investigated strategic options". Measured:
+    # 8 of this class's body-decided rows were that, plus the investigationAL bug
+    # the headline rule's comment describes. The notice grammar is likewise
+    # headline-strength — "on behalf of shareholders" is in the boilerplate of any
+    # PR that mentions a proxy.
+    "Legal":
+        r"class action|law firm|lawsuit|litigation|settlement|court (?:rul|approv)"
+        r"|\blead plaintiff\b|\bclass period\b|\bsecurities fraud\b",
 }
 
 COMPILED_BODY = _compile([(fine, broad, BODY_OVERRIDES.get(fine, pat))
@@ -478,21 +530,77 @@ def classify(text, headline=False):
     return "Other", "Other"
 
 
-def classify_row(row):
-    """Headline first; body lead as fallback. Returns (fine, broad, used_body)."""
+def classify_row(row, body_text=None):
+    """Headline first; body lead as fallback. Returns (fine, broad, used_body).
+
+    `body_text` lets the caller supply the fallback string itself, and it is then
+    used VERBATIM (no BODY_LEAD_CHARS slice). That is how --body-200w reproduces
+    Orchestrator5.3, which classifies the same 200-word body_prep string its body
+    encoders and its embedder score, not a 1500-char slice of the raw cell.
+    Leaving it None is the historical behaviour, byte for byte."""
     fine, broad = classify(row.get("Headline") or "", headline=True)
     if fine != "Other":
         return fine, broad, False
-    body = (row.get("body") or "").strip() or (row.get("Body") or "")
-    fine, broad = classify(body[:BODY_LEAD_CHARS])
+    if body_text is None:
+        body = (row.get("body") or "").strip() or (row.get("Body") or "")
+        body_text = body[:BODY_LEAD_CHARS]
+    fine, broad = classify(body_text)
     return fine, broad, fine != "Other"
+
+
+# ── The Orchestrator5.3 200-word body path (batch side) ──────────────────────
+# O5.3 builds ONE body string per article (_prep_body_200) and hands it to the
+# three body encoders, the FinBERT embedder AND — since the 200-word alignment —
+# this classifier, so every body consumer reads the same text and an offline
+# rescore of the TSV reproduces the live cells. `--body-200w` reproduces that
+# string here. It is opt-in: without the flag this script still classifies the
+# first BODY_LEAD_CHARS characters of the raw cell, exactly as it always has.
+
+# A verbatim copy of clean_inline_text (RTPR_connector3/RTPR_connector3_curl.py),
+# which is what produced the TSV Body cell in the first place. Copied rather than
+# imported on purpose: this module is path-loaded by the live orchestrator and its
+# top level must stay stdlib-only. It is idempotent on an already one-lined cell —
+# it is here so the offline string is provably the same function O5.3 applies.
+_INLINE_WS = re.compile(r"\s+")
+
+
+def _clean_inline(text):
+    return _INLINE_WS.sub(" ", (text or "").replace("\xa0", " ")).strip()
+
+
+def _load_body_prep():
+    """Path-load tools/Encoder_Models/body_prep.py — the same module, by the same
+    mechanism, that Orchestrator5.3 loads as `o53_body_prep`.
+
+    Called ONLY from main(): body_prep lazily pulls in tools/keyword/keyword_finder
+    (pandas + sklearn) for strip_wire_boilerplate, which must never land in the
+    live orchestrator's import of this file."""
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "Encoder_Models", "body_prep.py")
+    spec = importlib.util.spec_from_file_location("prclass_body_prep", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.prep_body
 
 
 def main():
     ap = argparse.ArgumentParser(description="Add FineClass/BroadClass columns to a PRstats TSV")
     ap.add_argument("--input", required=True, help="input PRstats TSV")
     ap.add_argument("--output", help="output TSV (default: <input-stem>_Classed.tsv)")
+    ap.add_argument("--body-200w", action="store_true",
+                    help="classify the body fallback on the Orchestrator5.3 string: "
+                         "body_prep.prep_body(clean_inline(Body), Headline, 200) "
+                         "instead of the first %d characters of the raw cell"
+                         % BODY_LEAD_CHARS)
+    ap.add_argument("--fine-col", default="FineClass",
+                    help="output column for the fine class (default: FineClass)")
+    ap.add_argument("--broad-col", default="BroadClass",
+                    help="output column for the broad class (default: BroadClass)")
     args = ap.parse_args()
+
+    prep_body = _load_body_prep() if args.body_200w else None
 
     out_path = args.output
     if not out_path:
@@ -510,22 +618,30 @@ def main():
         # Re-classifying an already-classed TSV is routine (rule changes), so append
         # the two columns only if they are not already there — otherwise the header
         # would carry duplicate names and every row would write the value twice.
-        fieldnames = list(reader.fieldnames) + [c for c in ("FineClass", "BroadClass")
+        fieldnames = list(reader.fieldnames) + [c for c in (args.fine_col, args.broad_col)
                                                 if c not in reader.fieldnames]
         writer = csv.DictWriter(fout, fieldnames=fieldnames,
                                 delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None,
                                 escapechar=None, lineterminator="\n")
         writer.writeheader()
         for row in reader:
-            fine, broad, used_body = classify_row(row)
-            row["FineClass"], row["BroadClass"] = fine, broad
+            body_text = None
+            if prep_body is not None:
+                body = (row.get("body") or "").strip() or (row.get("Body") or "")
+                body_text = prep_body(_clean_inline(body), row.get("Headline") or "",
+                                      BODY_PREP_WORDS)
+            fine, broad, used_body = classify_row(row, body_text)
+            row[args.fine_col], row[args.broad_col] = fine, broad
             writer.writerow(row)
             n_rows += 1
             n_body += used_body
             fine_counts[fine] += 1
             broad_counts[broad] += 1
 
-    print(f"{n_rows} rows -> {out_path}  ({n_body} classified via body fallback)")
+    window = (f"body_prep + first {BODY_PREP_WORDS} words"
+              if args.body_200w else f"first {BODY_LEAD_CHARS} chars")
+    print(f"{n_rows} rows -> {out_path}  ({n_body} classified via body fallback; "
+          f"body window: {window}; columns: {args.fine_col}/{args.broad_col})")
     print("\nFineClass:")
     # dict.fromkeys de-dups while preserving order: Earnings_Results appears twice
     # in RULES (narrow results rule, then the widened one below Earnings_Date).

@@ -138,7 +138,10 @@ def _load_module(mod_name: str, filename: str):
 # as the live duo fallback until 3.0 is paper-verified. A RUNNING clerk keeps
 # its imported module — this takes effect on the next clerk restart.
 xwing = _load_module("xwing2", "x-wing-3.0.py")
-trademole = _load_module("trademole2", "trade-mole-2.3.py")
+# 2026-09-18: trade-mole-2.3.py -> trade-mole-2.4.py (second precision pass;
+# see that file's header and mole-outputs/surge-predictor-analysis-2026-09-18.md).
+# Drop-in: same IBKRSurgeApp signature, same 16 module names this clerk reads.
+trademole = _load_module("trademole2", "trade-mole-2.6.py")
 t47mod = _load_module("t47_airspeeder", "T47-airspeeder-2.0.py")
 
 
@@ -440,20 +443,45 @@ class SharedIBClient(EWrapper, EClient):
         except Exception as e:
             logger.error("t47 on_tick_price failed: %s", e, exc_info=True)
 
+    # 2026-10-02: these three used to go to the MOLE ONLY. The subscription
+    # already carries every one of these ticks (GENERIC_TICKS below), ibapi has
+    # already decoded them, and x-wing was being handed tickPrice alone -- so
+    # bid/ask/last SIZE, day volume, VWAP, the trade-rate counters and the halt
+    # flag arrived in this process and were discarded. Routing them costs no new
+    # request and no extra market-data line. Mole stays FIRST in every one of
+    # them (the ordering comment in tickPrice is load-bearing), and the x-wing
+    # call is getattr-guarded + try/except exactly like the T47 call above, so
+    # neither a loader flip to an older x-wing nor a bug in new code can take
+    # down the mole's primary signal path.
     def tickSize(self, reqId, tickType, size):
         s = self.session
-        if s is not None:
-            s.mole.tickSize(reqId, tickType, size)
+        if s is None:
+            return
+        s.mole.tickSize(reqId, tickType, size)
+        self._route_xwing("route_tick_size", s.xwing, tickType, size)
 
     def tickString(self, reqId, tickType, value):
         s = self.session
-        if s is not None:
-            s.mole.tickString(reqId, tickType, value)
+        if s is None:
+            return
+        s.mole.tickString(reqId, tickType, value)
+        self._route_xwing("route_tick_string", s.xwing, tickType, value)
 
     def tickGeneric(self, reqId, tickType, value):
         s = self.session
-        if s is not None:
-            s.mole.tickGeneric(reqId, tickType, value)
+        if s is None:
+            return
+        s.mole.tickGeneric(reqId, tickType, value)
+        self._route_xwing("route_tick_generic", s.xwing, tickType, value)
+
+    def _route_xwing(self, fn_name, ctl, tickType, value):
+        fn = getattr(xwing, fn_name, None)   # absent on x-wing-2.1/3.0/3.1
+        if fn is None or ctl is None:
+            return
+        try:
+            fn(ctl, tickType, value)
+        except Exception as e:
+            logger.error("%s failed: %s", fn_name, e, exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +513,12 @@ class TrioSession:
         self._buy_fired = False
         self._finished = False
         self._mole_written = False    # guard: write the mole CSV exactly once
+        # 2026-10-03 post-trigger tail (trade-mole-2.5+ POST_TRIGGER_RECORD_SEC):
+        # the CSV is written once at the trigger as before, then REWRITTEN once
+        # when the tail ends. One lock serialises every write of the file.
+        self._mole_final_written = False
+        self._mole_write_lock = threading.Lock()
+        self._tail_timer = None
         self._watch_timer = None
         self._defer_timer = None     # closed-market: idle-until-04:00 ET timer
         self._defer_target = None    # target datetime (ET) we are deferring to
@@ -734,6 +768,17 @@ class TrioSession:
                 self._sentiment_bypassed = True
             if self._watch_timer is not None:
                 self._watch_timer.cancel()
+            # 2026-10-03: a trade-mole with a post-trigger tail (2.5+) keeps
+            # recording raw ticks after this call; end the tail and rewrite the
+            # CSV when it runs out (+1 s so the last in-window ticks land first).
+            # A mole without the tail (2.4) never sets _post_trigger_until, so
+            # nothing is scheduled and this path behaves exactly as before.
+            tail_sec = getattr(trademole, "POST_TRIGGER_RECORD_SEC", 0) or 0
+            if tail_sec > 0 and getattr(self.mole, "_post_trigger_until", None):
+                self._tail_timer = threading.Timer(
+                    tail_sec + 1.0, self._end_mole_tail, args=("complete",))
+                self._tail_timer.daemon = True
+                self._tail_timer.start()
         if res.finbert_gate:
             logger.info("[%s] BUY-SIGNAL (last_ask=%s print=%s) on client %d — awaiting sentiment gate",
                         self.symbol, last_ask, trigger_print, self.client.client_id)
@@ -749,18 +794,49 @@ class TrioSession:
     def _write_mole_once(self):
         """Write the collected trade-mole dataset exactly once. Safe to call
         from the trigger path and again from finish(): the flag guarantees a
-        single write. The mole halts recording at the buy-signal, so the
-        record buffer is already final by the time the trigger fires."""
-        with self._lock:
-            if self._mole_written:
+        single write. A 2.4 mole halts recording at the buy-signal, so its
+        record buffer is already final by the time the trigger fires; a 2.5+
+        mole keeps a post-trigger tail, which _end_mole_tail() writes later."""
+        self._write_mole(final=False)
+
+    def _write_mole(self, final: bool):
+        """The one place the mole CSV is written. final=False: the at-trigger /
+        teardown write, at most once, and skipped if the final write already ran
+        (a late first write would overwrite the tail with a shorter snapshot).
+        final=True: the post-tail rewrite, at most once. The lock is held across
+        the write so two threads never write the file at the same time."""
+        with self._mole_write_lock:
+            if final:
+                if self._mole_final_written:
+                    return
+                self._mole_final_written = True
+            elif self._mole_written or self._mole_final_written:
                 return
             self._mole_written = True
+            try:
+                trademole.write_records_output(self.mole, self.output_path,
+                                               log=self.mole_log)
+            except Exception as e:
+                logger.error("[%s] writing trade-mole output failed: %s",
+                             self.symbol, e, exc_info=True)
+
+    def _end_mole_tail(self, reason):
+        """Close the trade-mole's post-trigger tail and rewrite its CSV with the
+        tail included. Idempotent: the tail timer calls it with 'complete', and
+        finish() with 'session_end:<why>' when the session ends first. No-op for
+        a mole without a tail, or a session whose buy-signal never fired."""
+        ender = getattr(self.mole, "end_post_trigger", None)
+        if ender is None or not getattr(self.mole, "_post_trigger_until", None):
+            return
         try:
-            trademole.write_records_output(self.mole, self.output_path,
-                                           log=self.mole_log)
+            ender(reason)
         except Exception as e:
-            logger.error("[%s] writing trade-mole output failed: %s",
+            logger.error("[%s] ending the trade-mole tail failed: %s",
                          self.symbol, e, exc_info=True)
+        if not self._mole_final_written:
+            logger.info("[%s] trade-mole post-trigger tail ended (%s); rewriting %s",
+                        self.symbol, reason, os.path.basename(self.output_path))
+        self._write_mole(final=True)
 
     def _await_sentiment_and_launch(self, last_ask, trigger_print, gate_on):
         """Sentinel thread: waits for the Sentiment gate then launches x-wing,
@@ -848,6 +924,16 @@ class TrioSession:
         # Idempotent: a triggered duo already wrote it at trigger time; this
         # covers the non-triggered exits (no_surge, sentiment_timeout/bad).
         self._write_mole_once()
+
+        # 2026-10-03: a trade-mole post-trigger tail still running ends HERE —
+        # market data was just cancelled, so it would record nothing more — and
+        # the CSV is rewritten with it. Teardown is NOT delayed for the tail: a
+        # session ended by the sentiment gate keeps only what arrived until now
+        # (holding the client longer would starve the pool and delay T47). No-op
+        # without a tail, and after the tail timer already ended it.
+        if self._tail_timer is not None:
+            self._tail_timer.cancel()
+        self._end_mole_tail(f"session_end:{reason}")
 
         # detach per-duo log handlers so loggers don't accumulate across reuse
         for lg in (self.mole_log, self.xwing_log):

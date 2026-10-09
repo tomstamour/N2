@@ -20,14 +20,19 @@ mole-outputs/
 outputs/
 outputs_*/
 model_trained_on_*/
+S4_model_trained_on_*/
 ibkr_data/
 tables/
+# Orchestrator5.4 bench runs (scratch TSVs/logs/stdout.txt/candidate rules per run)
+orchestrator5/bench/runs/
 # generated run logs — the *.txt ones can leak IBKR account IDs (e.g. preTrade_log.txt)
 logs/
 # regenerated FinBERT ONNX model (rebuild with setup.sh / FinBERT-*.py --export)
 finbert_onnx/
 # regenerated FinBERT ONNX feature-extraction model (rebuild with finbert_embed_core.py --export)
 finbert_feat_onnx/
+# model-3 INT8 FinBERT embedders (rebuild with training_data/model-3/m3_int8_embedder.py)
+embedder_int8_*/
 
 # --- but DO track the .tsv outputs in price_stats_loader/outputs/ ---
 # (re-include the folder first, since a file can't be un-ignored while its parent dir is)

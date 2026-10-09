@@ -17,10 +17,10 @@ SSH, no browser needed). Four columns are added immediately after Symbol:
 
 The columns the trade gate reads (../orchestrator5/orchestrator_trigger_rules.txt)
 are grouped together immediately after ArrivalTime — for the current rules that is
-FineClass, Prosus_pos_hd, FinMarBa_ind_hd, kw15_proba_bd, kw15_proba_hd,
-FLANG_ss_hd, EarningScore — so the whole trade decision reads at a glance;
-ClerkSentiment, the gate's fired-rule verdict, follows immediately after the
-group (to the right of EarningScore). A trigger cell is suffixed with "*" when
+FineClass, kw15_proba_hd_FT, ge35_m3FT, se_m3, FM3_bd_ge50_FT, kw15_proba_bd_FT, FM3_hd_reg_FT
+— so the whole trade decision reads at a glance;
+ClerkSentiment, the gate's fired-rule verdict, is placed immediately after
+FM3_hd_reg_FT. A trigger cell is suffixed with "*" when
 its value clears the bar for at least one
 gate rule (e.g. Prosus_pos_hd >= 0.5). Both the column set and the thresholds are
 read from the rules file at startup, so they track the live gate — restart the
@@ -465,13 +465,37 @@ class DataManager:
             else:
                 rest = trigger_group + rest
 
-        # Place ClerkSentiment (the gate's fired-rule verdict) immediately to the
-        # right of EarningScore, so the outcome sits beside the scores that drove
-        # it. Only when both are present (a no-op on schemas/rules lacking either).
-        if 'ClerkSentiment' in rest and 'EarningScore' in rest:
-            rest = [c for c in rest if c != 'ClerkSentiment']
+        # Keep FM3_hd_reg_FT right beside kw15_proba_bd_FT, in the group or not.
+        # Later steps skip trigger_group members; this one is not in them anyway.
+        if 'kw15_proba_bd_FT' in rest and 'FM3_hd_reg_FT' in rest:
+            rest.remove('FM3_hd_reg_FT')
+            rest.insert(rest.index('kw15_proba_bd_FT') + 1, 'FM3_hd_reg_FT')
+            if 'FM3_hd_reg_FT' in trigger_group:
+                trigger_group.remove('FM3_hd_reg_FT')
+                trigger_group.insert(trigger_group.index('kw15_proba_bd_FT') + 1,
+                                     'FM3_hd_reg_FT')
+
+        # Place XGB model columns after EarningScore. model-2 names (O5.3 files) and
+        # model-3 names (O5.4 files); absent names are skipped. Columns in
+        # trigger_group (the ones a rule reads) stay in the group after ArrivalTime
+        # and are never listed twice.
+        xgb_model_cols = ['se_m2', 'q80_m2', 'ge20_m2', 'ge35_m2', 'se_m2FT',
+                          'q80_m2FT', 'ge20_m2FT', 'ge35_m2FT', 'ge50_m2FT',
+                          'se_m3', 'q80_m3', 'ge20_m3', 'ge35_m3', 'ge50_m3',
+                          'se_m3FT', 'q80_m3FT', 'ge20_m3FT', 'ge35_m3FT', 'ge50_m3FT']
+        to_insert = [c for c in xgb_model_cols if c in rest and c not in trigger_group]
+        if to_insert and 'EarningScore' in rest:
+            rest = [c for c in rest if c not in to_insert]
             es_idx = rest.index('EarningScore')
-            rest = rest[:es_idx + 1] + ['ClerkSentiment'] + rest[es_idx + 1:]
+            rest = rest[:es_idx + 1] + to_insert + rest[es_idx + 1:]
+
+        # Place ClerkSentiment (the gate's fired-rule verdict) immediately after
+        # FM3_hd_reg_FT. Only when both are present (a no-op on schemas/rules
+        # lacking either).
+        if 'ClerkSentiment' in rest and 'FM3_hd_reg_FT' in rest:
+            rest = [c for c in rest if c != 'ClerkSentiment']
+            fm3_idx = rest.index('FM3_hd_reg_FT')
+            rest = rest[:fm3_idx + 1] + ['ClerkSentiment'] + rest[fm3_idx + 1:]
 
         # Position specific columns right after Headline. With the grouping above
         # ON, the gate columns were already pulled out of `rest`, so this now only

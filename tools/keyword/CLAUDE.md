@@ -72,6 +72,29 @@ max |diff| ≤ 1e-5 vs stored columns).
   follow `Training_guide_for_keyword_finder.md`. Do not improvise a retrain.
 - Switching the live model = editing `CANON_DIR`, `DEFAULT_PREVALENCE`,
   `DEFAULT_COMBO_MODEL` in keyword_scorer-2.py, then re-verifying byte-exactness.
+- ⚠ Orchestrator5 does NOT use `CANON_DIR`. Its kw15 (`orchestrator5/o54_engine.py`
+  `KW15_DIR`) is `model_trained_on_04-PRstats-2026-05-04to06-18_TRAIN/classify_fromPRhigh_ge15{,_headline}/`
+  (tfidf pipelines only).
+
+## kw15_FT (2026-09-28): the full-training twin, live in Orchestrator5.5
+
+- **Where:** `model_trained_on_2026-05-04-2026-09-24/`, with
+  `classify_fromPRhigh_ge15_FT/` (body) and `classify_fromPRhigh_ge15_headline_FT/`.
+  This dir is FROZEN: O5.5 loads it and checks `reference_scores.json` at startup.
+- **What:** the kw15 recipe refit on EVERY labelled row. That is 5,668 PRs,
+  05-04→09-24 (FM3's frozen snapshot, `fromPR_status == ok`), at ≥15%.
+  - keyword_finder always holds out 20%, so live kw15 saw only 2,117 rows.
+  - O5.5 writes the outputs as `kw15_proba_bd_FT` / `kw15_proba_hd_FT`.
+  - ⚠ NO held-out score. Cut from live data only.
+- **Trainer: `kw15_ft_train.py`** (live venv, never edits keyword_finder):
+  - `repro --channel hd|bd` rebuilds the live pipelines bit for bit, which proves
+    it is the same recipe.
+  - `train` fits on all rows with the exact live text prep, and writes the same
+    file set plus `card.json` (data sha256, C/l1, file sha256s),
+    `reference_scores.json` and `train_rows.tsv`.
+  - It refuses to re-train into a finished dir.
+  - Run it at idle priority: `nice -n 19 chrt -i 0 taskset -c 3,7 … --n-jobs 2`
+    (~14 min; the binary body fit is most of it).
 
 ## Gotchas (each cost a debugging round)
 

@@ -11,6 +11,13 @@ Fundamentals data chain (per ticker):
   Primary : finvizfinance  → ticker_fundament()["Shs Float"] + ["Market Cap"]
   Fallback: yfinance       → info["floatShares"] + info["marketCap"]
 
+  finviz has supplied nothing since ~2026-06 (site redesign broke the
+  finvizfinance 1.3.0 parser) and answers HTTP 403 since ~2026-09-30. A 403 is
+  treated as a block, not a rate limit, and after _FINVIZ_MAX_CONSEC_FAILS
+  failures in a row finviz is switched off for the rest of the run, so Step 1
+  runs on yfinance alone. (Treating 403 as a rate limit cost 3 min per symbol
+  and stalled the nightly cron for days, 2026-09-30 → 10-03.)
+
 Float_M and MarketCap_M are sourced independently: each metric falls through to
 the next source on its own, so a finviz row that lists a Market Cap but no float
 (`Shs Float = '-'`) still gets its float from the yfinance fallback. The two
@@ -36,6 +43,7 @@ CLI:
 """
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -76,6 +84,15 @@ _SCREENER_EXCHANGE_LABEL = {
 
 _MAX_WORKERS = 3  # yfinance rate-limits badly above ~3 concurrent requests
 _PROGRESS_EVERY = 100   # log a progress line every N symbols
+
+# finviz off switch: after this many failed finviz calls in a row (no success
+# in between), stop calling finviz for the rest of the process.
+_FINVIZ_MAX_CONSEC_FAILS = 25
+_finviz_lock = threading.Lock()
+_finviz_consec_fails = 0
+_finviz_disabled = False
+# yfinance pause per request once finviz is off (see _yfinance_fundamentals).
+_YF_PACE_NO_FINVIZ_S = 1.5
 
 _API_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -179,6 +196,22 @@ def _parse_float_str(val: str | None) -> float | None:
         return None
 
 
+def _finviz_note(ok: bool) -> None:
+    """Record one finviz outcome; trip the off switch on a long failure run."""
+    global _finviz_consec_fails, _finviz_disabled
+    with _finviz_lock:
+        if ok:
+            _finviz_consec_fails = 0
+            return
+        _finviz_consec_fails += 1
+        if not _finviz_disabled and _finviz_consec_fails >= _FINVIZ_MAX_CONSEC_FAILS:
+            _finviz_disabled = True
+            logger.warning(
+                f"finviz failed {_finviz_consec_fails} times in a row — "
+                f"finviz disabled for this run, yfinance only"
+            )
+
+
 def _finviz_fundamentals(sym: str) -> tuple[float | None, float | None]:
     """Primary fundamentals source: finvizfinance → ticker_fundament().
 
@@ -186,8 +219,14 @@ def _finviz_fundamentals(sym: str) -> tuple[float | None, float | None]:
     Finviz lacks the field. Both values are extracted from the same dict, so
     this stays a single HTTP call per symbol.
 
-    Rate-limited to ~1 req/s; retries up to 3 times on 403/429 with 30s backoff.
+    Rate-limited to ~1 req/s; retries up to 3 times on 429 with 30s/60s/90s
+    backoff. A 403 means finviz is blocking us, not throttling — waiting does
+    not help, so it fails at once like any other error. Every failure counts
+    toward the run-wide off switch (_finviz_note); once tripped, this returns
+    (None, None) without making a request.
     """
+    if _finviz_disabled:
+        return None, None
     try:
         from finvizfinance.quote import finvizfinance  # type: ignore
     except ImportError:
@@ -200,20 +239,24 @@ def _finviz_fundamentals(sym: str) -> tuple[float | None, float | None]:
             # Finviz formats both fields the same way ("12.34M", "1.20B", "-"),
             # so _parse_float_str handles both. The unit interpretation is
             # caller-specific: shares-millions for float, USD-millions for cap.
-            return (
+            result = (
                 _parse_float_str(data.get("Shs Float")),
                 _parse_float_str(data.get("Market Cap")),
             )
+            _finviz_note(ok=result != (None, None))
+            return result
         except Exception as exc:
             exc_str = str(exc)
-            if "403" in exc_str or "429" in exc_str or "Too Many" in exc_str:
+            if "429" in exc_str or "Too Many" in exc_str:
                 wait = 30 * (attempt + 1)
                 logger.warning(f"{sym} finviz rate limited (attempt {attempt + 1}/3), waiting {wait}s")
                 time.sleep(wait)
                 continue
             logger.debug(f"{sym} finviz error: {exc}")
+            _finviz_note(ok=False)
             return None, None
     logger.warning(f"{sym} finviz: gave up after 3 rate-limit retries")
+    _finviz_note(ok=False)
     return None, None
 
 
@@ -256,7 +299,10 @@ def _yfinance_fundamentals(sym: str) -> tuple[float | None, float | None]:
 
     for attempt in range(3):
         try:
-            time.sleep(0.5)  # ~2 req/s per worker
+            # ~2 req/s per worker. With finviz off, its ~1 s call no longer
+            # spaces our requests, and the bare 0.5 s drew yfinance 429s
+            # (2026-10-03); 1.5 s restores the old spacing for ~+39 min/run.
+            time.sleep(_YF_PACE_NO_FINVIZ_S if _finviz_disabled else 0.5)
             info = yf.Ticker(sym).info
             shares = info.get("floatShares") or info.get("sharesOutstanding")
             float_m = round(shares / 1_000_000, 4) if shares and shares > 0 else None

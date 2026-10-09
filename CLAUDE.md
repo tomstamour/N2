@@ -24,9 +24,10 @@ there. This file is only the cross-cutting rules.**
 - **clientIds**: Gateway API slots are limited; clerk pre-claims 1000–1029,
   dailyStats 77, daily-board 20000. Saturation shows up as handshake timeouts.
 - **Live chain** (three separate processes):
-  `RTPR_connector3` →tcp 8900→ `orchestrator5/Orchestrator5.1.py` →tcp 8765→
-  `x-wing-mole/clerk-1.1.py` → Gateway. Run exactly ONE connector variant and
-  ONE orchestrator (never 5.0 and 5.1 together).
+  `RTPR_connector3` →tcp 8900→ `orchestrator5/Orchestrator5.4.py` →tcp 8765→
+  `x-wing-mole/clerk-1.2.py` → Gateway. Run exactly ONE connector variant and
+  ONE orchestrator (never two O5.x together). O5.4 pins itself to CPUs 1-3,5-7:
+  physical core 0 is left to the clerk, the Gateways and the connector.
 - **Git**: only source is tracked (`.py .sh .txt .md`); data/model/log outputs
   are gitignored — never force-add them. Model dirs referenced by live code or
   past backtests are frozen: retrain into a new dataset-stamped dir.

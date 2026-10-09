@@ -28,3 +28,8 @@ python3 trade_frequency_and_size_backfill_AddON.py --input ../price_stats_loader
 
 
 
+
+
+####  RetroUniverse-3: pipeline-3's columns for past PRs (paper GW 4002, resumable)
+/home/tom/venv/bin/python RetroUniverse-3.py -i ../price_stats_loader/outputs/PRstats_2026-05-04-2026-09-24-CoffeeFltr.tsv --compare-live
+/home/tom/venv/bin/python RetroUniverse-3.py -i <PRs.tsv> --limit 60      # smoke test, own _limit60 work dir and output

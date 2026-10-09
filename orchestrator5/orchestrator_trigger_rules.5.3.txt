@@ -1,0 +1,486 @@
+# ==============================================================================
+# orchestrator_trigger_rules.txt — THE TRADE GATE.
+#
+# This file IS the gate. Orchestrator5.3.py holds no thresholds and no rules of
+# its own: every cut that decides whether a press release becomes a trade is on
+# one of the rule lines below. Add a rule, retune a threshold, delete a rule —
+# edit here, restart O5.3, done. No Python edit.
+#
+# Read by  : orchestrator5/Orchestrator5.3.py
+#            _load_trigger_rules()  ->  _evaluate_trigger()
+#
+# !!!! THIS FILE NOW REQUIRES 5.3.  Orchestrator5.2.py CANNOT LOAD IT.  2026-09-20
+#   The XgbSolo rule at the bottom names `ge50_m2`, a field 5.2 has never heard of
+#   (5.2 knows 27 fields, 5.3 knows 46).  An unknown field is a HARD FAIL with no
+#   fallback gate, so Orchestrator5.2.py --check-rules and Orchestrator5.2.py
+#   itself both exit 1 with EXACTLY this (verified 2026-09-20) — recognise it, it
+#   is not a corrupt file:
+#       orchestrator_trigger_rules.txt:<line>: unknown field 'ge50_m2' — no
+#       similar field name; see the 'Fields' table in the header of this file
+#       for the full list — refusing to start
+#   A 5.2 process that is ALREADY RUNNING is unaffected — rules are read once at
+#   startup — but it will not come back from a restart or a crash.
+#   THE ESCAPE IS ONE CHARACTER: comment out the XgbSolo line and 5.2 loads this
+#   file again, unchanged.  Nothing else in here is 5.3-only.
+#
+# WHEN READ: ONCE, at startup, before any model is loaded.
+#   !! Editing this file does NOT change a process that is already running.
+#      A running O5.3 keeps the gate it started with until you restart it.
+#      The `[Gate] ACTIVE` block in logs/Orchestrator5.3_YYYY_MM_DD.log is the
+#      authoritative record of what a given process actually holds — the daily
+#      TSV header has been identical across gate changes since 2026-08-02, so
+#      the log is the only place that answers "which gate ran today?".
+#   Dry-run a change in ~1 second, without loading a model or opening a socket:
+#      /home/tom/venv/bin/python Orchestrator5.3.py --check-rules
+#   Exit 0 means the gate echoed is exactly the gate O5.3 would run.
+#
+# !! A RULE ON AN XGBoost-LEG FIELD COSTS ~870 ms ON EVERY TRADE.    2026-09-20
+#   Naming any se_* / q80_* / ge*_m2* / encoder / TimeToOpen field in ANY rule
+#   sets _gate_needs_xgb, and the gate then cannot be evaluated until the ~800 ms
+#   XGBoost leg has finished.  MEASURED, 9 single PRs one at a time:
+#       STEP-1b SENTIMENT   943 ms median (p90 1030, range 806..1030)
+#                           against 71 ms when no rule reads the leg = +872 ms
+#       STEP-1a ARM          17 ms — UNAFFECTED
+#   — on EVERY PR, including rows that fire on CORE or the keyword rules and never
+#   read a model-2 score.  The arm is issued in _on_row_built at reception either
+#   way, so the clerk still registers the session immediately; it is the trade
+#   DECISION that is late.
+#   It also escalates the universe dependency: with the leg gating, a universe TSV
+#   that predates daily_universe_pipeline-3 becomes a STARTUP HARD FAIL rather
+#   than `Xgb_status=disabled_universe` with trading carrying on regardless.
+#   --check-rules prints which mode is in force on its last line, and startup logs
+#   a WARNING naming the offending field(s).
+#
+# ON ERROR : O5.3 REFUSES TO START. A missing file, an empty file, an unknown
+#   field, a bad operator, an unparseable number, a duplicate rule name — any
+#   of them is a hard failure with a `file:line:` message. There is deliberately
+#   NO fallback gate and NO skip-the-bad-line: a trading process must never run
+#   a gate nobody wrote, and a one-character typo must never silently delete a
+#   branch while the tape still looks alive. Use --check-rules before a restart.
+#   !! A misspelled FIELD NAME is caught here, with a did-you-mean. A misspelled
+#      class VALUE is not — see the FineClass note in the Fields section.
+# ==============================================================================
+#
+# ── Format ────────────────────────────────────────────────────────────────────
+#   One rule per line, in one of TWO forms:
+#       <RuleName>:         <field> <op> <value> AND ...    an ordinary rule
+#       REQUIRE <RuleName>: <field> <op> <value> AND ...    a PRECONDITION
+#
+#   Ordinary rules are OR-ed — a row trades when ANY ONE of them all-holds.
+#   REQUIRE lines are AND-ed — EVERY one must hold, or nothing trades at all.
+#   Conditions are AND-ed within either kind of line.
+#
+#       the gate = (every REQUIRE line holds) AND (any ordinary rule fires)
+#
+#   There is no OR inside a line and no parentheses. To express an OR, write a
+#   second rule; that is what rules are.
+#
+#   RuleName  letters and digits, starting with a letter. Must be unique —
+#             ordinary and REQUIRE rules share ONE name space, because both
+#             print as a group in the TSV Trigger cell.
+#             NO UNDERSCORE — fired rule names are joined with '_' into the TSV
+#             ClerkSentiment cell, so an underscore in a name would make that
+#             cell ambiguous. 'BAD', 'skipped' and 'REQUIRE' are reserved.
+#             The name is yours and it lands in ClerkSentiment, so name a rule
+#             for what it means, not for the model it reads.
+#   AND       case-insensitive, must be surrounded by spaces.
+#   REQUIRE   case-insensitive, separated from the name by whitespace.
+#   #         starts a comment, anywhere on a line. Blank lines are ignored.
+#
+# ── Operators ─────────────────────────────────────────────────────────────────
+#   >=  <=  >  <  ==  !=  in  not in
+#   Numeric fields take the six comparisons. `in` / `not in` are REJECTED there —
+#     they are set membership over STRING values (write a range, or a 2nd rule).
+#   String fields take == , != , in and not in , all CASE-INSENSITIVE
+#     (FineClass == earnings_results matches Earnings_Results).
+#
+#   `in` / `not in` take a COMMA-SEPARATED list. Braces are optional on input and
+#   are how the [Gate] ACTIVE echo prints one back, so an echoed rule can be
+#   pasted straight into this file:
+#       FineClass in MA, Partnership, Patent_IP        a whitelist
+#       FineClass not in Reverse_Split                 a blacklist
+#   A list is REJECTED at load if an element contains a SPACE (almost always a
+#   missing comma), if a value repeats, or if an element is empty (a doubled or
+#   trailing ','). Every one of those silently SHRINKS the set, which is exactly
+#   what the hard-fail policy exists to stop.
+#
+# ── REQUIRE: preconditions ────────────────────────────────────────────────────
+#   A `REQUIRE <Name>: ...` line NEVER FIRES ANYTHING. It only PERMITS. Every
+#   REQUIRE line must hold before any ordinary rule is allowed to trade, so one
+#   of them constrains the WHOLE gate at once — which is the point: without it,
+#   a constraint you want on every rule has to be copy-pasted onto every line,
+#   and silently missed off the next rule somebody adds.
+#
+#   Because a REQUIRE rule permits rather than fires:
+#     - Its name NEVER reaches ClerkSentiment. A row it blocked reads `BAD`,
+#       like any other non-fire. The Trigger cell is what tells them apart.
+#     - Its Trigger group prints ALLOW / BLOCK, not YES / NO. Count blocked rows
+#       with:   grep -c ':BLOCK\[' tables/news_output_*.tsv
+#     - !! A `CORE:YES` GROUP CAN NOW SIT IN A CELL WHOSE VERDICT IS `NO`. The
+#       rule held; a precondition blocked it. Read the LEADING YES/NO for what
+#       the row did and the groups for why. Anything that counted fires by
+#       grepping `:YES` is wrong as of 2026-08-17.
+#     - A file with ONLY REQUIRE lines is a hard error: nothing could ever fire.
+#
+#   !! REQUIRE FAILS CLOSED. A None on a REQUIRE condition fails it like any
+#      other, and that closes the entire gate rather than one branch — so a dead
+#      scorer behind a precondition stops ALL trading. That is deliberate, and it
+#      makes whatever a REQUIRE line reads a single point of failure. The
+#      BLOCKED-BY-MISSING-SCORE-ONLY alarm below is what makes it visible.
+#
+# ── Missing scores ────────────────────────────────────────────────────────────
+#   A score can be absent: a model raised, a future timed out, or the symbol is
+#   not in today's universe TSV. Such a value is None, and None ALWAYS FAILS its
+#   condition — it never passes, never raises, never wraps around. The Trigger
+#   cell prints `<field>:MISSING` for it.
+#
+#   `EarningScore:NA` is a DIFFERENT thing and is not a fault: the earnings
+#   scorer is skipped on purpose for every PR that is not an Earnings_Results
+#   (~81% of rows), so a blank EarningScore means "not an earnings PR", never
+#   "scored 0". NA is why the one row where the scorer actually DIED is still
+#   visible instead of buried under 300 innocent ones.
+#
+#   When every evaluable condition of a rule passed and only a MISSING score
+#   stood between the row and a fire, O5.3 logs at WARNING:
+#       [Gate] <SYM> BLOCKED BY MISSING SCORE ONLY — ...
+#   That is the dead-scorer alarm. A rule with ONE condition (see the solo rules
+#   below) makes it very loud by design: a dead model there removes an entire
+#   branch, and a gate that quietly stopped firing looks exactly like a quiet
+#   news day. Grep logs/ for that string.
+#
+#   !! A None on a REQUIRE condition is the LOUDEST case in this file, because it
+#      closes the whole gate rather than one branch: the alarm then fires on
+#      EVERY row until the scorer is fixed. That volume IS the signal. With the
+#      ClassWhitelist line below, a dead PR classifier stops all trading, and
+#      this WARNING is the only thing that distinguishes that from a quiet day.
+#
+# ── Fields ────────────────────────────────────────────────────────────────────
+#   Field names follow the unified {Model}_{channel}_{hd|bd} convention adopted
+#   2026-08-09. `hd` = the model scored the HEADLINE, `bd` = the BODY cell.
+#
+#   FinBERT — headline (ProsusAI/finbert).  `Prosus` distinguishes it from the
+#   other two FinBERT derivatives scored elsewhere in the repo.
+#     Prosus_pos_hd        float 0..1
+#     Prosus_neu_hd        float 0..1
+#     Prosus_neg_hd        float 0..1
+#     Prosus_ss_hd         float -1..1   (positive − negative)
+#     Prosus_lab_hd        string        positive | neutral | negative
+#   FinMarBa — headline (baptle/FinBERT_market_based)
+#     FinMarBa_pos_hd      float 0..1
+#     FinMarBa_ind_hd      float 0..1    !! see the direction warning below
+#     FinMarBa_neg_hd      float 0..1
+#     FinMarBa_ss_hd       float -1..1
+#     FinMarBa_lab_hd      string        positive | indecisive | negative
+#   FLANG-BERT — headline (avinasht/FLANG-BERT_flang-bert)
+#     FLANG_pos_hd         float 0..1
+#     FLANG_neu_hd         float 0..1
+#     FLANG_neg_hd         float 0..1
+#     FLANG_ss_hd          float -1..1   (positive − negative)
+#     FLANG_lab_hd         string        positive | neutral | negative
+#   ge15 keyword pipelines (tfidf, corrected labels)
+#     kw15_proba_bd        float 0..1    scores the BODY cell
+#     kw15_proba_hd        float 0..1    scores the headline
+#   PR classifier + earnings scorer  (no hd/bd twin — neither is a sentiment
+#   channel, and FineClass reads the headline and the body lead together)
+#     FineClass            string        MA, Partnership, Earnings_Results,
+#                                        Product_Launch, Clinical_Data, ... — the
+#                                        ~21 values are the first column of RULES
+#                                        in ../tools/categorizer/PrClassifier.py.
+#                          !! A misspelled CLASS is NOT an error: it is a value,
+#                             not a field name, so it gets no whitelist check, no
+#                             did-you-mean and no hard fail — it simply never
+#                             matches, silently narrowing the gate. (This line
+#                             itself said `Product_Update` until 2026-08-17; no
+#                             such class has ever existed.) COPY THE SPELLING OUT
+#                             OF PrClassifier.py, and check the fire count after.
+#     EarningScore         INTEGER       points, observed -7..+9  !! see below
+#   The row itself (this ticker, from today's universe TSV)
+#     Float                float         millions of shares
+#     MktCap               float         $ millions
+#     LastDailyClose       float         $
+#     itiBaseline          float         seconds  (44444 = "no baseline")
+#     tradeSizeBaseline    float         shares   (44444 = "no baseline")
+#     Exchange             string        NASDAQ, NYSE, ...
+#     Symbol               string
+#     TickerCount          INTEGER       tickers this PR named (1 or 2)
+#
+#   ── 5.3 ONLY, from the XGBoost leg (2026-09-18, model-2 since 2026-09-20) ──
+#   !! EVERY field in this block sets _gate_needs_xgb — see the ~730 ms banner at
+#      the top of this file BEFORE writing a rule on one.
+#   !! 5.2 knows NONE of them and will refuse to start on a file that names one.
+#
+#   XGBoost predictions.  model-2 (`_m2`) early-stopped against a held-out fold.
+#   model-2FT (`_m2FT`) is the SAME 25 features and hyperparameters refit on 100%
+#   of the rows — it has NO held-out score at all, so it is a second opinion, not
+#   a confirmation, and q80_m2FT least of all (4000 rounds, no early-stop net).
+#     se_m2   se_m2FT      float PERCENT !! predicted fromPR_High(%). NOT 0-1.
+#     q80_m2  q80_m2FT     float PERCENT !! `>= 0.3` here would mean 0.3%, not 30%.
+#     ge20_m2 ge20_m2FT    float 0..1    !! RANKING scores, NOT probabilities
+#     ge35_m2 ge35_m2FT    float 0..1       (see the calibration note below)
+#     ge50_m2 ge50_m2FT    float 0..1
+#   !! THE SIX ge* ARE NOT CALIBRATED PROBABILITIES. Each was fit with
+#      scale_pos_weight (4.18 / 8.33 / 12.53 for ge20/35/50), which multiplies the
+#      modelled odds. ge50_m2 AVERAGES 0.357 against a 9.6% base rate, and Brier
+#      skill is negative for all three. A `>= 0.7` is a rank cut at roughly the
+#      89th percentile, worth a calibrated P(move >= 50%) of about 19% — NOT 70%.
+#      Pick a cut from a measured quantile of your own tape, never from what the
+#      number looks like. Platt parameters, for OFFLINE use:
+#        ../price_stats_loader/statsByClaude/model2_calibration_params.json
+#
+#   Encoder channels the leg scores (all on the 200-word prepped body for `bd`)
+#     DeBERTa_ss_hd        float -1..1   zero-shot NLI, the costliest single model
+#     DeBERTa_lab_hd       string        positive | neutral | negative
+#     TradeHero_ss_hd      float -1..1
+#     TradeHero_lab_hd     string
+#     FinancialB_ss_bd     float -1..1   scores the BODY
+#     TradeHero_ss_bd      float -1..1   scores the BODY
+#     TradeHero_pos_bd     float 0..1    scores the BODY
+#
+#   Catalyst rollup and clock
+#     BroadClass           string        Clinical, Commercial, Compliance,
+#                                        Corporate, Crypto, Earnings, FDA,
+#                                        Financing, IP, Legal, MA, Other — the
+#                                        grouped companion to FineClass, from the
+#                                        same classify_pr call.
+#     TimeToOpen           float HOURS   from the 04:00 ET ETH open of THIS PR's
+#                                        session. !! NEGATIVE means the market has
+#                                        not opened yet, so `TimeToOpen >= 0` reads
+#                                        "already in session".
+#
+#   These are ALSO the daily TSV column names, and the tokens the Trigger cell
+#   prints — one name per field, everywhere. Copy a column header straight out of
+#   tables/news_output_*.tsv into a rule; it will be accepted.
+#   !! Rules written before 2026-08-09 use the OLD names (FinBERT_positive,
+#      FMB_indecisive, FLANG_score, kw15_body, ...). Those are rejected at load,
+#      with an error naming the replacement.
+#
+# ── !! EarningScore is INTEGER POINTS ─────────────────────────────────────────
+#   Observed -7…+9, median 0. It is NOT a 0-1 probability. `>= 4` means four
+#   points. Writing `>= 0.4` is REJECTED at load — it would have meant `>= 1`,
+#   i.e. 36.5% of earnings PRs at 32% precision, which is a very different gate
+#   from the one you thought you wrote.
+#   It is a RANKING cut, not a calibrated probability: the >=30% base rate it
+#   was tuned against moved 3.7% (May) -> ~15-20% (Jun/Jul) on its own.
+#   The points come from tools/Earning_Scorer/earn_score_params.json, which is
+#   FROZEN (calibrated 2026-08-01). Changing that file changes what `>= 4` means
+#   here without changing a character of this one.
+#
+# ── !!!! DO NOT ADD AN `FinMarBa_ind_hd <= x` RULE THAT FIRES ALONE ────────────
+#   One was implemented on 2026-08-03 (FMBSolo, `FinMarBa_ind_hd <= 0.115`) and
+#   REMOVED the same day, before it ever ran live.
+#   Reason: FinMarBa's three classes are negative / indecisive / positive, so a
+#   LOW `indecisive` means "confident" — IN EITHER DIRECTION. Inside the CORE
+#   rule that is harmless, because `Prosus_pos_hd >= 0.8` pins the sign right
+#   beside it. Standalone, NOTHING pins the sign, and the rule trades
+#   confidently-BAD news.
+#   Not hypothetical. On the 2026-07-29 tape it fired WETO, "Wetour Robotics
+#   Announces Share Consolidation" — a REVERSE SPLIT — on indecisive=0.0961 with
+#   FinMarBa_lab_hd=positive, while BOTH other headline models disagreed (FinBERT
+#   positive 0.150, FLANG_ss_hd -0.8037).
+#   It was also by far the loosest cut ever measured here: 44/552 rows (8.0%),
+#   against 2.9% / 2.4% / 1.3% for the three solo rules below.
+#   If you ever revisit it, it needs a DIRECTION condition beside it — see the
+#   commented FMBDirected example at the bottom of this file.
+#
+# ── !! The three solo rules below are UNCALIBRATED ────────────────────────────
+#   Alone among every cut in this file, KwBodySolo / FLANGSolo / FinBERTSolo
+#   were specified by the operator on 2026-08-03 with NO fires/precision/lift
+#   measurement behind them. The nearest evidence, none of it at these cuts:
+#   FLANG standalone at 0.97 ran 46.1% precision @>=15% / 24.3% @>=30% on 3434
+#   rows; the ge15 body channel alone at 0.60 ran ~41%, against the 57.3% the
+#   body+head PAIR bought. Both point BELOW the CORE rule's 46.2% @>=30%.
+#   Measured effect on live tape (not a labelled corpus): fire rate went from
+#   ~2.5% (~1 trade/day) to ~15% when they were added. Accepted trade: more
+#   trades, lower hit rate. Retune HERE.
+#
+# ── !! The solo rules SUBSUME CORE and EARNINGS ───────────────────────────────
+#   Each of the three re-reads a score CORE already uses, at a STRICTLY TIGHTER
+#   cut (0.70 > 0.50, 0.975 > 0.96, 0.935 > 0.80). So each solo rule IMPLIES its
+#   CORE twin, and CORE and EARNINGS are only DECISIVE in the band below every
+#   solo cut: kw15_proba_bd in [0.50, 0.70), FLANG_ss_hd in [0.96, 0.975),
+#   Prosus_pos_hd in [0.80, 0.935). Outside those bands a single score trades.
+#   FinMarBa_ind_hd and kw15_proba_hd are the only conditions left in the whole gate
+#   that can still VETO anything.
+#
+# ── Where the numbers came from ───────────────────────────────────────────────
+#   Calibration corpora, dates, precision/lift for every cut, and the full
+#   history of the gate:
+#       orchestrator5/CLAUDE.md          §"Clerk handshake"
+#       orchestrator5/version-control.txt
+#   Deliberately NOT repeated here: a rules file salted with precision numbers
+#   goes stale the first time somebody edits a threshold.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTIVE RULES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── PRECONDITION ──────────────────────────────────────────────────────────────
+# 2026-08-17. EVERY rule below is conditional on this line.
+# Why: the sentiment cuts do not read the catalyst TYPE, so a confidently-positive
+# headline fires whether the PR is an acquisition or a share offering — and the
+# false positives concentrate in classes that barely move. Measured on the honest
+# window (1644 rows, 2026-06-20..08-13, base rate 9.06%), in
+#   ../price_stats_loader/outputs/08_class_trading_value.md §2:
+#         gate today   173 fires / 38 TP = 22.0% precision, 2.42x lift, 3.3/day
+#         with this    115 fires / 32 TP = 27.8% precision, 3.07x lift, ~2.2/day
+#   i.e. 52 of 135 false positives removed (39%) for 6 of 38 true positives lost.
+#   Dropped: Other 16, Product_Launch 12, Offering_Financing 10, Clinical_Update 5,
+#   Business_Update 5, Crypto_Treasury 4, Management_Change 3, + 3 singletons.
+# !! Earnings_Results is IN the list on purpose, so the EARNINGS rule below keeps
+#    working. Without it that rule could never fire again.
+# !! Clinical_Data and Regain_Compliance contributed 6 fires and 0 TPs in that
+#    window and are kept deliberately (operator's call — n is far too small to
+#    call them dead; dropping them would read 38.5% on 65 fires).
+# !! FAILS CLOSED: a dead PR classifier (FineClass None) fails the class condition
+#    on every rule that carries it, and every such rule then cannot fire. Grep
+#    logs/ for BLOCKED BY MISSING SCORE ONLY — it is still the alarm that matters
+#    most, and XgbSolo carries its own guard so it fails closed too.
+#
+# ============================================================================
+# !!!! 2026-09-21 — THIS IS NO LONGER A `REQUIRE` LINE. IT MOVED INTO THE RULES.
+# ============================================================================
+# The operator wanted XgbSolo to fire on ANY catalyst class. A `REQUIRE` is
+# AND-ed over the WHOLE gate by design — it cannot exempt one rule — so the
+# whitelist was moved OUT of the precondition and INTO each rule that should
+# still be subject to it. Same seven classes, same behaviour, four copies:
+#     CORE, KwBodySolo, FLANGSolo, FinBERTSolo   carry it explicitly
+#     EARNINGS                                   needs nothing: its own
+#                                                `FineClass == Earnings_Results`
+#                                                is strictly narrower
+#     XgbSolo                                    DELIBERATELY EXEMPT
+# Verified behaviour-neutral for the five: the whole tape replays to identical
+# is_ok / fired rules / Trigger groups. See version-control.txt 2026-09-21.
+#
+# !! THE LIST NOW LIVES IN FOUR PLACES. A retune must edit ALL FOUR. That is the
+#    price of exempting one rule, and it is deliberate: the alternative was a new
+#    rule kind in the Python, and the gate is supposed to be a text artifact.
+#    `--check-rules` echoes every rule rebuilt from its parsed conditions, so a
+#    copy that drifts is visible there immediately — diff the four.
+#
+# !! MEASURED BEFORE EXEMPTING XgbSolo (model-2 val fold, 1380 rows / 25 sessions,
+#    base rate 16.3% at >=30%):
+#        ge50_m2 >= 0.70, whitelisted only : 122 fires  4.9/day  37.7%  2.31x
+#        ge50_m2 >= 0.70, ALL classes      : 150 fires  6.0/day  38.0%  2.33x
+#        the 28 extra fires on their own   :  28 fires  1.1/day  39.3%  2.41x
+#    So the classes the whitelist blocks score slightly BETTER on this cut, not
+#    worse — the exemption adds ~1.1 trades/day at no loss of hit rate. n=28, so
+#    the per-class splits below are noise, not findings:
+#        Product_Launch 0/8 | Offering_Financing 4/8 | Other 1/5
+#        Buyback_Dividend 3/3 | Crypto_Treasury 2/3 | Business_Update 1/1
+#    !! This says nothing about the OTHER five rules. They keep the whitelist
+#       because their 2026-08-17 calibration (22.0% -> 27.8%, 2.42x -> 3.07x)
+#       was measured with it and has not been re-derived without it.
+
+# The 2026-08-01 five-way AND. Calibrated as a whole; every condition required.
+CORE:        FineClass in MA, Partnership, Regain_Compliance, Clinical_Data, Contract_Award, Patent_IP, Earnings_Results AND Prosus_pos_hd >= 0.5 AND FinMarBa_ind_hd <= 0.14 AND kw15_proba_bd >= 0.54 AND kw15_proba_hd >= 0.50 AND FLANG_ss_hd >= 0.96
+
+# The 2026-08-02 earnings branch. Exists because CORE is structurally BLIND to
+# earnings PRs: its own FinBERT headline score measured test AUC 0.297 there
+# (ANTI-predictive) — winners and duds share the headline ("X Reports Q1 2026
+# Financial Results") and the separating numbers are in the body.
+EARNINGS:    FineClass == Earnings_Results AND EarningScore >= 4 AND kw15_proba_bd >= 0.50
+
+# The 2026-08-03 solo rules. FinBERTSolo still fires on ONE condition, unaided.
+# KwBodySolo and FLANGSolo each carry an added FinMarBa_ind_hd <= 0.14 indecision
+# veto (2026-08-11, from the daily-board FP review) — the same veto CORE uses — so
+# a confidently-scored but market-indecisive headline no longer trades on the solo
+# score alone. This is the allowed shape from the !!!! warning above: a direction/
+# catalyst signal (FLANG_ss_hd >= 0.975 / kw15_proba_bd >= 0.70) sits beside the
+# veto, so "confident" cannot mean "confidently bad". Read the two warnings above
+# before touching these numbers.
+KwBodySolo:  FineClass in MA, Partnership, Regain_Compliance, Clinical_Data, Contract_Award, Patent_IP, Earnings_Results AND kw15_proba_bd >= 0.70 AND FinMarBa_ind_hd <= 0.14
+FLANGSolo:   FineClass in MA, Partnership, Regain_Compliance, Clinical_Data, Contract_Award, Patent_IP, Earnings_Results AND FLANG_ss_hd >= 0.975 AND FinMarBa_ind_hd <= 0.14
+FinBERTSolo: FineClass in MA, Partnership, Regain_Compliance, Clinical_Data, Contract_Award, Patent_IP, Earnings_Results AND Prosus_pos_hd >= 0.935
+
+# ── 2026-09-20. The first rule that reads the XGBoost leg. ────────────────────
+# !! Adding this line is what made this whole file 5.3-only and what made the gate
+#    wait ~800 ms for the leg on every PR. Both banners at the top of the file.
+# !! ge50_m2 IS NOT A PROBABILITY. Fit with scale_pos_weight = 12.53, which
+#    multiplies the modelled odds; the column averages 0.357 against a 9.6% base
+#    rate. 0.70 is a RANK cut at the 89th percentile of the score distribution,
+#    worth a calibrated P(fromPR_High >= 50%) of about 19% — NOT 70%.
+# Measured on the model-2 validation fold (1380 rows / 25 sessions,
+# 2026-07-28..08-28), restricted to the ClassWhitelist classes this rule is
+# subject to like every other ordinary rule:
+#    >= 0.70   122 fires  ~4.9/day  37.7% @>=30%  25.4% @>=50%  2.31x lift
+#    >= 0.80    56 fires  ~2.2/day  41.1% @>=30%  25.0% @>=50%  2.52x
+#    >= 0.85    33 fires  ~1.3/day  45.5% @>=30%  24.2% @>=50%  2.79x  (n=33)
+#    Sanity check through the LIVE path on 10 real articles: ge50_m2 ranged
+#    0.101..0.695, so none cleared 0.70 — consistent with an ~11% fire rate.
+#    RETUNE HERE — the whole curve is one number on the line below.
+# !! THIS RULE ROUGHLY TRIPLES THE TRADE RATE AT LOWER LIFT. The other five ran
+#    ~2.2/day at 3.07x before it; this one alone is ~4.9/day at 2.31x, OR-ed on
+#    top. OVERLAP WITH THE OTHER FIVE IS UNMEASURED — the val corpus carries no
+#    kw15_*, Prosus_pos_hd or EarningScore columns, so the COMBINED gate has never
+#    been replayed anywhere. Watch the live fire rate before trusting a total.
+# !! Uses ge50_m2, NOT ge50_m2FT. model-2FT trained on 100% of the rows including
+#    that entire fold, so its 49.6% @>=30% there is in-sample and proves nothing.
+# !! ONE CONDITION, so the dead-scorer alarm is very loud by design: if the leg
+#    errors or times out, ge50_m2 is None, this rule is the only thing it blocks,
+#    and BLOCKED BY MISSING SCORE ONLY fires on EVERY row. That volume IS the
+#    signal — grep logs/ for it.
+# !! 2026-09-21 — XgbSolo IS THE ONE RULE EXEMPT FROM THE CLASS WHITELIST.
+#    It fires on ANY catalyst class: Offering_Financing, Other, Product_Launch,
+#    Business_Update, Legal — anything. That is deliberate (operator, measured
+#    above: 38.0% over all classes vs 37.7% whitelisted). The justification is
+#    that this rule is the only one whose model READS the class — FineClass is
+#    one of model-2's 25 features — so it is not blind to catalyst type the way
+#    the five sentiment rules are, which is why they keep the whitelist.
+#
+# !! `FineClass not in __CLASSIFIER_DEAD__` IS A LIVENESS GUARD, NOT A FILTER.
+#    __CLASSIFIER_DEAD__ is not a real class, so EVERY real class passes it. Its
+#    only job is to fail when FineClass is None, i.e. when PrClassifier died or
+#    its future timed out. Without it this rule would be the one thing still
+#    trading through a classifier outage — on a feature vector with that very
+#    feature NaN. With it, the gate still fails closed everywhere, and
+#    BLOCKED BY MISSING SCORE ONLY still means what it has always meant.
+#    ⚠ Do NOT "tidy" this condition away, and do NOT rename the sentinel to
+#      something that could ever collide with a real PrClassifier class.
+XgbSolo:     FineClass not in __CLASSIFIER_DEAD__ AND ge50_m2 >= 0.70
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXAMPLES — all commented out. Uncomment or adapt; they are here so you never
+# have to guess the syntax. Each one exercises a different feature.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# A row field. Low float + a decent body score — the kind of rule the model
+# scores alone cannot express.
+# SmallFloat:  kw15_proba_bd >= 0.60 AND Float <= 20
+
+# A liquidity guard beside a model score. !! itiBaseline is 44444 when the
+# universe TSV had no baseline for the symbol, so `<= 60` also excludes those.
+# Liquid:      FLANG_ss_hd >= 0.96 AND itiBaseline <= 60
+
+# Earnings, but only for PRs naming a single ticker. Worth knowing: on a
+# 2-ticker PR the earnings score is computed once, using the FIRST in-universe
+# ticker's float-cap, so the partner row's EarningScore is not derived from its
+# own size. TickerCount == 1 sidesteps that entirely.
+# EarnSolo:    FineClass == Earnings_Results AND EarningScore >= 4 AND TickerCount == 1
+
+# A string field. Case-insensitive, == and != only.
+# NasdaqOnly:  kw15_proba_bd >= 0.60 AND Exchange == NASDAQ
+
+# A label field, and a cheap-stock cut.
+# CheapPositive: Prosus_lab_hd == positive AND LastDailyClose < 3 AND kw15_proba_hd >= 0.60
+
+# An XGBoost rule with a sentiment veto beside it, the same shape KwBodySolo and
+# FLANGSolo took on 2026-08-11. Tighter than XgbSolo on both axes; not measured.
+# XgbVetoed:   ge50_m2 >= 0.60 AND FinMarBa_ind_hd <= 0.14
+
+# Requiring BOTH generations to agree. Trims the disagreements (the two rank at
+# Spearman 0.899) but its precision CANNOT be measured on the val fold, because
+# model-2FT trained on those rows.
+# XgbBoth:     ge50_m2 >= 0.70 AND ge50_m2FT >= 0.70
+
+# The ONLY acceptable shape for an FinMarBa_ind_hd rule: a DIRECTION condition
+# beside it, so "confident" cannot mean "confidently bad". See the !!!! warning.
+# FMBDirected: FinMarBa_ind_hd <= 0.115 AND FLANG_ss_hd >= 0.5
+
+# A blacklist instead of a whitelist — same mechanism, opposite sense. Note that
+# every REQUIRE line is AND-ed, so this would narrow the gate FURTHER, on top of
+# the ClassWhitelist above; it does not replace it.
+# REQUIRE NotDilution: FineClass not in Offering_Financing, Reverse_Split
+
+# A precondition may AND several conditions, exactly like an ordinary rule — and
+# it need not read a model at all. This one would cap the tradeable universe.
+# REQUIRE Tradeable: Float <= 50 AND LastDailyClose >= 1

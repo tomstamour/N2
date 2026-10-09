@@ -22,6 +22,13 @@ compare encoders for the N2 news pipeline. Run everything with
 # (golden probe headlines + expected scores live in verify_goldens.txt)
 /home/tom/venv/bin/python verify_headliners.py            # all models; exit 1 on FAIL
 /home/tom/venv/bin/python verify_headliners.py --model DeBERTa
+
+# Batch-score a TSV's Body with all 12 encoders (the 11 here + ProsusAI FinBERT)
+/home/tom/venv/bin/python BodyScore12encoders.py --input ../../price_stats_loader/outputs/FILE.tsv
+
+# Re-score an already-scored file IN PLACE (header untouched, values overwritten)
+/home/tom/venv/bin/python BodyScore12encoders.py --input FILE.tsv \
+    --cap-words 200 --replace-existing --out-suffix _prosusReScore.tsv
 ```
 
 Model dirs (`*_onnx/`, `loumcd_sdict/`) are gitignored build artifacts — on a
@@ -62,6 +69,18 @@ One name per score, everywhere: standalone script, batch scorer, and live
   string cannot know which it got. `HeadScore11encoders` appends `_hd`,
   `BodyScore11encoders` appends `_bd`, and that is the whole reason the body twin
   can reuse the head registry untouched.
+- **`BodyScore12encoders`** is `BodyScore11encoders` + **`Prosus`** (ProsusAI
+  FinBERT, the headliner outside this directory), scoring the SAME prepped
+  200-word body text as the other 11 → 76 `_bd` columns, Prosus last. It extends
+  the registry locally (`MODELS12 = {**MODELS, "Prosus": ...}`, whose entry
+  carries a `path` key so `score_table` imports from `../../FinBERT/`); `MODELS`
+  itself gains no entry, so the `_hd` path and its 70 columns are unchanged.
+  `FinBERT_TSV_scorer.py` still scores the RAW body — its `Prosus_*_bd` values
+  are not comparable with these. `--replace-existing` overwrites the `_bd`
+  columns a file ALREADY has instead of appending — it matches a pandas
+  duplicate-name suffix too (`FinMarBa_ss_bd.1`), never renames or reorders a
+  column, and skips (does not add) a channel the file no longer carries, so a
+  column-pruned research file keeps its exact shape.
 - **`ms` replaced `elapsed_ms` (7 scripts) and `inference_ms` (4)**, which removed
   a `setdefault` papering over the split in `HeadScore11encoders` and a two-key
   lookup in `verify_headliners`.

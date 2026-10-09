@@ -139,3 +139,19 @@ LouMcD-SDict_Body_sentiment_score \
 /home/tom/venv/bin/python class_hitrate_ranking.py \
 ../outputs/04_PRstats_2026-05-04-2026-07-23_CoffeeFilter_11EncScored_Classed_BodyEnc_clean_FromPRhigh.tsv \
 --threshold 30
+
+##### analyze_frompr40_tpfp.py (2026-10-07): rank every numeric column on
+##### fromPR_High(%) > 40 — correlations, AUC + bootstrap CI, TP/FP at top 10%/20% fires.
+/home/tom/venv/bin/python analyze_frompr40_tpfp.py \
+PRstats_2026-09-25-2026-10-06_CoffeeFltrd_fromPRhigh.tsv --threshold 40
+
+##### threshold_combo_search.py (2026-10-07): AND-gate percentile-cut search over 6 scores
+##### (FM3_hd_reg_FT, kw15_proba_hd_FT, ge35_m3FT, se_m3, FM3_bd_ge50_FT, kw15_proba_bd_FT),
+##### best TP/FP in a 5-9 fires/day band. No train/test split.
+/home/tom/venv/bin/python threshold_combo_search.py \
+PRstats_2026-09-25-2026-10-06_CoffeeFltrd_fromPRhigh.tsv --threshold 40 --min-day 5 --max-day 9
+
+##### solo_rule_search.py (2026-10-07): each of the 6 scores as its own solo trigger,
+##### best cut at 1-2 trades/day + all-solo OR overlap. No train/test split.
+/home/tom/venv/bin/python solo_rule_search.py \
+PRstats_2026-09-25-2026-10-06_CoffeeFltrd_fromPRhigh.tsv --threshold 40 --min-day 1 --max-day 2

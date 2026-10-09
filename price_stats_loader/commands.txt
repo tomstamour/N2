@@ -12,7 +12,7 @@ python3 finBERT_noCoref_AddON.py --input outputs/concatenated_enriched.tsv
 python3 rule-based-AddOn.py --column-name Headline --input outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings.tsv --output outputs/PR-stats-2026-05-19to06-19-filtered-50float_dailyHigh_exStrings_RBscored.tsv
 
 #######
-python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir inputs/ -o outputs/PRstats_2026-05-04-2026-08-28-unfiltered.tsv
+python3 enriched_tsv_concatener.py -l inputs/concat-list.txt --input-dir inputs/ -o outputs/PRstats_2026-09-25-2026-10-06.tsv
 
 ######
 python3 filter_float_dailyhigh.py --input outputs/PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh.tsv --output outputs/PR-stats-2026-05-03to06-19-filtered-50float-12high_RBscore_body_pricefilled_clean_keywordScored_created_fromPRhigh_excStr2.tsv --MaxFloat 50 --string-to-exclude /home/tom/Documents/ibkr_scripts/N2/scripts/orchestrator5/excluded_strings-2.txt 
@@ -29,8 +29,8 @@ python3 plot_sentiment_vs_dailyhigh_terminal.py outputs/concatenated_enriched_Fi
 
 #############################################
 python3 coffee_filter.py \
--i outputs/PRstats_2026-05-04-2026-08-28-unfiltered.tsv \
--o outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd.tsv \
+-i outputs/PRstats_2026-08-29-2026-09-24-unfiltered.tsv \
+-o outputs/PRstats_2026-08-29-2026-09-24-unfiltered_CoffeeFltrd.tsv \
 --pr-cooloff 240 --max-body-words 400 \
 --string-to-exclude ../orchestrator5/excluded_strings-2.txt
 
@@ -69,3 +69,118 @@ python3 mktcap_backfill_addOn.py -i ./outputs/PRstats_2026-05-04-2026-08-28-Coff
   --input outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter_orch52cols_gateReplay.tsv \
   --compare-scores outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores.tsv
 # Next validation window: the same 5 steps, plus --report <new date>_... on step 4.
+
+########################################################
+# model-2 vs model-1 -- predictive power on fromPR_High(%). STATS ONLY: this script
+# recommends no gate and proposes no rule line; the O5.2 gate is replayed purely as a
+# fixed reference point. Report: statsByClaude/2026-09-20_XGB_model2_vs_model1_predictive_power.md
+#
+# Nothing upstream needs re-running: --m1 is the gate-replay TSV the 5-step chain above
+# already produced, and --m2 is the model-2 score file as delivered. The two share the
+# same 1380 val rows in the same order with a byte-identical target, so the join is a
+# true PAIRING and the bootstraps below are paired -- the script hard-fails if that ever
+# stops being true. Deterministic (--seed 42); ~30s.
+/home/tom/venv/bin/python compare_xgb_models.py \
+  --m1 outputs/2026-07-28_2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_PCA_val_XGBscores_bestiter_orch52cols_gateReplay.tsv \
+  --m2 outputs/08_2026-05-04-2026-08-28_RawData_splits_rmCol_NaN_rmCol_rmCol_prosusReScore_reCat_PCA_val_M2-scores.tsv
+# Controls that license the numbers: join 1380/1380 + target max-diff 0.0, gate 113 fires
+# / 655 whitelist (it reads no model column, so any movement means a bad join), and 14/14
+# on the model-report reproduction check -- that last one is what caught model-1 scoring
+# past best_iteration. Exits non-zero if any model check fails.
+
+########################################################
+# model-2 DEEP ANALYSIS -- predictive power on fromPR_High(%), model-2 alone.
+# STATS ONLY: no gate recommended, no rule line, nothing under orchestrator5/ read.
+# Report: statsByClaude/2026-09-20_XGB_model2_deep_analysis.md
+#
+# Goes past the two earlier "which column ranks best" reports in three directions:
+#   - MAGNITUDE: Spearman vs Pearson, MAE against a constant, decile profiles,
+#     captured-move curves, and a coverage test of the q80 quantile's 80% promise.
+#   - CALIBRATION: the classifiers carry scale_pos_weight 4.18/8.33/12.53, so their
+#     outputs are rank scores, not probabilities -- Brier skill is NEGATIVE for all
+#     three. The analytic prior correction p/(p+(1-p)*w) is shown to fix the scale
+#     while leaving AUC untouched.
+#   - THE VARIABLES: all ~280 numeric + categorical columns screened univariately on
+#     train and val separately (BH-FDR controlled), then tested for INCREMENTAL value
+#     over the best model score via session-grouped CV logistic stacking.
+#
+# Row scope is deliberate and asymmetric: model-score numbers are val-only (1380 rows,
+# strictly out-of-sample) while the variable screen uses the full 4804-row corpus so a
+# 250-column sweep is not driven by 132 positives. The two are never pooled.
+# Deterministic (--seed 42); ~60s. Both defaults are already correct, so no flags needed.
+/home/tom/venv/bin/python analyze_model2_deep.py
+
+# Controls that license the numbers: score file vs corpus val slice 1380/1380 with
+# target max-diff 0.0, and 23/23 on the *_prep.json reproduction check (ROC-AUC, PR-AUC,
+# Brier, top-10% precision and base rate per classifier; MAE, Spearman, RMSE, n per
+# regressor). Exits NON-ZERO if any check fails -- verified by corrupting a score column
+# and confirming it trips. Artifacts written beside the report:
+#   model2_univariate_screen.tsv   -- every variable, train/val AUC, p, q
+#   model2_incremental_value.tsv   -- every variable, dAUC over the model score, CI, q
+#   model2_calibration_bins.tsv    -- reliability bins, raw and prior-corrected
+#   model2_decile_profile.tsv      -- per-decile move size and share of upside
+
+########################################################
+# model-2 CLASSIFIER CALIBRATION -- turn proba_clf_ge20/35/50 into real probabilities.
+# STATS ONLY: no gate, no rule line, nothing under orchestrator5/ touched, no retrain.
+# Report: statsByClaude/2026-09-20_XGB_model2_calibration.md
+#
+# WHY: those three columns were trained with scale_pos_weight 4.18/8.33/12.53, which
+# multiplies the modelled ODDS by that weight. They are rank scores wearing probability
+# clothing -- all three score NEGATIVE Brier skill (worse than always answering the base
+# rate). See 2026-09-20_XGB_model2_deep_analysis.md §4.
+#
+# WHAT IT DOES: reads only the score columns that already exist plus the outcome column
+# beside them. Sorts by score, measures what fraction of each region actually hit its
+# threshold, fits a curve. Five monotone methods compared -- raw / prior (the free
+# p/(p+(1-p)*w)) / platt / beta / isotonic. ~5s, no pipeline, no new data.
+#
+# ⚠ EVERY HEADLINE NUMBER IS OUT OF FOLD (fit on 20 sessions, score the held-out 5,
+# rotate). A curve fitted on all 1380 rows and graded on those same rows looks superb
+# whether or not it works -- isotonic is the proof: best in-sample on all three columns,
+# and it gives most of it back out of fold.
+/home/tom/venv/bin/python calibrate_model2_clf.py
+
+# ANSWER: use `platt` (2 params/column, saved in model2_calibration_params.json). The
+# free `prior` formula OVER-corrects by construction -- it divides by the full weight
+# though XGBoost regularisation already pulled the odds back -- landing 14%/21%/32% below
+# the true base rate, the miss growing with the weight. platt matches the base rate on
+# all three and halves ECE. Calibration changes NO ranking decision: all five methods are
+# monotone, and the control table shows AUC shift 0.000000 for platt/beta/prior.
+# isotonic is the one exception (pooling creates ties, costs 0.008-0.015 AUC) -- don't use it.
+#
+# Controls: 11/11 reproduction of the deep analysis §4 Brier values + row/session/positive
+# counts; per-fold AUC monotonicity gate. Exits NON-ZERO on either failure (verified by
+# corrupting a score column). Artifacts beside the report:
+#   model2_calibration_params.json       -- fitted params, all 3 columns, all 4 methods
+#   model2_calibration_methods.tsv       -- full metric grid (Brier/skill/ECE/MCE/logloss)
+#   model2_calibration_reliability.tsv   -- per-bin observed vs predicted
+
+########################################################
+# OPERATING THRESHOLD for a model-2 classifier column. STATS ONLY -- recommends no gate
+# and proposes no rule line. Report: statsByClaude/2026-09-20_XGB_model2_ge50_threshold.md
+#
+# Scores are used RAW. The calibration study proved any monotone rescale (Platt, the
+# scale_pos_weight prior correction) picks the IDENTICAL rows in the IDENTICAL order, so
+# it renumbers a threshold without changing the decision. Don't calibrate to pick a cut.
+/home/tom/venv/bin/python sweep_clf_threshold.py
+# --column / --target-threshold make it reusable:
+/home/tom/venv/bin/python sweep_clf_threshold.py --column proba_clf_ge35 --target-threshold 35
+#
+# ANSWER for proba_clf_ge50: >= 0.70, equivalently the top ~10%. 150 fires / 25 sessions
+# (6.0/day), 38 TP + 112 FP, precision 25.3%, 2.65x base rate, recall 28.8%.
+#
+# ⚠ THREE TRAPS the script exists to stop, all of them live in this data:
+#  1. The in-sample optimum is a MIRAGE. Searching the fold returns 0.83 at 30.6%; the
+#     same search on half the data overstated itself by ~6 points on average (one arm by
+#     10.3). Never quote a searched-for precision as the expected hit rate.
+#  2. Precision PLATEAUS at 0.70-0.80 (25.3/25.0/24.6/25.0%) while recall falls 28.8%
+#     -> 6.8%. Stand on the LOWEST cut of the plateau, not the highest.
+#  3. An absolute cut is not a stable workload. Held at top-10% precision was 27.7% vs
+#     27.4% across the two date halves; at top-5% it swung 30.3% vs 16.2%. Set cuts from
+#     a measured quantile -- the same advice in Orchestrator5.3.py:1583.
+#  Also: 0.90 fires 9 times and hits 0. --min-fires flags cuts too thin to measure.
+#
+# Controls: 5/5 (confusion sums to 1380 at every cut, fire count non-increasing,
+# 132 positives, 25 sessions). Exits non-zero on failure. Artifact:
+#   model2_ge50_threshold_sweep.tsv -- the full grid incl. per-half precision and swing

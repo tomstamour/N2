@@ -7,7 +7,8 @@ as an in-process "duo" on ONE shared, pre-warmed ibapi client from a pool.
 Live chain (three separate processes):
     RTPR_connector3 ─tcp8900─► orchestrator5 ─tcp8765─► clerk-1.1 ─► Gateway
 Current live scripts: clerk-1.1.py, trade-mole-2.2.py, x-wing-2.1.py.
-clerk-1.2.py (trio, paper-verify pending) loads trade-mole-2.2.py,
+clerk-1.2.py (trio, paper-verify pending) loads trade-mole-2.4.py (2.2 until
+2026-09-17, then 2.3 for one day, then 2.4 on 2026-09-18),
 T47-airspeeder-2.0.py and x-wing-3.0.py.
 Run everything with the venv python (system python3 lacks ibapi).
 Ports: 4001 = LIVE Gateway, 4002 = paper GW, 7497 = paper TWS.
@@ -78,7 +79,372 @@ Constant across versions:
     addresses neither failure mode. 3.0 turns it off.
 
 --------------------------------------------------------------------------------
-2.1  ->  3.0     (x-wing-3.0.py)                                        [CURRENT]
+3.3  ->  3.4   (x-wing-3.0.py, in place)                                [CURRENT]
+--------------------------------------------------------------------------------
+  2026-10-06. EXIT-REPAIR only. The exit DECISION is untouched and that is
+  proven, not asserted: replay_exit.py --all over every session from 2026-09-28
+  is BYTE-IDENTICAL before and after (56 lines, diff clean). Nothing here can
+  change WHEN x-wing sells; it changes only what happens when the broker refuses
+  the sell order.
+
+  THE FAILURE: JUNS 2026-10-06, one share long and UNPROTECTED for four hours.
+  From clerk_logs/clerk.log, 11:15:38:
+    .103  hard_floor fires. arm_or_replace_protective converts the resting
+          protective order by MODIFY on the live orderId 61: SELL STP LMT
+          aux=2.19/lmt=1.98  ->  SELL LMT @ 2.50 (the bid).
+    .105  IBKR: "103 Duplicate order id". A type-change modify on a working id
+          is refused -- which is exactly what the cancel+new fallback in
+          on_order_error exists for, and it fired correctly.
+    .105  the fallback cancels 61 and places 62 ... at _lmt_floor = 1.98. That
+          is the LADDER's stop limit, NOT the bid the hard floor asked for.
+          (cancelOrder(61) also raced the place and drew 10147 "not found".)
+    .216  IBKR: "202 ... more aggressive than 2.3001 ... market price 2.55".
+          For a SELL, more aggressive means LOWER; 1.98 was 22% under the
+          market, so the refusal was arithmetically certain. Order 62 Cancelled.
+          The 202 landed 111 ms after the replace -- inside
+          PROTECTIVE_MODIFY_RETRY_MIN_GAP_SEC -- so the min-gap guard logged
+          "spacing it by 0.50s instead of storming" and returned.
+  And that was the end of it. The run sat in phase EXITING with
+  protective_status=Cancelled and 1 sh open from 11:15 to the 15:15 lifetime
+  flatten, which took the SAME 103 -> 202 pair for the same two reasons and
+  logged "FLATTEN incomplete: 1 sh still open; SELL LMT left resting at the
+  broker". 14,338 TSV rows were written over those four hours, every one of them
+  recording a dead exit, and nothing read the column.
+
+  THE SHAPE OF THE BUG. The three guards in the cancel+new fallback (budget
+  spent / inside the min gap / empty token bucket) each return after only
+  wake.set(). They are RIGHT to refuse to storm the Gateway -- that bound is
+  what IVF 2026-08-17 paid for (eleven orders in 1.66 s). What was missing is
+  that nothing owned the state they leave behind. chase_exit_limit could not:
+  it bails on _prot_reject_n by design, because pushing a refused SELL lower
+  cannot work. So "exiting latched + resting exit dead + position open" was a
+  reachable state with no owner.
+
+  THREE FIXES.
+  (A) _exit_repair_price() -- ONE source of truth for the repair price, and it
+      honours WHICH trigger fired. _trigger_source == "hard_floor" (equivalently
+      _exit_lmt_sent is None, which is what the control loop records at the
+      synthetic trigger) means the exit must be marketable at the BID: the hard
+      floor IS the loss cap, and a limit resting above the market caps nothing.
+      Otherwise the held ladder limit. 3.2 reached for _lmt_floor unconditionally
+      and that is defect 2 of the JUNS chain.
+  (B) rearm_dead_exit(), called from the control loop's exiting branch BEFORE
+      chase_exit_limit. When the resting exit reads Cancelled / ApiCancelled /
+      Inactive / Rejected (ORDER_DEAD_STATUSES) with shares still open, it
+      re-places on a FRESH orderId.
+      ⚠ A fresh id is the point. arm_or_replace_protective reuses
+      self.protective_id by design -- same id means modify, which is what the
+      trailing ladder wants -- so re-placing on a dead id draws 103 again. The id
+      is cleared by the supervisor before the call, never inside it.
+      Bounded exactly like every other order path here: EXIT_REARM_MAX_N = 5
+      attempts, EXIT_REARM_MIN_GAP_SEC = 2.0 apart, only after the order has read
+      dead for EXIT_REARM_AFTER_SEC = 2.0 (~13x the ~150 ms a
+      PendingCancel -> Cancelled -> Submitted round trip takes on this Gateway),
+      each through the global ORDER_THROTTLE. An UNKNOWN status is never treated
+      as dead -- re-placing over a working exit would double the sell side.
+      Budget spent logs ERROR once, naming the position: nothing in the process
+      can close it before the lifetime flatten, so that line is the operator's
+      only warning. Resets on a new entry fill, with the ratchet state.
+  (C) exit_wall_obs / exit_wall_ref / _note_exit_wall() -- the SELL-side mirror
+      of entry_wall_obs. A 202 on the protective id carries the EXACT floor and
+      IBKR's own reference; 3.2 parsed both inside the handler and threw them
+      away, so every later repair was free to re-send a refused price. Now
+      recorded FIRST, before the guards that return early (the reading is just as
+      valuable on an attempt we decline to make), keeping the HIGHEST floor seen
+      this run, and _exit_repair_price lifts over it with _wall_step_up.
+  Plus: the shutdown FLATTEN now clears a dead protective id and prices through
+  _exit_repair_price(force_bid=True), so it cannot repeat the 15:15 failure. And
+  the 3.2 budget-spent log line claimed "the control loop will flatten" -- it did
+  not and never could; the handover is now named instead of assumed.
+
+  KILL SWITCH: --no-exit-rearm (EXIT_REARM_ENABLED=False) reverts (B) exactly.
+  (A) and (C) are not switchable: a repair price that ignores the trigger, or a
+  wall reading thrown away, are defects with no configuration to preserve.
+
+  VERIFIED OFFLINE:
+    - replay_exit.py --all BYTE-IDENTICAL to the 3.3 code over the whole corpus.
+      replay_exit.py --self-check 3/3.
+    - verify_xwing3_tracking.py 239 -> 267 checks, 0 failed. New
+      case_dead_exit_rearm replays the JUNS state at 11:15:38.216 and asserts
+      the pre-fix behaviour is gone: a hard_floor repair prices at the bid 2.55
+      not the ladder 1.98, the 2.3001 floor is recorded and cleared at 2.31, the
+      min-gap 202 still sends nothing but the supervisor then re-arms on a fresh
+      id, twelve dead reads produce 5 orders not 12, and working / unknown /
+      filled / flat / not-exiting are all left alone.
+    - ⚠ PAPER GATEWAY (4002) PENDING, as for 3.0-3.3. Offline tests cannot
+      settle whether a re-armed SELL LMT at the lifted price is ACCEPTED -- only
+      the Gateway can. The one measurement that matters: force a dead exit and
+      read whether EXIT_REARM_1 appears in the TSV event column and fills.
+
+  ⚠ ALSO FIXED, unrelated to the exit: replay_exit.py resolved x-wing-3.0.py as
+  Path(__file__).parent.parent -- correct for analyze_trade_mole/, where
+  CLAUDE.md documents it, but the file lives at the x-wing-mole ROOT, so every
+  run died at import with FileNotFoundError. It now locates the module instead
+  of assuming a depth and works from either directory.
+
+  ⚠ OPEN, from the same day: VCIG 15:45 shows the OTHER half of the wall
+  problem, on the entry. Order 28 @ 1.0500 drew 202 (wall 1.0472, IBKR ref
+  0.9537 against a real 1.02/1.02 market); the retry pinned itself under the
+  wall at 1.0400 and the ask then ran 1.02 -> 1.09 -> 1.10, so the limit could
+  never fill and the 10 s timeout cancelled it. The wall clamp behaved as
+  designed. What is unaddressed is that a wall-pinned entry limit is left frozen
+  while the market leaves it behind. No change made -- the entry path is not
+  touched here.
+
+  ⚠ clerk-1.2.py keeps the imported module -- the live clerk must be RESTARTED.
+
+--------------------------------------------------------------------------------
+3.2  ->  3.3   (x-wing-3.0.py, in place)                         [prior, 10-02]
+--------------------------------------------------------------------------------
+  2026-10-02, same day as 3.2. RECORD-ONLY: no exit decision, no order price and
+  no entry behaviour changes. Proven, not asserted -- replay_exit.py --all over
+  every session from 2026-09-28 produces output BYTE-IDENTICAL to the 3.2 code.
+
+  THE FINDING. The data needed to calibrate the exit was already arriving in
+  this process and was being thrown away.
+    - clerk-1.2.py:666 subscribes once per trio with trade-mole's generic tick
+      list (trade-mole-2.4.py GENERIC_TICKS = "233,236,293,294,295,318,375,165,
+      221"): RTVolume, shortable, trade count/rate, volume rate, last-RTH-trade,
+      RT trade volume, misc stats, mark price.
+    - Its SharedIBClient already implements all four tick callbacks
+      (clerk-1.2.py:433-459) -- but tickSize, tickString and tickGeneric fanned
+      to the MOLE ONLY. x-wing was handed tickPrice alone.
+    - route_tick_price kept 5 tick ids (1/2/4/9/37 + delayed twins) and had no
+      else branch. Ticks 0/3/5 (bid/ask/last SIZE), 8 (day volume) and 6/7/14
+      (day high/low/open) arrive with the DEFAULT tick set, were decoded by
+      ibapi, and vanished.
+    - In standalone mode x-wing asked for genericTickList = "" -- nothing.
+  So reading all of it costs NO new request, NO extra market-data line, NO extra
+  Gateway traffic and NO added latency. The packets were already being parsed.
+
+  WHY IT MATTERS. The 3.2 exit was calibrated on 26 columns and recordings that
+  last SECONDS. The single most important missing variable is SIZE AT THE TOUCH:
+  a 1-lot bid being withdrawn is not a market falling, a 50-lot bid being eaten
+  is, and nothing in this process could tell them apart -- which is the whole
+  shape of the 2026-10-01 ejections. Also now recorded: VWAP (free inside the
+  RTVolume payload, already the mole's direction gate), the EXCHANGE timestamp
+  of the print (strictly better than our own arrival stamp, which is all
+  last_age() can offer), the server-computed trade/volume rates (a dead tape is
+  exactly the condition in which a bid is withdrawn with nothing trading: MEDS
+  entered with last_age=126 s), the halt flag (a halt is the worst state to sell
+  into and x-wing could not tell one from a dead tape), and borrow availability.
+
+  CHANGES.
+  1. route_tick_size / route_tick_generic / route_tick_string, beside
+     route_tick_price and sharing the same both-modes contract. Matching
+     XWingClient callbacks (standalone must see what driven mode sees or an
+     offline replay calibrates against different inputs), and the standalone
+     reqMktData now passes GENERIC_TICKS instead of "".
+     ⚠ A price of 0 is garbage and is dropped. A SIZE of 0 is NOT: it is the
+     book being pulled, the very event these columns exist to capture, so the
+     size path tests `is not None`, never truthiness. Same for a trade rate of
+     0. An `if size:` anywhere in here silently discards the signal.
+  2. clerk-1.2.py fans the three callbacks to x-wing as well. Mole stays FIRST
+     in every one (the ordering comment in tickPrice is load-bearing) and the
+     x-wing call is getattr-guarded + try/except like the T47 call, so neither
+     a loader flip to an older x-wing nor a bug in new code can take down the
+     mole's primary signal path.
+  3. trade-mole-2.4.py GENERIC_TICKS += ",595" (ticks 63/64/65 = 3/5/10-minute
+     volume), for x-wing's benefit; the mole does not branch on them. Proven
+     behaviour-neutral by running replay_mole.py --self-check --check-decisions
+     over mole-outputs/_*.csv against the pre-change module: 77/253 reproduced
+     BOTH before and after.
+  4. Derived, zero fetch cost: microprice() = (bid*ask_sz + ask*bid_sz)/
+     (bid_sz+ask_sz) -- the weights are crossed on purpose, a deep bid against a
+     thin ask means the next trade is likelier at the ask so fair value sits
+     HIGH. This is the honest answer to "the yield is on the bid so it is
+     already negative at the fill": a 1-lot bid 6% down barely moves the
+     microprice while it drags the bid-based yield straight through the stop.
+     NOTHING ANCHORS ON IT YET -- that decision wants the labelled corpus.
+     Also touch_imbalance(), quote_rate() (a frozen feed and a quiet market look
+     identical in the tables today), bid_vol_pct() (a noise scale that does not
+     assume the spread is the whole story), px_vs_vwap_pct(), and
+     note_trade_through() (the complement of deferred_n: times a trade DID agree
+     with the stop, counted once per distinct print).
+  5. Table +22 append-only columns at PA_COLUMNS[35:], built in ONE place
+     (market_snapshot_row()) so the three row builders cannot drift. Real
+     columns, not packed: the 3.2 diagnosis was slow precisely because `last`
+     was reachable only by string-parsing ref_snapshot. The exception is
+     static_snapshot, for the handful of values that arrive once and never move.
+  6. POST_EXIT_WATCH_SEC 0 -> 300, dense (POST_EXIT_FAST_HZ=4) for the first 30 s
+     then 1 Hz, with POST_EXIT_STALE_BAIL_SEC=30.
+     ⚠⚠ The 3.2 note said this could not work because "the clerk cancels the
+     market-data subscription on recycle". THAT WAS WRONG. T47.on_run_done
+     (T47-airspeeder-2.0.py:367-407) OPENS its re-entry watch when a run ends
+     flat with budget left, and clerk-1.2.py:30 holds the client "for the WHOLE
+     trio (watch included)"; cancelMktData is reached only in
+     TrioSession.finish() (clerk-1.2.py:846). Quotes keep arriving for up to two
+     hours. The cases where they do not (T47 ending the trio at once, or
+     relaunching and swapping session.xwing) are covered by the stale bail. NO
+     clerk-side change was needed, and cancelMktData is deliberately NOT
+     deferred -- that would hold a client out of the pool and delay T47.
+  7. analyze_trade_mole/replay_exit.py --score-labels / --leave-one-out: scores
+     the exit rules against labelled tables, reusing eval_rules.py's convention
+     verbatim (glob _*.tsv, basename.split("_")[1]). Labels early/good/hloss
+     plus late (held too long and gave the profit back -- v7's failure, the
+     OPPOSITE error, without which calibration overfits to "never eject") and
+     nofill (the LESL shape).
+     ⚠ It REFUSES to score a file whose recording ends at the exit, or whose
+     entry never filled, and says so. replay_mole.py once required a TRADE row
+     and silently skipped 26 of 90 files, which invalidated every precision
+     number before 2026-08-14; that is not repeated here.
+
+  CAPACITY, measured not estimated. xwing_tables = 102 MB / 533 files / ~4
+  months at 322 bytes/row; 208 GB free. The new columns add ~40% row width and
+  the tail ~175 KB/session, so ~1.8 MB/day at 6-10 sessions/day. CPU: 8 cores,
+  load 0.19-0.33, the live clerk at 0.4% -- and ibapi already decodes these
+  ticks today. Gateway: the binding limit is market-data LINES, not ticks;
+  routing existing callbacks adds zero, and the tail holds no line that T47 was
+  not already holding for up to 2 h.
+
+  REJECTED. reqMktDepth (a separate depth line from a limited pool, far higher
+  message rate, and SMART-aggregated small-cap books are too thin to trust --
+  size at the touch is the part that carries the signal and ticks 0/3 give it
+  free). reqTickByTickData (measured 0.16-0.43 s SLOWER on small caps in 08-26,
+  whole-second stamps, same pool as depth). reqRealTimeBars (one extra line per
+  symbol for what the ticks already give). reqHistoricalData keepUpToDate (HMDS
+  contention).
+
+  VERIFIED OFFLINE ONLY.
+    - verify_xwing3_tracking.py 239/239 (210 pre-existing + 29 new in case [17]).
+    - replay_exit.py --all byte-identical to the 3.2 code: the exit path is
+      provably untouched.
+    - replay_mole.py self-check unchanged at 77/253 across the mole edit.
+    - End-to-end: 57 columns round-trip, post-exit tail wrote 12 rows in 3 s at
+      4 Hz with the same header.
+    ⚠ PAPER GATEWAY (4002) STILL PENDING, and it is the only thing that can
+      answer what the Gateway actually SENDS: (a) does halted (49) arrive
+      without its own generic tick, (b) do vol_3min/5min/10min arrive at all for
+      a thin small cap, (c) is day_volume really in lots. Do not assert any of
+      those from documentation -- measure them and record the answer here.
+    ⚠ The labelled corpus is currently 7 files of which 4 are UNSCORABLE, so
+      --leave-one-out reports a delta of 0.0 for all four defences. The harness
+      is right; the corpus is too thin and has no post-exit data yet. That is
+      the thing this change exists to fix, not evidence that the defences do
+      nothing.
+    ⚠ clerk-1.2.py keeps the imported module -- the live clerk must be RESTARTED.
+
+--------------------------------------------------------------------------------
+3.0/3.1  ->  3.2   (x-wing-3.0.py, in place)                     [prior, 10-02]
+--------------------------------------------------------------------------------
+  2026-10-02. EXIT-side only; the entry tracker and the price wall are untouched
+  (verify_xwing3_tracking.py's 186 pre-existing checks all still pass).
+
+  THE PROBLEM. Three trades on 2026-10-01 (MEDS, VEEA, HXHX, labelled _early_ in
+  xwing_tables/) exited 1-9 s after the entry fill, at prices that have no
+  corresponding trade on a TradingView chart. The whole exit path runs off the
+  BID -- current_exit_ref() returns it, yield_pct is (bid-entry)/entry,
+  high_water is the peak BID, aux = high_water*(1-Trigger%/100). TWO separate
+  stops then exist:
+      1. a REAL IBKR STP LMT resting at the Gateway. triggerMethod is never set,
+         so IBKR evaluates it on the LAST TRADED price. This one was CORRECT and
+         never fired.
+      2. x-wing's OWN check, `if exit_ref <= aux:` in control_loop, once a
+         second, on the BID. On fire it replaces the stop-limit with a plain
+         SELL LMT, which has no trigger and sells straight into the book.
+  (2) did the damage. A bid is an offer that can be WITHDRAWN with no shares
+  changing hands, so the level it ejects at need never have traded -- hence no
+  print on the chart. In 6 of 26 triggered exits it fired while the last trade
+  AND the ask were still at/above the entry fill: MEDS (entry 3.73, ejected on
+  bid 3.58 with last 3.73 / ask 3.75), VEEA, EDBL, IMCC, KIDZ (entry 2.83,
+  ejected on bid 2.45 while last and ask were 2.90 -- a -13% loss on a stock
+  that was UP), NAMI.
+  Measured over 31 filled sessions 2026-09-28..10-01: median spread at fill
+  4.23% (v7) / 2.34% (v8); 18 of 31 reached a positive yield at some point but
+  only 3 ENDED positive. The losses are made on the EXIT, not the entry: v7 gave
+  the gains back (HCTI +11.3%->-6.1%, ZBAO +21.5%->-3.4%) and v8 ejected before
+  the move started. Winners took 8-119 s to reach their peak; v8 was exiting in
+  1-9 s.
+
+  ⚠ NOT the cause, and checked first: re-anchoring the yield on the bid at fill
+  changes NOTHING. LimitsTable.lookup() floors at the first row, so a yield of
+  -5.22% and one of 0.00% both select the `Yield 0` row (row_yield_threshold is
+  0.0 in all three files), and aux comes from high_water, not from the anchor.
+  The bid is the RIGHT price for accounting -- it is where a sell fills. It is
+  the wrong price for the DECISION "is this falling?".
+
+  THE CHANGES (all flag-gated; DRIVEN mode reads the module constants, so those
+  defaults are the live configuration -- build_config does not carry them):
+  - exit_decision() replaces the bare `if exit_ref <= aux:`. Three outcomes:
+      hard_floor / hard_floor_bid  unconditional loss cap, no confirmation
+      bid+last                     bid at/below aux AND a real trade agrees
+      deferred                     bid crossed aux, no trade did -> HOLD
+    EXIT_REQUIRE_TRADE_CONFIRM=True. A silent or >30 s stale tape (
+    EXIT_CONFIRM_MAX_LAST_AGE_SEC) gives no trade signal, so the bid stands
+    alone there and the row says so (bid_only_stale_last) -- without that escape
+    the position would be left protected only by the floor.
+  - the spread band. EXIT_TRIGGER_SPREAD_MULT=1.5:
+    eff_trigger% = max(table_Trigger%, 1.5 * MEDIAN spread% over 10 s), capped
+    at EXIT_SPREAD_MAX_PCT=20. The table value is now a FLOOR. The MEDIAN
+    matters: HXHX quoted 0.43/0.44 (2.3%) for one tick while its 10 s median was
+    4.9%, and the median is the honest measure of a name's noise scale.
+  - ⚠ the RATCHET had to be split. _aux_floor/_lmt_floor stay the EFFECTIVE held
+    levels (on_order_error's fallback and the `exiting` branch read them), and
+    new _aux_table_floor/_lmt_table_floor carry the pure profit ratchet. aux =
+    min(ratcheted_table_aux, hw*(1-eff_trigger%/100)). Without the split the
+    ratchet pushes the stop UP into the noise band, which IS the MEDS failure.
+  - the hard floor. HARD_FLOOR_PCT=5.0, HARD_FLOOR_ON_LAST=True. ⚠ On the last
+    print this caps the TRADED decline at 5%, NOT the realised loss -- the sale
+    happens at the bid, a spread lower (replay: it fires at a bid of -8.57% on
+    NUR, -12.51% on QCLS). A plain 5% BID floor is not the answer either: VEEA's
+    bid fell 5.6% on noise with `last` unmoved, so it would fire on that and
+    undo the confirmation. So the bid clause is spread-widened too:
+    bid <= entry*(1-(5%+spread%)/100). A name with a 12% spread (LRHC) simply
+    cannot be exited for a 5% loss; this makes that explicit.
+  - chase_exit_limit(). LESL 2026-09-30: the bid gapped 0.2320->0.1815 straight
+    THROUGH aux 0.2085 and the SELL LMT at 0.2074 rested UNFILLED for 860+ s
+    while the position bled. Now re-priced DOWN to the live bid. ⚠ Bounded
+    exactly as the 2026-08-17 IVF storm requires: EXIT_LMT_CHASE_MAX_N=5,
+    spaced by PROTECTIVE_MODIFY_RETRY_MIN_GAP_SEC, strictly down-only so an
+    identical price can never be re-sent, and ABANDONED once _prot_reject_n>0
+    (a 202 means too aggressive = too LOW for a SELL; the existing wall handler
+    owns that case and lifts the exit back above the wall).
+  - table +9 append-only columns: last, spread_pct, eff_trigger_pct,
+    eff_limit_pct, trigger_source, deferred_n, exit_fill_px, exit_fill_ts,
+    realized_yield_pct, plus events TRIGGER_DEFERRED and EXIT_CHASE_<n>.
+    `last` was previously reachable only by string-parsing ref_snapshot. The
+    exit fill price was recorded NOWHERE: control_loop checks stop_evt before
+    building a row and _signal_done sets it from the ibapi thread, so the loop
+    always exited without writing the fill. write_terminal_row() now writes it
+    from shutdown(). ⚠ Three readers parse these tables by column NAME
+    (verify_xwing3_tracking.py, analyze_firstrade_outcomes.py,
+    calibrate_price_wall.py) -- append only, never reorder.
+  - start_post_exit_watch(): samples bid/ask/last for N seconds after the exit
+    into xwing_tables/postexit/<stem>-post.tsv, in a daemon thread. It must NOT
+    run in the control loop -- stop_evt is load-bearing in 14 places including
+    the clerk teardown and the T47 hand-off. SHIPS OFF (POST_EXIT_WATCH_SEC=0):
+    in driven mode the clerk owns the market-data subscription and cancels it on
+    recycle, so the quotes freeze. Keeping the feed alive needs a clerk change.
+  - yield-triggerLimit-data/v8-input.tsv: rows Yield 0-7 1.0/1.5 -> 2.0/3.0 and
+    rows 8-12 1.5/2 -> 2.5/3.5. The 8-12 bump is NOT cosmetic: leaving them at
+    1.5 would make the trigger DROP as the yield rose past 7.
+
+  Kill switches: --no-exit-trade-confirm (restores the pre-3.2 bid-only
+  trigger), --no-exit-spread-trigger, --exit-trigger-spread-mult,
+  --hard-floor-pct 0, --hard-floor-on-bid, --no-exit-lmt-chase,
+  --post-exit-watch-sec.
+
+  VERIFIED OFFLINE ONLY -- paper-GW verify PENDING, and the live clerk (PID
+  1417805 at the time of writing) must be RESTARTED to pick any of this up.
+    - verify_xwing3_tracking.py: 209 checks, 0 failed (186 pre-existing + 23 new
+      in case_exit_noise_defences, which drive exit_decision() directly because
+      the three labelled files are all held by the spread band alone and never
+      exercise the trade confirmation).
+    - analyze_trade_mole/replay_exit.py (NEW): replays a recorded table's
+      bid/ask/last through the REAL compute_protective_levels() + exit_decision()
+      on a row-driven fake clock (without the clock the 10 s spread window never
+      trims and the median comes out far too wide). --self-check asserts all
+      three labelled ejections are no longer bid-only exits; --all replays the
+      week. Biggest moves: HCTI -6.06% -> +8.38%, ZBAO -3.43% -> +10.41%, LESL
+      -15.31% -> -2.01%, KALA -7.89% -> -2.49%, PMAX +25.57%.
+    - ⚠ For ~10 sessions the replay reports "NEVER FIRES" (KIDZ, SVRE, XXII,
+      IMCC, NEXR, TRUG, EDBL...). That is NOT proof the new exit is better:
+      every recording ENDS at the old exit, so there is no data on what the
+      price did afterwards. That gap is exactly what POST_EXIT_WATCH_SEC is for.
+
+
+--------------------------------------------------------------------------------
+2.1  ->  3.0     (x-wing-3.0.py)                        [entry tracker, 08-12]
 --------------------------------------------------------------------------------
   Loaded by clerk-1.2.py:135 since 2026-08-12. clerk-1.1.py stays on 2.1 as the
   live duo fallback until 3.0 is paper-GW verified. A RUNNING clerk keeps its
@@ -426,6 +792,243 @@ trade-mole  —  trade-frequency surge detector (produces x-wing's buy-signal)
     time-to-fire unchanged (1.78s). ⚠ F-veto calibrated on only 5 pretrade
     pos; all numbers censored (recordings stop at the fire).
 
+--------------------------------------------------------------------------------
+2026-08-14  2.2 -> 2.3  (trade-mole-2.3.py; 2.2 kept on disk. ⚠ Wired into
+            clerk-1.2 only on 2026-09-17, in commit ec6d6a4 — this file and
+            x-wing-mole/CLAUDE.md both still described it as "not loaded by any
+            clerk" until 2026-09-18. Recorded here retroactively.)
+--------------------------------------------------------------------------------
+  Precision pass on 90 labelled files >= 2026-07-09. Report =
+  mole-outputs/surge-predictor-analysis-2026-08-14.md, scored through the real
+  should_fire() by the new analyze_trade_mole/eval_rules.py.
+  - FIRST it fixed the MEASUREMENT: replay_mole required a TRADE row, so every
+    pre-trade-only recording (26 of 90, incl. 8 pos / 10 neg) was silently
+    skipped by the whole sweep stack. Every trigger precision number published
+    before 2026-08-14 therefore describes the TRADE PATH ONLY.
+  - RULE_B_ENABLED = False (1 positive for 5 negatives, not threshold-separable).
+  - RULE_A_ENABLED = False (zero unique positives).
+  - PRETRADE_MIN_GAP_VS_CLOSE_PCT = 5.0 — the pre-trade path gains a direction
+    gate from ticks 4/9 (last vs previous close). PRE-TRADE ONLY; it inverts on
+    the trade path. Defers rather than disables.
+  - SURGE_ITI_COLLAPSE_MAX_SESSION_AGE_SEC = 1.5 — Rule D capped to the first
+    1.5 s of the session (its classes differ only in WHEN they fire).
+  - On the 90-file corpus: pos 28/28 -> 24/28, neu 15/18 -> 9/18,
+    neg 23/44 -> 11/44.
+
+--------------------------------------------------------------------------------
+2026-09-18  2.3 -> 2.4  (trade-mole-2.4.py; 2.3 kept on disk. clerk-1.2.py:144
+            switched the same day — live on the NEXT clerk restart; a running
+            clerk keeps its imported 2.3. clerk-1.1 is unaffected, still 2.2.)
+--------------------------------------------------------------------------------
+  Second precision pass, on a corpus grown 90 -> 133 labelled files
+  (>= 2026-07-09). Report =
+  mole-outputs/surge-predictor-analysis-2026-09-18.md. Operator's objective this
+  round: minimise neg + 0.4*neu under a HARD floor of 33/39 positives, with NO
+  ADDED DELAY (rules stay same-tick; no confirmation window).
+
+      2.3 on the 133-file corpus:  pos 35/39  neu 14/23  neg 25/70  cost 30.6
+      2.4:                         pos 33/39  neu 12/23  neg 11/70  cost 15.8
+
+  Unlabelled control (206 replayable recordings >= 2026-07-09, never judged):
+  fires 78 -> 55, and ZERO fires added.
+
+  ORGANISING FINDING: 2.3 mixes RELATIVE rules (B, C, pre-trade — "is this tape
+  fast FOR THIS NAME") with ABSOLUTE ones (D, E — "is this tape fast"). Across a
+  universe whose historical ITI spans 0.4 s to 34,200 s an absolute bar means
+  different things at the two ends, and that is where the false fires were.
+  - SURGE_E_MIN_FLOW_X_BASELINE = 10.0 — NEW metric flow_x_baseline_5s =
+    dollar_rate_5s / (hist_trade_rate * hist_trade_size * last_price), both
+    sides lot-denominated so the ratio is unitless. Rule E was the only rule
+    with no baseline normalisation and the largest single source of false fires
+    (9 of 25). Leave-one-out: +9.0 cost for 1 positive. Plateau [5, 25].
+  - SURGE_D_MIN_VOLUME_5S = 20.0 lots — Rule D gains the dust filter Rule A got
+    on 2026-07-07 and D never had. +2.4 cost for 1 positive. ⚠ NARROWEST
+    plateau in the file, [18, 21]; re-check it first when new labels arrive.
+  - SURGE_C_MIN_CUM_DOLLAR = 80.0 lot-$ — Rule C gains a money gate. +2.0 cost,
+    0 positives. ⚠ Implemented INSIDE the condition, not as a filter on the
+    result: a blocked C must fall through to D/E/N on the same tick.
+  - SURGE_MIN_PX_VS_VWAP_PCT = -1.0 — NEW metric px_vs_vwap_pct, a global
+    direction gate on the trade path. +1.0 cost, 0 positives, plateau
+    [-8, -0.2] (40x). ⚠ Must stay strictly negative: at the first trade
+    vwap == price, so any gate at >= 0 is a float-equality knife edge.
+  - SURGE_N_MIN_PRICE_RISE_PCT = 0.04 — NEW branch N: the absolute-flow path
+    survives, at 4x Rule E's price bar. Buys back 1 positive (HIHO, a liquid
+    name with no relative signature) at ZERO cost, which pays for Rule D above.
+  - SURGE_NF_MIN_FLOW_X_BASELINE = None — NEW branch NF (extreme relative flow,
+    no price leg), measured and then SHIPPED OFF. Free and 0.48 s faster on the
+    labelled corpus, but the unlabelled set showed its four added fires are all
+    "1-2 prints, 0.00% price move, on a name that never trades" — Rule B's
+    start-staleness shape, which 2.3 switched off. Set to 700.0 to enable.
+  - RULE_C_ENABLED kill switch added (C is 2 positives for 1 negative).
+  - Positives spent: RUBI 2026-07-16 (D's size leg), VIVK 2026-08-21 (E's
+    relative leg). Latency: median 1.05 s -> 1.00 s, 29 of 31 unchanged, one
+    later (NNVC 13.77 -> 18.52 s).
+  - ⚠ The one _late_ label (CYAB 2026-08-31) no longer fires at all: it is a
+    liquid name (baseline ITI 0.8 s) whose flow at the 2.3 fire was 0.08x its
+    own baseline. No relative rule can see it; keeping it costs 9 negatives.
+  - TABLE: two appended columns, px_vs_vwap_pct and flow_x_baseline_5s.
+  - analyze_trade_mole/eval_rules.py gained: the _late_ label (tracked apart,
+    out of the weighted cost), N/NF reason classification, applicable_rules()
+    so --leave-one-out still runs against 2.2/2.3, and --set NAME=None.
+
+--------------------------------------------------------------------------------
+2026-10-02  2.4 -> 2.5  (trade-mole-2.5.py; 2.4 kept on disk and STILL LIVE.
+            clerk-1.2.py:144 was NOT switched — operator's call, then a clerk
+            restart.)
+--------------------------------------------------------------------------------
+  Third pass, on 192 labelled files >= 2026-07-09 (62 pos / 90 neg, 11 of them
+  unreplayable / 27 neu / 13 late). Report =
+  mole-outputs/surge-predictor-analysis-2026-10-02.md. Operator's objective:
+  total = neg + 0.4*neu + 3*(pos missed + late missed) ("1 good trigger only
+  for >= 3 bad ones"); a change that makes _late_ files fire earlier may add NO
+  neg fire; a confirmation wait <= 1 s allowed; inputs = data IBKR already
+  sends + news details + stock facts, no new requests.
+
+      2.4:  pos 54/62  neu 16/27  neg 24/90  late 12/13  total 57.4
+      2.5:  pos 54/62  neu 16/27  neg 24/90  late 12/13  total 57.4
+            late: median 5.8 s -> 3.9 s after the surge start,
+                  median +4.5% -> +2.5% above the surge-start price.
+
+  - SURGE_VWAP_GATE_RULES = ("A", "B", "C", "D", "NF") — the -1% VWAP gate
+    now holds only the rules with no price-rise leg; None = 2.4. ⚠ 2.4's gate
+    reads IBKR's WHOLE-DAY VWAP (the RTVolume field), not the session's own as
+    its docstring said, so a name that traded higher earlier in the day was held
+    on EVERY rule until the news move regained the old average. LESL 2026-09-30
+    +26.2 s -> +3.9 s (27.5% cheaper), LGHL +57.9 s -> +2.5 s (4.6% cheaper);
+    no other labelled file moves. Keeping the gate on D keeps PHGE 2026-07-24
+    (neg) out — dropping the gate, or reading the session's own VWAP, re-admits
+    it. Unlabelled (264 replayable): fires 74 -> 76, IMCC 2026-09-23 (+23% max
+    after) and SLE 2026-08-14 (fired live in August, stopped out -4.6%).
+  - RECORD-ONLY columns: true_day_volume, true_vol_5s, true_vol_x_normal_5s
+    (IBKR's day volume from tick 8 + tick-48 totalVolume, incl. the zero-size
+    messages; counts the sub-100-share prints the print path drops), and
+    tws_trade_count is now filled. ⚠ Tick 54 arrives via tickGeneric; only
+    tickSize handled it, so the column was empty in every recording and
+    _reconcile_trade_count has NEVER run. 2.5 records the count and still does
+    not call the reconciler (it would rewrite the trade log).
+  - NOT ADOPTED, measured: any veto at the trigger instant (held-out AUC
+    0.43-0.53 over every tape / hidden-volume / news / stock feature; one-file
+    plateaus only); a <= 1 s confirmation (unmeasurable: 102 of 106 fired files
+    have < 1 s recorded after the fire); a first-burst rule (good and bad share
+    the first-print signature); DEDUP_EXCLUDE_TWIN_FROM_COUNTS (57.4 -> 110.4)
+    and RATE_NORMALIZE_BY_SESSION_AGE (-> 61.4); news / stock-fact vetoes;
+    single-file timing tweaks (E price 1.15%, pre-trade gap 1.3 s, E flow 5,
+    N 3%). Every active rule pays for itself (leave-one-out +9.0 to +45.8).
+  - ⚠ Units: hist_baseline_trade_size is SHARES, live sizes LOTS — 2.4's
+    flow_x_baseline_5s is 100x understated (cosmetic; thresholds fit on it).
+  - Verified: SURGE_VWAP_GATE_RULES=None reproduces 2.4's decisions and fire
+    times on all 192 labelled + 472 unlabelled files, and every 2.4 column on
+    all 445 replayable files.
+  - analyze_trade_mole/eval_rules.py: total score, --timing, --against-*,
+    --unlabelled, --min-date/--max-date. NEW analyze_trade_mole/
+    session_context.py (news row, stock facts, end reason, offline surge start).
+    replay_mole._symbol_from_name strips every label prefix (was _pos/_neg/_neu
+    only; cosmetic).
+
+  2026-10-03 addendum (same file, operator request) — POST-TRIGGER TAIL.
+  - POST_TRIGGER_RECORD_SEC = 60.0 (0 / None = 2.4 behaviour). Recording no
+    longer stops at the buy-signal: every tick for 60 s, or until the clerk
+    tears the session down, is still recorded, flagged post_trigger=True. The
+    decision path is untouched — tail on vs off changes no decision on any of
+    the 192 + 472 files.
+  - Kept cheap because the clerk feeds the mole BEFORE x-wing on every tick:
+    tail trades skip ITIs, windows and should_fire() and are stored RAW
+    (_record_raw_trade); quote / size / generic / string ticks run their normal
+    body. Measured 3.6 us per trade message, 2.4 us per quote.
+  - Every tick handler split into a public callback + _tick_* body: before the
+    trigger the body runs exactly as 2.4 (column-identical on 445 files); during
+    the tail the same body runs flagged and wrapped in try/except, so a tail bug
+    can never raise into the clerk's fan-out.
+  - end_post_trigger(reason) closes the tail and stamps ONE POST_TRIGGER_END row
+    ("complete after 61.0s" / "session_end:<why> after N s"); a tail without it
+    was cut by a crash.
+  - write_records_output: snapshots app.records (the ibapi thread may still be
+    appending) and writes atomically (.tmp + os.replace) — the clerk now writes
+    the same path twice and daily-board may be reading it.
+  - Standalone main(): keeps collecting through the tail, then stamps the end.
+  - replay_mole.replay_file replays tail rows by default (skip_post_trigger=False)
+    so a stricter candidate CAN fire inside the tail; self_check skips them with
+    detection off, and drops POST_TRIGGER_END. VERIFIED on LESL 2026-09-30: 2.5
+    fires at +3.94 s and records 501 tail rows; that file self-checks (decisions
+    + tail); and 2.4's rules replayed on it find their own live fire, +26.22 s
+    @ 0.244, inside the tail — feature-identical except tws_trade_count.
+  - ⚠ The tail contains our own x-wing entry/exit prints — match xwing_tables
+    fills before reading it as the market's response.
+  - Needs clerk-1.2 (below) to be written at tail end; with clerk-1.1 the tail is
+    recorded in memory but never written (harmless).
+
+--------------------------------------------------------------------------------
+2026-10-03  clerk-1.2.py — writes the trade-mole post-trigger tail
+--------------------------------------------------------------------------------
+  - on_buy_signal: when the loaded mole has POST_TRIGGER_RECORD_SEC > 0 and its
+    tail is open, arms _tail_timer (tail + 1 s) -> _end_mole_tail("complete").
+  - finish(): cancels the timer, then ends a still-open tail with
+    "session_end:<reason>" and rewrites the CSV. Teardown is NOT delayed for the
+    tail (holding the client would starve the pool and delay T47), so a session
+    ended by the sentiment gate keeps a short tail.
+  - All mole CSV writes go through _write_mole(final) under _mole_write_lock:
+    the at-trigger write at most once, the post-tail rewrite at most once, and a
+    late first write never overwrites the final one.
+  - With trade-mole-2.4 loaded nothing is scheduled: identical behaviour.
+  - Tested offline with stand-in objects (no IBKR): tail completes by timer;
+    tail cut by a sentiment timeout at 2 s; 2.4 mole unchanged. NOT yet run
+    against a Gateway.
+
+
+--------------------------------------------------------------------------------
+2026-10-08  2.5 -> 2.6  (trade-mole-2.6.py; 2.5 kept on disk and LIVE:
+            clerk-1.2.py:144 names 2.5, the clerk was restarted 2026-10-04
+            20:12, the first recordings with a tail are dated 10-05. 2.6 is NOT
+            loaded — operator's call.)
+--------------------------------------------------------------------------------
+  Fourth pass, on 219 labelled files >= 2026-07-09 (66 pos / 101 neg, 10
+  unreplayable / 34 neu incl. 2 `_neu-late_` / 18 late), same balance as 10-02
+  (total = neg + 0.4*neu + 3*(pos missed + late missed)). Report =
+  mole-outputs/surge-predictor-analysis-2026-10-08.md. Operator's reasons for a
+  bad file: "little happens after the trigger" and "the price rises, then falls";
+  a confirmation wait <= 1 s allowed.
+
+      2.5, corrected baselines:  pos 58/66  neu 23/34  neg 31/101  late 16/18  total 70.2
+      2.6 (confirmation off):    identical on all 219 labelled + 473 unlabelled files
+
+  - NO RULE CHANGE. Every active rule pays for itself (leave-one-out: PRE +45.8,
+    D +41.8, N +26.2, E +24.2, C +6.0). One-at-a-time sweeps of 17 constants move
+    one or two files or add fires on unlabelled recordings (report section 3).
+    Option F, NOT adopted pending two labels: SURGE_ITI_COLLAPSE_MIN_TRADES_5S
+    3 -> 2 fires FNGR/VCIG (late) and CJMB/LABT (pos) 1.3-6.9 s earlier and 4-9%
+    cheaper, adds no labelled fire, adds AZI 2026-08-07 and FUSE 2026-08-04
+    (unlabelled).
+  - NEW, OFF: CONFIRM_WINDOW_SEC (None), CONFIRM_MIN_TRADES (1),
+    CONFIRM_MIN_DAYVOL_LOTS (None), CONFIRM_RULES. A trade-path signal is HELD
+    until CONFIRM_MIN_TRADES new trades (a twin report of one fill counts once)
+    have printed, or dropped when the window ends; a later signal can start a new
+    hold; the pre-trade path is never held. _confirm_gate() is called once per
+    trade event after _detect_surge(); off = the line is skipped. Evidence: on the
+    19 trade-path signals that carry a tail, "1 trade in 1 s" keeps 8/8 good,
+    3/5 grey, 2/6 bad (Fisher p 0.015 before ~9 checks tried); through the whole
+    mole on the 27 files from 10-05, total 9.8 -> 7.4, every good file still fires
+    0.01-0.75 s later. Against it: only 19 signals, the first print comes at a
+    median 0.25 s (RTVolume arrives in 250 ms batches) and the ask moved a median
+    2.8% / up to 11% on the good files during that wait. Turn on only after >= 40
+    trade-path tails keep >= 90% of the good ones.
+  - ANALYSIS ONLY: 15 labelled files (6 of the 18 late) recorded on 2026-10-01/02
+    were run with the 2026-09-29 stock list (the nightly job stalled in Step 1,
+    finviz 403). Only those 3 days since 07-09 were affected; no file has bad
+    content. Rebuilt with RetroUniverse-3 (paper GW 4002; 34/34 validation rows
+    within 1.6% of the real 09-29 file): values were off by 1.2x-212x but only 2
+    files change (CUPR no longer fires; TNMG 45.74 -> 38.73 s).
+  - Not a trigger: IBKR's hidden-volume surge start occurs on 50% of bad files
+    (29 bad vs 5 good among files 2.5 does not fire on).
+  - TOOLS (analyze_trade_mole/): eval_rules.py gained `_neu-late_`,
+    --baselines / --against-recorded-baselines, held-signal upper bound;
+    replay_mole.py BASELINE_OVERRIDES / load_baseline_overrides();
+    session_context.py corrected baselines; NEW make_baseline_overrides.py,
+    confirm_after_signal.py (--tails, --checks), early_signal_search.py,
+    sweep_constants.py, verify_confirm_gate.py. Data:
+    mole-outputs/baseline-overrides-2026-10-08.csv.
+  - Verified: eval_rules --against-module trade-mole-2.5.py -> 0 changes
+    (labelled and unlabelled); replay_mole --self-check --check-decisions
+    812/1681 for 2.5 and 2.6; verify_confirm_gate.py all checks pass.
 
 ================================================================================
 clerk  —  warm ibapi client pool + orch-trigger listener (runs the duos)

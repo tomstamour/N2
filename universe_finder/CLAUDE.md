@@ -90,6 +90,27 @@ leaves the pre-step file intact.
 - `--never-split-fill blank` (Step 11). The default `maxima` sentinel is derived
   from **the file's own** resolved rows, so a nightly file emits a different
   sentinel than the one frozen into the training corpus.
+- `--refresh` (Step 10). Alone among the steps, `vix_addOn` resolves its anchor
+  from **data availability**, not the calendar: the session index is whatever rows
+  the CBOE history holds, and `resolve_anchor` then returns the newest session at
+  or before the target with `problem=None` — no warning, no flag, no blank (it
+  even logs the miss as "non-session date (weekend/holiday)", wrong for a
+  Thursday). A cache too fresh to refetch therefore slides the whole VIX/FNG
+  block back a session, `FNG_Index` included. `--refresh` bypasses the 12 h TTL
+  for both caches (`load_history:315`, `load_fng_history:454`). Without it, any
+  v3 run between ~08:30 and 20:30 poisons that evening's cron. FNG rides the VIX
+  index (`fill_fng` reads `days[j]`), so it slides too even when CNN's own cache
+  has the right day. `_check_vix_anchor` then compares `VIX_AnchorDate` against
+  **`msc_anchor_date`** and WARNS on mismatch — `--refresh` cannot help when CBOE
+  has simply not published yet, which is the remaining cause.
+  ⚠ The reference is `msc_anchor_date`, NOT `Date`. `Date` is the calendar day the
+  file was produced; `msc_anchor_date` is the session `Sessions.resolve(Date, 0)`
+  landed on, and on a **weekend run those legitimately differ** (Sunday 2026-09-20
+  → Friday 2026-09-18). Comparing against `Date` made the check fire on both
+  2026-09-19 and 2026-09-20 while those files were perfectly aligned; fixed
+  2026-09-21. The equality the training corpus validated is
+  `VIX_AnchorDate == msc_anchor_date` (4804/4804 rows), and it is weekend-safe
+  because vix_addOn walks back to the same preceding session MSC does.
 
 **Borrow is gone.** Step 3.6 and all five `--borrow-*` flags removed: ~72 min of
 the run, 0 of the 49 model features, and grepping `orchestrator5/`, `x-wing-mole/`
@@ -106,12 +127,28 @@ which `xgb_cons49_se_prep.json` maps to frozen constants (46800.0 / 68400.0 /
 reads the canonical columns as `itiBaseline`/`tradeSizeBaseline`. Both views now
 ship. None of the three is in the current 49-feature allowlist — this is for retrains.
 
-**The 15 model features this file supplies:** `Float_M`→`Float`,
-`MarketCap_M`→`MktCap` (O5.2 renames), `SI_ChangePct`, `SVR_5dAvgPct`,
-`FNG_Index`, `atr_pct_14`, `float_turnover_max_20d`, `msc_basis_ratio`,
-`dist_swing_high_20d_pct`, `range_pct_1d`, `amihud_63d`, `realized_vol_5d`,
-`gap_abs_mean_20d`, `days_since_52w_low`, `illiq_trend`. The other 14 + 20 PCA
-are PR-level and belong to the O5.2 successor — see the module docstring.
+**The model features this file supplies.** ⚠ The live models changed on
+2026-09-20: O5.3 runs **model-2 + model-2FT**, whose 10 boosters share ONE
+25-feature allowlist (`training_data/model-2/xgb_fromPRhigh_features_*.txt` —
+`conservative` and `aggressive` are byte-identical, and model-2FT's five preps
+carry the same list). **9 of those 25 come from here**, and `_M2_UNIVERSE_FEATURES`
+in the script is that list:
+
+    Float_M→Float   MarketCap_M→MktCap   (O5.2/5.3 rename these two)
+    SI_ChangePct   atr_pct_14   float_turnover_max_20d   msc_basis_ratio
+    dist_swing_high_20d_pct   range_pct_1d   amihud_63d
+
+The other 16 are PR-level (`FineClass`, `TimeToOpen`, 6 encoder scores, 8 FinBERT
+PCA) and belong to O5.3. The superseded 49-feature model-1 took **15** from here;
+the 6 it used and model-2 dropped — `SVR_5dAvgPct`, `FNG_Index`,
+`realized_vol_5d`, `gap_abs_mean_20d`, `days_since_52w_low`, `illiq_trend` — are
+still emitted for retrains, and the end-of-run check still counts all 15.
+⚠ `msc_price_ref_src` and `FNG_Rating` appear in every prep's `cat_cols` but not
+in `features_used`; `cat_cols` is the whole training frame's categorical list, so
+they are not model inputs. Same for the three sentinel columns
+(`RTH_avgITI_sec`, `ETH_avgITI_sec`, `RTH_tradeSize`): the inference script
+substitutes 44444 on them unconditionally, but none survived the prune, so Steps
+4/7 overwriting the raw sentinel with an HGB prediction cannot reach the model.
 
 ⚠ **Accepted divergence:** `RegSHO_Flag`/`RegSHO_ConsecDays` get their 1-session
 publication lag by accident (the live SI addon walks back from `eastern_today()`
@@ -126,11 +163,128 @@ the new fetch, because dropping borrow (~72 min) more than pays for MSC (~60 min
 `cached[-1].date >= anchor`, so a new anchor misses every symbol and refetches a
 full 2-year series.
 
+**Step 1 finviz and the run lock (2026-10-03).** finviz has given no data since
+~2026-06 and answers HTTP 403 since ~2026-09-30. The old code read 403 as a rate
+limit and waited 30+60+90 s per symbol, so the 09-30, 10-01 and 10-02 crons all
+stalled in Step 1 (7020 symbols ≈ 5 days) and piled up on top of each other.
+Now only 429 is retried; 403 fails at once, and after 25 finviz failures in a
+row `NASDAQ_symbols_data` switches finviz off for the run (one WARNING line) —
+Step 1 is yfinance-only, and yfinance then waits 1.5 s (not 0.5 s) per request:
+without finviz's ~1 s call in between, 0.5 s drew yfinance 429s. Step 1 cold ≈
+65 min (was ~73 with finviz in the loop). `main()` also takes a non-blocking `flock` on
+`runs/pipeline_daily-3.lock` before anything else; a second run prints a line to
+`cron.log` and exits 1. Step 1 is only slow on a cold night (cache > 24 h).
+
+**Phone alerts (ntfy, since 2026-10-03).** Same ntfy topic as the IB Gateway
+alerts (`/home/tom/IBC/.secrets/ntfy.env`, read by `ntfy_alert.py`; the topic is
+never logged). Failures only — silence means the night was fine. Every alert,
+sent or not, is also appended to `runs/alerts.log`.
+- **blocked** — a run found the previous one still holding the lock (`_acquire_run_lock`).
+- **crashed** — `main()` raised; the traceback stays in `cron.log`.
+- **flawed** — the file was written but `_problems` is non-empty: Step 9/10/11
+  failed or its script is missing, VIX/FNG anchor ≠ MSC anchor, any of the 15
+  feature columns absent, fewer than 500 rows, or an IBKR step lost the Gateway /
+  tripped the contention canary. One alert per run lists them all.
+- **no file by 06:00** — `universe_watchdog.py` (cron 06:00 ET) checks that
+  yesterday's `stocks_universe_D.tsv` exists AND its per-day log says
+  "finished"; it reports whether that run is still going and the log's last line.
+  This is the only one that catches a hang or a kill.
+Test: `ntfy_alert.py --test`; `universe_watchdog.py --date 2026-09-30 --dry-run`.
+
 Cron entry: `30 20 * * * /home/tom/venv/bin/python3 …/daily_universe_pipeline-3.py
 --port 4002 --freq-concurrency 2 --freq-timeout 60 >> runs/cron.log 2>&1`
 (the crontab block already exports `TZ=America/New_York`, which is what makes
 `datetime.now()` in `_session_date` an ET date). Per-day log is
 `runs/{DD-MMM-YYYY}/pipeline_daily-3.log`.
+
+---
+
+## `RetroUniverse-3.py` — pipeline-3's columns for PAST PRs (since 2026-10-03)
+
+Input: any TSV with `Symbol` + `ArrivalDate`. Output `<stem>_RetroU3.tsv` beside it:
+every input row in order + the 150 universe columns (pipeline-3's 147 − `Symbol`
++ 4 `LastSplit_*`) exactly as `stocks_universe_<ArrivalDate−1>.tsv` would hold
+them + `RU3_*` provenance and marketcap_backfill's `MarketCap_Source/AsOf/LagDays`.
+Replaces the hand-run `--days-prior 1` chain of
+`price_stats_loader/training-set-construction-steps.md`. Colliding input columns
+are kept as `<name>_input`.
+
+**Universe orientation.** `resolve(A,1) == resolve(A−1,0)` on every calendar day,
+so it builds a work table W (one row per unique (Symbol, ArrivalDate),
+`Date = A−1`) and replays each addon against `Date` at `--days-prior 0`, as the
+nightly does per file. ⚠ Every addon auto-detects `ArrivalDate` BEFORE `Date`,
+so `Date` is always passed explicitly; only marketcap_backfill keeps ArrivalDate
+and its own `--days-prior 1`.
+
+**Steps.**
+- S1: Float_M / Float_Source / Exchange are joined from the served-by snapshot.
+- S2: an ADDITIVE split-cache refresh, then the IBKR RTH close × forward split factor (see Splits). When IBKR no longer serves a symbol (delisted since), it falls back to the nightly's own close, but only from a snapshot whose true session is the row's anchor (`RU3_Close_SplitAdj=snapshot`). That same snapshot referees every close: ≥1.2× off it means yfinance dates a split on another session than IBKR applied it (RUBI: ex 10-06 on yfinance, 10-05 at IBKR → 1.05 vs 0.70), and the snapshot's close is used (`refereed`, since 2026-10-09). S8 runs `--split-source both` so its trade-size restatement follows — which also stops the backfill from undoing a split IBKR has not applied yet (NIVF/NXGL/ZBAO went ex on the run day 10-09; with `yfinance` their sizes were 4×/20×/50× too large).
+- S3: marketcap_backfill, unchanged.
+- S4: SI backfill with `--skip-borrow-history`.
+- S5: vix.
+- S6: splits with `--eod-fallback --never-split-fill blank`.
+- S7: MSC, chunked by symbol; symbols with a split after their anchor run in separate `mscnc_*` chunks on fresh bars, through a private `--cache-dir` (`<work>/msc_cache/`: empty `bars/` + a link to the shared `splits/`). ⚠ Never MSC's `--no-cache`: it also skips the split cache and asks yfinance live, which on 2026-10-09 listed only NIVF's split of that day and dropped seven older ones (`msc_split_*` read "no split").
+- S8: TFB, chunked by unit, plus a Step-3.5-style retry.
+- S9: imputers POOLED over the input.
+
+**Live-file semantics** everywhere (operator decision 2026-09-28):
+- borrow is blank;
+- LastSplit hours are measured to Date 20:00;
+- the close is the anchor session's RTH close;
+- the MSC referee is a dir of snapshot symlinks renamed to each file's TRUE session (`universe_session_map.tsv`), else this run's own close.
+
+Float_M is blank when the symbol is not in the served-by file. That is always the case before 2026-05-14, where `RU3_FilterReason=float_missing`.
+
+**Resume.**
+- Work dir: `runs/retro/<stem>[_limitN]/` (W.tsv, msc/ and freq/ chunks, per-addon logs).
+- Every step and chunk is marker-guarded, so after any failure re-run the same command. `--fresh` restarts.
+- Exit code 1 means something is incomplete.
+
+**Safety.**
+- It never writes into `data/`: RTPR_connector3 loads the newest-*created* `stocks_universe_YYYY-MM-DD.tsv` there as the live list.
+- Before each IBKR step or chunk it waits while `daily_universe_pipeline-3.py` is running, or between 20:05 and 20:40 ET (`--no-yield` overrides). It detects the nightly through `/proc` and never touches `runs/pipeline_daily-3.lock`.
+- It refuses ports 4001/7496 without `--allow-live-gateway`.
+- ClientIds: 81 (close), 82 (TFB), 83 (MSC).
+- Every split lookup runs at max-age 36500, but only AFTER S2 has refreshed the cache additively (next section).
+
+**Splits — 36500 alone is wrong for past anchors.** A past anchor needs every split *after* it. The 09-07 cache files lacked CDT's and TRUG's 2026-09-29 reverse splits, so the first smoke run read:
+- closes 25× and 10× off;
+- `msc_basis_ratio` 25 and 10;
+- trade sizes divided by 25.
+
+So S2 re-queries yfinance with `fetch_splits(use_cache=False)`, which never writes, and **merges by ex-date into `tools/market_state/tables/splits/`**:
+- new ex-dates are added;
+- a factor that differs beyond float noise takes yfinance's value;
+- an ex-date yfinance dropped is kept (the delisted-symbol wipe);
+- a failed lookup changes nothing.
+
+Verified against a full copy of the cache: 0 ex-dates lost or changed, only real splits added.
+
+MSC's split arithmetic also assumes bars pulled *on* an ex-date are still pre-split. That was true for ARTL, but CDT and TRUG were pulled already adjusted by the 09-29 nightly, and no referee can reconcile that. So split-straddling symbols get fresh bars (a private `--cache-dir`, see S7). `--no-split-refresh` skips the refresh for offline re-runs.
+
+⚠ **Live consequence.** The nightly's own 36500 never refreshes an existing list. Its `msc_split_*` columns therefore go stale for any symbol that split after its file was written:
+- ALP's 09-09 1-for-50 split was absent from `stocks_universe_2026-09-21.tsv`, which reads `msc_split_sessions_since` 525 where the truth is 8;
+- `msc_split_sessions_since` is a model-3 input.
+
+**`--compare-live`** writes `<out>_vs_live.tsv`: per-column agreement with the real snapshot of each row's Date. Checked offline on PRs from 09-18 to 09-24:
+- Float_M, MarketCap_M, Float_Source, Exchange and Date, plus all 24 SI columns, agree 100%.
+- `FNG_Index` differs on about every row: live holds CNN's provisional same-day score, the history holds the settled one. It is not a model-2/3 input.
+- The 09-23 nightly's VIX/FNG block is a session behind (CBOE was late); retro has the right anchor.
+
+Pooled imputation over one real night (09-25) reproduced that night's 8 imputed columns on 824/824 rows.
+
+**Validated 2026-10-03.**
+- **Live acceptance**: 232 PRs from 09-18 to 09-24 against their real snapshots, 16 min.
+  - Everything outside the market-state block agrees 100%: Float_M, MarketCap_M, Exchange, Date, the close, the 24 SI columns, and VIX except the 09-23 rows (that nightly is a session behind).
+  - Volume- and range-based msc features drift by at most ~3%, because IBKR revises bars after the night.
+  - `msc_split_*` differs only where the nightly's split cache is stale.
+- **Training cross-check**: 100 rows of `08_…_RawData_splits`.
+  - All 67 msc features agree on 98% of rows; the rest are symbols IBKR no longer serves.
+  - Raw ITI and trade size agree within 1e-3 on 95/100 rows; LastSplit Date/Factor on 62/62.
+  - The deliberate differences are borrow, the close definition (RTH, versus the old extended-hours/orchestrator close) and the referee ratio.
+  - ⚠ CNN revises its F&G history: the FNG_ block for 07-15..08-27 differs from the corpus's 09-05 fetch, so F&G is not point-in-time. It is a model-1 input only.
+
+**Cost.** TFB takes about 2.7 s per unit at concurrency 2, so 4.7k units is about 3.5 h. MSC takes 1–2 h uncached for about 1.3k symbols, and minutes when the nightly's bar cache already covers the anchors.
 
 ---
 
@@ -192,6 +346,8 @@ Recomputes `RTH_avgITI_sec, ETH_avgITI_sec, RTH_tradeSize, ETH_TradeSize` as of 
 **`--days-prior` vs `--past-days-lookback` — do NOT confuse.** First shifts the anchor (which nightly run to replay); second is the window length (defaults both to 1).
 
 ⚠️ **Share splits are CORRECTED on trade-size columns.** IBKR back-adjusts historical volume; ITI (transaction count) is immune, but trade size (volume/count) scales by cumulative split factor. `yfinance` leads; a price probe audits discrepancies outside ±2%.
+
+⚠️ **`--split-max-age-days`** (since 2026-10-03; the default of 1 is unchanged and is MSC's own). Pass 36500 for historical work. A refresh overwrites a delisted symbol's split history with "never split" (NTZ, OMH), and the restatement then silently uses F=1.0. RetroUniverse-3 always passes 36500.
 
 ---
 

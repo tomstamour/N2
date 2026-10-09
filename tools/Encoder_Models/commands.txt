@@ -1,0 +1,4 @@
+python3 BodyScore11encoders.py --input ../../price_stats_loader/outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip.tsv --cap-words 200 --body-col Body
+
+##
+python3 HeadScore11encoders.py --input ../../price_stats_loader/outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip_11EncBodyScored.tsv --headline-col Headline

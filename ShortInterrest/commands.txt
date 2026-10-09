@@ -1,0 +1,25 @@
+# ── SI / squeeze backfill of a PR-stats corpus ───────────────────────────────
+# Step 1 builds the IBKR borrow-rate cache (the ONLY step that needs a Gateway).
+# Run it against the IDLE PAPER GW — the live one drops bulk historical under
+# contention. Resumable: an already-cached symbol is skipped unless --overwrite.
+
+python3 ibkr_rates_fetch_AddON.py \
+--input ../price_stats_loader/outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip_11EncBodyScored_11EncScored_mktstate.tsv \
+--port 4002 \
+--clientID 63 \
+--log logs/ibkr_rates_fetch.log
+
+# Step 2 is offline and re-runnable. --ibkr-rates sources CTB_FeePct /
+# CTB_RebatePct / CTB_FeeDelta5d from that cache instead of the iBorrowDesk one,
+# which ends at fetch date 2026-07-21 and only ever held 809 symbols.
+# Borrow_Available / _AvailDelta5dPct / _UtilProxy are NOT recoverable — IBKR has
+# no historical shortableShares — so they stay blank where iBorrowDesk misses.
+
+python3 ShortInterrest_backfill_AddON.py --input ../price_stats_loader/outputs/PRstats_2026-05-04-2026-08-28-CoffeeFltrd_fromPRhigh_noSkip_11EncBodyScored_11EncScored_mktstate.tsv \
+--log SI_backfill-2.log \
+--date-col ArrivalDate \
+--float-column-name Float \
+--lastClose-column-name LastDailyClose \
+--ibkr-rates \
+--overwrite \
+--days-prior 1

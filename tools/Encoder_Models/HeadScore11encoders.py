@@ -68,10 +68,15 @@ MODELS = {
 PROGRESS_EVERY = 250
 
 
-def _load_module(script_name: str):
-    """Import a headliner by file path (several filenames contain hyphens)."""
+def _load_module(script_name: str, base: Path = HERE):
+    """Import a headliner by file path (several filenames contain hyphens).
+
+    `base` is the directory holding the script; it defaults to this directory
+    and is only overridden for the one headliner living outside it (ProsusAI
+    FinBERT, used by BodyScore12encoders.py).
+    """
     mod_name = "headliner_" + script_name.replace("-", "_").removesuffix(".py")
-    spec = importlib.util.spec_from_file_location(mod_name, HERE / script_name)
+    spec = importlib.util.spec_from_file_location(mod_name, Path(base) / script_name)
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
     spec.loader.exec_module(module)
@@ -84,14 +89,18 @@ def _fmt(value) -> str:
     return str(value)
 
 
-def score_table(rows, headline_idx, model_names):
-    """Append one column block per model to every row, one model at a time."""
+def score_table(rows, headline_idx, model_names, registry=MODELS):
+    """Append one column block per model to every row, one model at a time.
+
+    `registry` defaults to MODELS; BodyScore12encoders.py passes an extended one
+    whose Prosus entry carries a `path` key (the script lives outside HERE).
+    """
     n = len(rows)
     for name in model_names:
-        cfg = MODELS[name]
+        cfg = registry[name]
         keys = cfg["keys"]
         print(f"[{name}] loading …", flush=True)
-        module = _load_module(cfg["script"])
+        module = _load_module(cfg["script"], cfg.get("path", HERE))
         module.load_model()
         score_fn = getattr(module, cfg["fn"])
         score_fn("warm up")  # cold-start pass so row timings are warm

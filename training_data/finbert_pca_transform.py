@@ -26,7 +26,7 @@ import joblib
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "finbert_pca.pkl"
+MODEL_PATH = HERE / "model-1" / "finbert_pca.pkl"
 
 _M = None
 

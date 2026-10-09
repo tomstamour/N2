@@ -4,7 +4,7 @@ One standalone process that turns the RTPR firehose news stream into (a) a daily
 TSV of scored press releases and (b) real-time arm/sentiment trade signals to the
 clerk's warm IBKR client pool.
 
-Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
+Constant across 5.0 / 5.1 / 5.2 / 5.3 / 5.4 (architecture unchanged):
   - Standalone feed-client of RTPR_connector3 over loopback TCP 127.0.0.1:8900
     (successor of orchestrator3/Orchestrator4.2.py).
   - Reception in _on_row_built (main/feed thread, kept lean) -> per-ticker
@@ -15,16 +15,32 @@ Constant across 5.0 / 5.1 / 5.2 (architecture unchanged):
     local arm-block excluded_strings-2.txt.
   - Clerk handshake: STEP 1a ARM on reception, STEP 1b SENTIMENT "OK"/"BAD" after
     scoring. Missed-while-disconnected PRs are dropped by design (gap logged).
-  - Run exactly ONE orchestrator at a time — never two of 5.0/5.1/5.2 (double-arm).
+  - Run exactly ONE orchestrator at a time — never two of 5.0/5.1/5.2/5.3/5.4
+    (double-arm).
 
-Current version: Orchestrator5.2.py.  5.1 and 5.0 are frozen predecessors.
-NOTE: 5.2 has been extended IN PLACE eight times since 2026-07-20 (keyword-leg
-replacement 07-28, FLANG third leg 07-29, Trigger column 07-29, OR->AND gate retune
-08-01, earnings branch 08-02, three solo branches 08-03, gate externalized to
-orchestrator_trigger_rules.txt 08-07, class-whitelist precondition 08-17).  There is
-no 5.3 — the dated sections below are the only record of which gate/schema a given
+Current version: Orchestrator5.5.py (LIVE since 2026-09-27 11:23) = 5.4 + the FM3 shadow
+lane (logged only); see the O5.5 section at the end. Edited IN PLACE 2026-09-28 (operator's
+choice): + kw15_FT beside kw15, 75 columns, in-place header upgrade — see "O5.5 rev
+2026-09-28" (pre-edit file: Orchestrator5.5.py.bak-20260928). Edited IN PLACE again
+2026-09-29: + the S4 kw columns beside kw15/kw15_FT (score-only, no gate rule), 77
+columns — see "O5.5 rev 2026-09-29". Edited IN PLACE again 2026-10-07: a NEW GATE (3 rules
+on 6 priority models) + the late stage, 79 columns — see "O5.5 rev 2026-10-07" at the very
+end (pre-edit files: *.bak-20261007; old rules: orchestrator_trigger_rules.pre-20261007.txt).
+5.4 (2026-09-24, model-3 + the
+scoring engine) is the one-step rollback — same rules file.  5.3 (2026-09-18) is the one-line rollback;
+5.2, 5.1 and 5.0 are frozen.
+NOTE: 5.2 was extended IN PLACE eight times between 2026-07-20 and 2026-08-17
+(keyword-leg replacement 07-28, FLANG third leg 07-29, Trigger column 07-29,
+OR->AND gate retune 08-01, earnings branch 08-02, three solo branches 08-03, gate
+externalized to orchestrator_trigger_rules.txt 08-07, class-whitelist precondition
+08-17).  The dated sections below are the only record of which gate/schema a given
 day's TSV was written with, and from 08-02 the gate changes no longer change the
 schema at all.
+
+5.3 is the first NEW FILE since 5.2 (2026-09-18).  It adds the XGBoost leg and
+changes the schema 42 -> 101 columns; it does NOT change the gate, which is why it
+is a new file rather than a ninth in-place extension — 5.2 stays runnable and the
+two can be diffed.  See the 2026-09-18 section at the end.
 
 !! FROM 2026-08-07 THE GATE IS NOT IN THE PYTHON.  Rules live in
    orchestrator5/orchestrator_trigger_rules.txt, one rule per line, read ONCE at
@@ -1091,3 +1107,1212 @@ Verified:
    only), then confirm the [Gate] ACTIVE block in logs/ shows the REQUIRE line.
    replay_gate.py's --verify-since default was bumped to 2026-08-18 accordingly;
    until the first post-restart trading day that window is legitimately empty.
+
+================================================================================
+2026-09-18 — Orchestrator5.3.py: the XGBoost leg  (NEW FILE; 5.2 frozen)
+================================================================================
+WHAT IT IS.  Every PR is now scored by the 7-model XGBoost family trained in
+training_data/ (steps 21-25 of price_stats_loader/training-set-construction-steps.md),
+at reception, live.  5.2 could not: XGBoost_inference_script.py reads a row out of a
+finished training TSV, which does not exist at PR time.  5.3 computes all 49 features
+from the PR text + the daily universe file and predicts inline.
+
+!! THE TRADE GATE IS UNCHANGED.  Same orchestrator_trigger_rules.txt, same five
+   rules, same one precondition, same five scorers deciding it.  Verified: 434 rows
+   of the 09-1x tape replay through 5.2's and 5.3's _evaluate_trigger with ZERO
+   mismatches on is_ok, the fired-rule label, the full Trigger cell and
+   missing_blocked; and `--check-rules` output is byte-identical to 5.2's apart from
+   one added status line.  kw15 is retained untouched and still feeds three of the
+   five rules (300 rows re-derived from their own Body/Headline: bit-exact, max diff
+   0.00e+00).
+
+WHERE THE LEG SITS RELATIVE TO THE TRADE — the one thing to understand.
+  Shipped state, _gate_needs_xgb False: STEP-1b sentiment goes out on the five
+  original scores at 5.2's latency and the ~917 ms leg runs afterwards, delaying only
+  the TSV row.  MEASURED on single PRs: sentiment at a median 71 ms from reception,
+  TSV row at 963 ms.  Trade latency is unchanged.
+  Opt-in, _gate_needs_xgb True: naming ANY Xgb_* / new-encoder / TimeToOpen field in
+  a rule flips the leg in FRONT of the gate, so every sentiment send then waits for
+  it.  The flag is derived from the rules FILE at startup, so this is an edit plus a
+  restart like every other gate change — never a code change.  --check-rules reports
+  which mode the gate is in, and _load_trigger_rules logs a WARNING naming the
+  fields when it is blocking.
+
+MODELS (7).  cons49_se, cons49_q80, clf_ge20/35/50 + aggr_se, aggr_q80.  All seven
+share one 49-feature vector; the aggressive pair reads an 18-feature strict subset,
+so it costs one extra DMatrix build and no extra model work.
+  NOT run, deliberately: cons_se / cons_q80 need FLElectra_ss_bd.1 (FLANG-ELECTRA on
+  the body, ~1 s/PR — the exact feature dropped when cons49 was built, for that
+  reason); xgb_fromPRhigh_reg / _q80 need all 283 training columns.
+!! Predictions use iteration_range=(0, best_iteration+1).  XGBoost_inference_script's
+   own predict_one() omits it and therefore uses ALL rounds (336 vs the 235 early
+   stopping chose for cons49_se), which is a different number — verified 2.3004 vs
+   2.3044.  Same defect score_val_predictions.py had before its 2026-09-16 fix.
+   Prediction parity vs that script WITH the fix applied: max |diff| 4.8e-07 across
+   all 7 models on 8 corpus rows.
+
+!! THE 200-WORD BODY CAP IS AN OPERATOR DECISION (2026-09-18), taken for latency —
+   it saves 122 ms on the Prosus body call alone (213 -> 91 ms).  It is FAITHFUL for
+   FinancialB_ss_bd.1, TradeHero_pos_bd.1, TradeHero_ss_bd.1 and all bd_pca_*, which
+   were built by BodyScore11encoders --cap-words 200 / finbert_embed_core's
+   BODY_CAP_WORDS=200; re-scoring corpus rows reproduces them exactly (30/30, and
+   1e-6 on the PCA columns).  It is a DELIBERATE DIVERGENCE for Prosus_neg_bd and
+   Prosus_ss_bd, which came from FinBERT_TSV_scorer.py — a script with no body_prep
+   import at all, feeding the uncapped Body cell.  Measured on 30 corpus rows: the
+   raw body reproduces the stored value 30/30, the 200-word prep 0/30.  Those two
+   features rank 15th and 19th-23rd by gain.  Accepted knowingly.  DO NOT "fix" this
+   back without re-reading this paragraph.
+   The ge15 keyword scorer is NOT affected: it keeps its own 400-word cap and its own
+   _kw15_prep cleaner, because it costs a few ms (so capping saves nothing) and it is
+   a live GATE input, where changing the text window would change which PRs trade.
+
+SCHEMA 42 -> 101 COLUMNS, appended last so every existing ordinal is unchanged:
+  +2   BroadClass, TimeToOpen
+  +21  RoBERTa / DeBERTa / TradeHero *_hd blocks (at,pos,neu,neg,ss,lab,ms)
+  +21  Prosus / FinancialB / TradeHero *_bd blocks — the first BODY scores this
+       pipeline has ever written live
+  +7   Xgb_reg_se, Xgb_reg_q80, Xgb_clf_ge20/35/50, Xgb_aggr_se, Xgb_aggr_q80
+  +1   Xgb_status   ok | disabled_universe | no_embedding | not_loaded | error
+  +7   Xgb_hdx_ms, Xgb_body_ms, Xgb_embed_ms, Xgb_feat_ms, Xgb_predict_ms,
+       Xgb_total_ms (reception -> prediction wall clock, includes queueing), Xgb_at
+!! The four regressors are in PERCENT (predicted fromPR_High(%)), not 0-1.  The three
+   classifiers are 0-1 but are NOT calibrated probabilities — each was fit with
+   scale_pos_weight = neg/pos, so they rank, they do not state odds.
+!! A blank Xgb_* cell is never ambiguous: read Xgb_status on the same row.
+
+UNIVERSE DEPENDENCY.  13 of the 15 structured features exist only in a
+daily_universe_pipeline-3 file (147 cols, first written 2026-09-17); an older file
+has 38 columns and none of them.  5.3 checks at startup AND after every 03:00 reload.
+If they are absent it logs a WARNING, sets Xgb_status='disabled_universe', writes the
+Xgb_* cells empty and KEEPS TRADING on the existing gate — trading must not stop for a
+model that is not gating.  The one exception is _gate_needs_xgb True, where it is a
+startup hard-fail, because a gate cannot be evaluated on features that do not exist.
+!! Blank != 44444 in those 13 columns.  pipeline-3 writes an empty string when a
+   market-state cell is uncomputable, on purpose, because XGBoost would split on
+   44444 — while the ITI/trade-size columns in the SAME file keep the 44444 sentinel.
+   Two conventions in one file.
+!! Float_M / MarketCap_M feed Float / MktCap UNCONVERTED.  Both are already in
+   millions and the training columns came from the same source at the same scale.
+!! msc_basis_ratio sits at ~1.0 on every live row (832/833 on 09-17) where the
+   training column has real tails — known train/serve skew, inherent to point-in-time
+   inference.
+
+NEW: --check-xgb, the XGBoost twin of --check-rules (~2 s, no sockets).  Loads the 7
+models, asserts _XGB_FEATURE_SOURCES covers every feature of every one of them (a
+retrain that adds a feature fails HERE, naming it, instead of scoring a silent NaN
+forever), echoes the mapping, checks the universe file, and scores a synthetic row.
+Run it after any retrain.
+
+THREADING — measured, and it is not what you would guess.  More threads do NOT make
+this faster: one ONNX inference already saturates all 8 cores through ORT's intra-op
+pool.  Interleaved A/B over the three leg stages, 24 runs each: 926 ms sequential in
+ONE worker vs 997 ms across three concurrent pools.  So the leg is one task on one
+worker running its stages back to back; the pool exists only to overlap the leg with
+the clerk-arm round-trip and the gate's own scorers.  OMP_NUM_THREADS has no effect
+(ORT uses its own pool).  Capping intra_op_num_threads does work and is bit-identical
+(max diff 0.000e+00 across 1/2/3/4 threads) but only shifts CPU between models.
+
+COST (12 real articles, medians; moves with CPU frequency, observed 788..1251 ms):
+  headline encoders 192 ms | body encoders 285 ms | embedding+PCA 416 ms
+  leg total 917 ms (p90 1062) | features+DMatrix 12 ms | 7 boosters 1 ms
+
+--------------------------------------------------------------------------------
+2026-09-19  PR classifier moved onto the shared 200-word body string (5.3, in place)
+--------------------------------------------------------------------------------
+The classifier was the last body consumer in 5.3 still reading its own window: it
+classified the first PrClassifier.BODY_LEAD_CHARS (1500) CHARACTERS of
+clean_inline_text(body_raw), while the three body encoders and the FinBERT embedder
+all read _prep_body_200 (body_prep.clean_body + first XGB_BODY_CAP_WORDS = 200
+words).  It now reads that same string.
+
+WHAT CHANGED
+  - body_200 = _prep_body_200(news_dict) is built in _on_row_built BEFORE the five
+    submits (it was between them) and passed to _classify_and_score_earnings, which
+    gained a third parameter.  ONE prep per article, one string, four consumers —
+    two independent preps could silently diverge.
+  - _classify_and_score_earnings: classify_pr(body_cell[:PRCLASS_BODY_LEAD_CHARS])
+    -> classify_pr(body_200).  PRCLASS_BODY_LEAD_CHARS is no longer imported.
+  - The earnings SCORER is untouched: earn_extract_metrics still gets the full
+    body_cell, so EarningScore is bit-identical.
+  - The headline path is untouched (classify_pr(headline, headline=True)), so the
+    startup smoke check still passes.
+
+!! THIS CHANGES WHAT TRADES.  FineClass feeds the REQUIRE ClassWhitelist
+   precondition (fails closed) and is the first condition of the EARNINGS branch.
+   Measured over the 4804-row 2026-05-04..08-28 corpus (training_data/08_..._reCat.tsv,
+   produced by the offline twin `PrClassifier.py --body-200w`):
+     95 rows (2.0%) changed class, ALL of them rows whose headline was Other —
+     the headline-decided 2914 rows are unchanged, verified.
+     Other 666 -> 639 | MA +9 | Clinical_Update +7 | Partnership +7 |
+     Contract_Award +6 | Offering_Financing +4 | Legal -7 | Product_Launch -4.
+     Earnings_Results (700) and Crypto_Treasury (51) are IDENTICAL and cannot move:
+     both are in PrClassifier.BODY_EXCLUDED_CLASSES, so the EARNINGS branch neither
+     gains nor loses a row.  The whitelist churn is in MA/Partnership/
+     Contract_Award/Clinical_Data, which DO gate trades.
+   Not measured here: which PRs the gate would now fire on.  replay_gate.py over
+   that corpus is the tool; run it before restarting a live orchestrator.
+
+WHY THE NARROWER WINDOW MATCHED *MORE*, NOT LESS (body fallback 1224 -> 1251 rows)
+   200 words is ~1300 chars, slightly SHORTER than 1500 — but clean_body first cuts
+   the wire dateline, the verbatim headline repeat and the tracker URLs, so 200 words
+   of prose reach further into the actual article than 1500 raw chars did.
+
+OFFLINE TWIN
+   PrClassifier.py --body-200w [--fine-col X --broad-col Y] reproduces this exactly
+   (it path-loads the same body_prep module and applies the same clean_inline_text).
+   Without the flag the script is byte-identical to before — verified on the same
+   4804 rows, 0 differing labels — so past _Classed files and 5.2 are unaffected.
+   ⚠ The corpus Body cell is capped at 400 words upstream; 0 of 4804 rows cleaned
+   down to under 200 words, so the offline window is never short of what live saw.
+
+--------------------------------------------------------------------------------
+2026-09-19  PrClassifier `Legal` rule widened — affects 5.2 AND 5.3
+--------------------------------------------------------------------------------
+Not an orchestrator change; a RULES change in tools/categorizer/PrClassifier.py that
+both live orchestrators pick up on their next restart.  Recorded here because it
+moves rows across the ClassWhitelist.
+
+The Legal rule missed the plaintiff's-firm NOTICE grammar on the headline
+("<Firm> Investigates ...", "DEADLINE NOTICE", "Shareholders Are Encouraged to Reach
+Out to <firm>", "Did X Insiders Breach their Fiduciary Duties?").  Those headlines
+matched nothing, fell to the body, and came back labelled with the ISSUER'S BUSINESS
+— every "Halper Sadeh is Investigating Whether X is Obtaining a Fair Price" was MA,
+AARD's notice was Clinical_Data, ANGI's was Contract_Award.  All three are
+whitelisted classes, so a law-firm PR was trade-eligible.
+
+Measured over the 4804-row corpus, on top of the 200-word body change above:
+  34 rows move INTO Legal, all headline-decided, all genuine notices.
+  18 leave the ClassWhitelist, ZERO enter.  No genuine catalyst PR is taken.
+  8 rows LEAVE Legal (TRAW, ADGM, OPTH, PBM, SURG…): the old unanchored
+    `investigation` matched investigationAL, so ordinary biotech/mining bodies
+    carried the class.  Same family as the 2026-08-07 `rmat` bug.
+  Combined with the 200-word window, vs the labels the corpus shipped with:
+    129 rows changed | 31 enter the whitelist | 25 leave | Legal 78 -> 97 |
+    Other 666 -> 647 | Earnings_Results 700 and Crypto_Treasury 51 UNCHANGED.
+
+BODY_OVERRIDES["Legal"] is new and load-bearing: the investigate-family and the
+notice grammar are headline-strength only.  Over body prose a clinical study that
+"investigated" an endpoint, an SEC matter and a reply to a short-seller report all
+fire.  The body path keeps litigation NOUNS only.
+
+
+--------------------------------------------------------------------------------
+2026-09-20  Orchestrator5.3 — the XGBoost leg moves to model-2 + model-2FT
+--------------------------------------------------------------------------------
+Refactored IN PLACE, not forked into a 5.4.  5.3 had never run live: 5.2 was the
+running process from 09-18 to 09-20 and every file in tables/ is still 42 columns,
+so there was no corpus and no process to protect.  The 101-column model-1 build
+therefore exists only in this file's history.
+
+WHAT MOVED
+  7 boosters on 49 features (training_data/model-1/)
+    ->  10 boosters on 25 features (training_data/model-2/ and model-2FT/)
+  Five kinds each: se, q80, ge20, ge35, ge50.  Columns are
+  se_m2 q80_m2 ge20_m2 ge35_m2 ge50_m2 and the same five with _m2FT.
+  All ten share ONE feature list in ONE order; only the winsor bounds differ
+  between the two dirs, so it is 2 DataFrame/DMatrix builds, not 10 and not 1 —
+  discovered by preprocessing signature, not assumed.
+
+  model-2 retrained on corrected data (Prosus body rescored at 200 words,
+  FineClass/BroadClass recategorised) then SHAP-pruned 49 -> 25.  It measures
+  INDISTINGUISHABLE from model-1 (every paired CI contains 0) on half the inputs.
+  model-2FT is the same 25 features and the same hyperparameters refit on 100% of
+  the rows with NO held-out fold; its round count is fixed from model-2's early
+  stop.  There is no held-out score for it at all — q80_m2FT least of all, 4000
+  rounds with no early-stop safety net.
+
+WHAT WAS DROPPED, AND WHY IT WAS SAFE
+  RoBERTa on the headline   RoBERTa_neg_hd.1 is not a model-2 feature.  ~9 ms.
+  Prosus on the BODY        model-2 reads no Prosus_*_bd at all.  ~91 ms.
+  model-1's 7 boosters      superseded.
+  6 of 13 universe features not in the 25.
+  Nothing the GATE reads was touched.  ⚠ The trap here is FinMarBa: model-1 read
+  FinMarBa_ind_hd.1 and model-2 does not, but FinMarBa feeds CORE, KwBodySolo and
+  FLANGSolo.  "Only score what the models need" is scoped to _XGB_FEATURE_SOURCES
+  and says nothing about what the gate needs.  Same for Prosus on the HEADLINE
+  (CORE, FinBERTSolo) and both kw15 channels.
+
+THE 200-WORD DIVERGENCE IS RESOLVED
+  Under model-1, Prosus_neg_bd / Prosus_ss_bd were a known, accepted divergence:
+  their producer FinBERT_TSV_scorer.py has no body_prep import and fed the raw
+  uncapped cell, so the raw body reproduced the stored value 30/30 and the 200-word
+  prep 0/30.  model-2 closed it from both ends — the corpus rescored those columns
+  at 200 words AND the allowlist dropped them.  Measured on 24 corpus rows, every
+  body feature the live models read now reproduces EXACTLY (0.00e+00) and the PCA
+  components to 1.1e-6.  The standing "do not fix this back" warning is retired.
+
+A REAL BUG FIXED ON THE WAY IN
+  model-2FT's boosters carry NO best_iteration attribute (rounds were fixed, so
+  there was nothing to early-stop against).  5.3's loader set it_range = None in
+  that case and _score_xgb passed it straight into Booster.predict, which raises
+  TypeError: 'NoneType' object is not subscriptable on xgboost 3.4.1.  Every
+  model-2FT row would have become Xgb_status='error'.  The fallback is now
+  (0, booster.num_boosted_rounds()), which is also semantically right: a fixed-round
+  model wants every tree it built, while an early-stopped one must be told to stop.
+  --check-xgb now prints trees=<used>/<built> per model and fails if any prediction
+  is blank under status=ok — the shape that bug would have taken had it not raised.
+
+SCHEMA: 101 -> 90 COLUMNS
+  Removed: RoBERTa_*_hd (7), Prosus_*_bd (7), Xgb_reg_/clf_/aggr_ (7).
+  Added:   the 10 predictions.
+  Kept unchanged: Xgb_status, the 6 Xgb_*_ms timings, Xgb_at, BroadClass,
+  TimeToOpen, and the DeBERTa/TradeHero/FinancialB blocks.
+  90 is the only arity a live 5.3 file can have.  Header rotation is exact-list
+  equality, so the first write of the day rotates a 42- or 101-col file
+  automatically (verified on a seeded 101-col file).
+
+LATENCY (24 real corpus articles, medians; [model-1] for comparison)
+  headline encoders (DeBERTa + TradeHero)        184 ms  p90 220   [192]
+  body encoders @200w (FinancialB + TradeHero)   203 ms  p90 238   [285]
+  FinBERT embedding (hd + bd) + PCA              412 ms  p90 509   [416]
+  LEG TOTAL                                      801 ms  p90 988   [917]
+  features + 2 DMatrix builds                      8 ms            [12]
+  10 boosters, predict                             3 ms            [1]
+  Range 683..1285 ms for identical work — read Xgb_total_ms from the TSV.
+  ⚠ The EMBEDDING is now 51% of the leg and this change did not touch it.  Halving
+  the leg again means attacking the body forward pass, not the encoders.
+  Burst: 6 simultaneous PRs, last row at 4.9 s — the queue drains at about the
+  single-PR rate, so XGBLEG_WAIT_SEC = 30 is ~37 PRs deep.
+
+VERIFICATION (all passing)
+  --check-rules       BYTE-IDENTICAL to the pre-refactor echo on the live rules
+                      file, including the "XGBoost leg: observational" line.
+  --check-xgb         exit 0.  10 models from 2 dirs, 2 feature orders, 25/25
+                      features mapped, universe OK, synthetic row status=ok with
+                      all 10 predictions non-blank.
+  gate regression     863 rows across 19 daily TSVs: ZERO mismatches between 5.2's
+                      and 5.3's _evaluate_trigger on is_ok, the fired-rule label,
+                      the full Trigger cell and missing_blocked (32 fires, 3.7%).
+  kw15 re-derivation  863 rows x 2 channels re-scored from their own Body/Headline
+                      cells: max |diff| 0.00e+00.
+  prediction parity   8 val-fold rows vs model-2/..._val_M2-scores.tsv (produced by
+                      score_val_predictions.py, an independent path): max |diff|
+                      1e-6, which is _score_xgb's own round(...,6).  The three rows
+                      the model-2 guide pins (VMAR/SNES/PN) reproduce its published
+                      numbers exactly.
+  feature parity      24 corpus rows: DeBERTa_ss_hd, TradeHero_ss_hd,
+                      FinancialB_ss_bd, TradeHero_pos_bd all 0.00e+00; the 8 PCA
+                      components <= 1.13e-6.  NO carve-outs.
+  FineClass parity    24/24 rows re-classify through the live path to the stored
+                      FineClass AND BroadClass.  PrClassifier's 22 fine / 12 broad
+                      classes match model-2's categories vocabulary exactly, with
+                      nothing unmatched on either side.
+  gate-blocking flip  adding "REQUIRE M2Floor: ge20_m2 >= 0.5" flips _gate_needs_xgb
+                      to True and the WARNING names the field; removing it flips
+                      back.  A misspelled "ge20_M2" hard-fails with a did-you-mean.
+  end-to-end          6 real articles through _on_row_built with a stubbed clerk:
+                      90-col TSV, header == _TSV_COLUMNS, all 10 predictions and
+                      all 7 timings populated on 6/6 rows, 12 clerk messages
+                      (1 arm + 1 sentiment each), stale 101-col file rotated.
+
+  NOT done: a live dry run against the paper Gateway with the real connector and
+  clerk.  The sockets are the only part the stubs did not exercise.
+
+⚠ FineClass is the only categorical and it FAILS QUIET — an unseen category becomes
+NaN, it is not added.  That match holds only because model-2 trained on the
+recategorised corpus (..._reCat.tsv), built after the 2026-09-19 classifier change.
+RE-RUN THE 24-ROW CLASS CHECK AFTER ANY PrClassifier EDIT: a rule change that moves
+a class silently turns this feature into NaN on the affected rows and nothing else
+would notice.
+
+⚠ The six ge* columns are NOT probabilities.  scale_pos_weight (4.18/8.33/12.53)
+multiplies the modelled odds — ge50_m2 averages 0.357 against a 9.6% base rate and
+Brier skill is negative for all three.  A fitted Platt calibration for the model-2
+three lives in ../price_stats_loader/statsByClaude/model2_calibration_params.json
+and is DELIBERATELY not applied live: it is monotone so it changes no ranking and
+no top-N selection, it was fitted on model-2's own val fold, and there is no
+model-2FT equivalent.  Calibrate offline if you need odds.
+
+⚠ There is ONE PCA basis for every generation.  finbert_pca_transform.MODEL_PATH is
+a hardcoded model-1/finbert_pca.pkl and model-2 never refit it, deliberately — the
+embeddings never changed, only two structured columns and the class labels did.
+There is no model-2/finbert_pca.pkl; do not go looking for one.
+
+
+--------------------------------------------------------------------------------
+2026-09-20  XgbSolo: ge50_m2 >= 0.70 — the first rule that reads the XGBoost leg
+--------------------------------------------------------------------------------
+A one-line rules-file edit with three consequences that the line itself does not
+show.  Recorded here because two of them are operational, not analytical.
+
+THE RULE
+  XgbSolo:     ge50_m2 >= 0.70
+  One condition, OR-ed beside CORE / EARNINGS / KwBodySolo / FLANGSolo /
+  FinBERTSolo, and subject to the REQUIRE ClassWhitelist precondition like every
+  other ordinary rule.
+
+  !! ge50_m2 IS NOT A PROBABILITY AND 0.70 IS NOT 70%.  Fit with
+  scale_pos_weight = 12.53, which multiplies the modelled odds: the column
+  averages 0.357 against a 9.6% base rate and its Brier skill is negative.  0.70
+  is a RANK cut at the 89th percentile of the score distribution, worth a
+  Platt-calibrated P(fromPR_High >= 50%) of about 19%.  Read as a confidence it is
+  wrong by ~3.7x.  Platt params (offline only):
+  ../price_stats_loader/statsByClaude/model2_calibration_params.json
+
+CALIBRATION (model-2 validation fold, 1380 rows / 25 sessions, 2026-07-28..08-28,
+restricted to the ClassWhitelist classes the rule is subject to)
+    cut     fires   /day   p>=30%   p>=50%   lift(>=30%)
+    0.70      122   4.88    37.7%    25.4%     2.31x   <- live
+    0.80       56   2.24    41.1%    25.0%     2.52x
+    0.85       33   1.32    45.5%    24.2%     2.79x   (n=33, wide bars)
+  !! IT ROUGHLY TRIPLES THE TRADE RATE AT LOWER LIFT THAN THE GATE IT JOINS.  The
+  other five ran ~2.2/day at 3.07x; this one alone is ~4.9/day at 2.31x, OR-ed on
+  top.  THE OVERLAP IS UNMEASURED — the val corpus carries no kw15_*,
+  Prosus_pos_hd or EarningScore columns, so the COMBINED gate has never been
+  replayed anywhere.  That is the biggest open question in this change and it is
+  recorded, not resolved.  Watch the live fire rate for a week.
+  !! Uses ge50_m2, NOT ge50_m2FT.  model-2FT trained on 100% of the rows including
+  that entire fold, so its 49.6% p>=30% there is in-sample leakage, not evidence.
+
+CONSEQUENCE (a) — THE RULES FILE IS NOW 5.3-ONLY
+  ge50_m2 is not one of Orchestrator5.2.py's 27 addressable fields (5.3 has 46),
+  and an unknown field is a hard fail with no fallback gate.  Verified:
+    RuntimeError: orchestrator_trigger_rules.txt:<line>: unknown field 'ge50_m2'
+    — no similar field name; see the 'Fields' table in the header of this file
+    for the full list — refusing to start                              (exit 1)
+  A 5.2 process that is ALREADY RUNNING is unaffected — rules are read once at
+  startup — but it will not come back from a restart or a crash.  THE ESCAPE IS
+  ONE CHARACTER: comment out the XgbSolo line and 5.2 loads the file again.
+  This is the change that makes 5.3 the only runnable orchestrator.
+
+CONSEQUENCE (b) — THE LEG IS NOW GATE-BLOCKING
+  _gate_needs_xgb flips to True, so _resolve_leg() runs BEFORE _evaluate_trigger.
+  MEASURED, 9 single PRs one at a time through the live path:
+    STEP-1b SENTIMENT   943 ms median  (p90 1030, range 806..1030)
+                        against 71 ms observational  =  +872 ms
+    STEP-1a ARM          17 ms  — UNAFFECTED
+  The arm is issued in _on_row_built at reception, before _collect_and_log exists,
+  so the clerk still registers the session immediately; it is the trade DECISION
+  that is late — on EVERY PR, including rows that fire on CORE or the keyword
+  rules and never read a model-2 score.
+
+CONSEQUENCE (c) — A STALE UNIVERSE FILE NOW STOPS TRADING
+  With the leg gating, a universe TSV predating daily_universe_pipeline-3 is a
+  STARTUP HARD FAIL instead of Xgb_status='disabled_universe' with trading
+  carrying on.  Verified against stocks_universe_2026-09-16.tsv (38 cols): 6 of
+  the 7 market-state features missing -> RuntimeError.  The 20:30 cron already
+  runs daily_universe_pipeline-3.py and has written 147-col files since
+  2026-09-17, so this is armed but not tripping.  CHECK
+  ../universe_finder/runs/cron.log BEFORE A MORNING RESTART.
+
+VERIFICATION (all passing)
+  5.3 --check-rules   exit 0.  Echo shows `(6) XgbSolo: ge50_m2 >= 0.70`,
+                      `XGBoost feeds rule(s): XgbSolo`, the WARNING naming
+                      ge50_m2 with the measured cost, and
+                      `XGBoost leg: GATE-BLOCKING — STEP-1b waits for it`.
+  5.2 --check-rules   exit 1, as quoted above.  EXPECTED, not a corrupt file.
+  additive replay     864 tape rows through 5.3's gate, old rules vs new:
+                      0 fires LOST, 0 fires GAINED, 0 rows where the other five
+                      rules' Trigger groups changed, and exactly one appended
+                      XgbSolo group on every row.  (0 gained because the tape
+                      predates the column, so ge50_m2 reads MISSING — that proves
+                      the rule is WIRED, not that it is any good.)
+  alarm volume        missing_blocked went 0/864 -> 832/864 (96.3%) on that tape.
+                      A one-condition rule on a MISSING score is the sole blocker
+                      of its own branch, so BLOCKED BY MISSING SCORE ONLY fires on
+                      nearly every row.  On the tape that is an artifact; LIVE the
+                      rate is 0% when the leg is healthy and ~100% when it dies,
+                      which is a clean binary alarm.  Do not mistake it for a new
+                      fault after a restart against old data.
+  end-to-end          10 real articles through the live path: 90-col TSV,
+                      Xgb_status=ok on 10/10, ge50_m2 populated on 10/10 and
+                      rendering as `XgbSolo:NO[ge50_m2:FAIL(0.1011<0.70)]` in the
+                      Trigger cell.  Observed ge50_m2 range 0.101..0.695, so none
+                      cleared 0.70 — consistent with an ~11% fire rate on n=10.
+  universe hard-fail  confirmed, see consequence (c).
+
+  NOT done: a live dry run against the paper Gateway.  The feed and clerk sockets
+  remain the only untested part, and they are now on the critical path for a
+  943 ms decision rather than a 71 ms one.
+
+RETUNE POINT: the whole cut curve above is one number on one line.  0.80 halves
+the trade rate for +3.4pp of precision; 0.85 quarters it for +7.8pp on n=33.
+
+================================================================================
+2026-09-21  Orchestrator5.3.py — split-embedding fix (bit-identical, leg 1.45x)
+================================================================================
+FIRST LIVE DAY of the XGBoost leg. Observed Xgb_total_ms up to 7542 ms against a
+documented 801 ms leg. Investigated; two separate causes, only one of them a bug.
+
+1) NOT A BUG — QUEUEING. Per-PR compute was on spec (stage medians hdx 198 / body
+   235 / embed 434 / feat 30 / predict 10 = 908 ms). The excess is serial queueing
+   in the one-worker _xgbleg_executor. Today's 08:30 burst: 9 PRs in 0.83 s, wait
+   growing ~870 ms per queue position (VNTG 1755 ms ... RUBI 7542 ms). SIX of those
+   nine were ClassWhitelist:BLOCK and could never trade, yet sat ahead of the three
+   that could.
+
+2) A REAL DEFECT, NOW FIXED. _embed_and_project called
+       vecs = embed_texts([headline, body_200])
+   i.e. ONE combined forward — the exact thing its own docstring said not to do and
+   quoted a penalty for. _embed_batch pads to the longest item, so the ~12-token
+   headline was padded to the body's ~270 tokens and given a full body-sized pass.
+   Replaced with two separate calls, one per stream.
+
+   MEASURED (12 real PRs, the day it was found):
+       combined embed_texts([hd, bd]) : 596 ms
+       split into two calls           : 299 ms      1.99x
+       max |difference| in embeddings : 0.000e+00   BIT-IDENTICAL
+   RE-MEASURED end to end through _score_xgb_leg (36 real articles):
+       stage              before    after
+       headline encoders   198      178
+       body encoders       235      214
+       embedding + PCA     434      225      1.93x
+       LEG TOTAL           908      627      1.45x   (-281 ms/PR)
+   Bit-identity re-verified through the live function: max |PCA difference| between
+   patched and pre-patch = 0.000e+00 on all 36 articles. No model, no weight, no
+   feature and no threshold changed — only how many forward passes are issued.
+
+TRUE PARALLELISM: EVALUATED, REJECTED ON MEASUREMENT.
+   The pre-existing "one worker wins" note rested on an A/B that ran three pools at
+   DEFAULT intra-op — 24 ORT threads on 8 HT slots — so it measured oversubscription,
+   not parallel efficiency. Re-measured properly on this box (i7-1185G7, 4 PHYSICAL
+   cores, 8 threads, no CUDA GPU, 20 GB RAM free):
+       single body embedding, intra_op 1/2/4/8 : 490 / 283 / 188 / 196 ms
+           -> 4 cores buy 2.61x; intra_op=8 is WORSE than 4 (hyperthreading hurts)
+       8 bodies, N workers x intra_op=8/N :
+           1x8 1770 ms | 2x4 1611 ms (1.10x) | 4x2 1712 | 8x1 1663
+       cross-PR batching, 9-PR burst :
+           serial 1980 ms | batched 2644 ms  -> 0.75x, i.e. SLOWER
+   Conclusion: concurrency is worth ~10%, batching is NEGATIVE, and separate OS
+   processes buy nothing (ONNX already releases the GIL). A burst of 13 PRs is ~8 s
+   of 4-core work and no scheduling arrangement reduces it. The burst can only be
+   made SMALLER, not parallel.
+
+THE LATENCY BUDGET IS 2 SECONDS, AND IT IS NOT DOCUMENTED IN THIS DIRECTORY.
+   ../x-wing-mole/clerk-1.2.py:118  SENTIMENT_TIMEOUT_S = 2.0
+   When the mole fires a surge the clerk waits 2 s for STEP-1b and then ABORTS the
+   trade (_await_sentiment_and_launch -> finish("sentiment_timeout")). On 2026-09-21,
+   2 of the day's 3 buy signals hit it:
+       08:30:05.060 [AGMH] sentiment gate timed out (2.0s) — aborting trade
+       09:30:02.877 [GRML] sentiment gate timed out (2.0s) — aborting trade
+   Both were ClassWhitelist:BLOCK -> BAD anyway, so no trade was lost. But the abort
+   reached the right answer by coincidence, not by the gate working: the same
+   mechanism discards an OK just as readily. AGMH's own ge50_m2 was 0.757, ABOVE the
+   XgbSolo cut — in a whitelisted class that is a fired trade the clerk would have
+   thrown away.
+
+EFFECT OF THIS COMMIT ALONE (simulated on 885 real articles / 20 days):
+       STEP-1b latency      med    p90    p99    max    >2s
+       before               908   4088   7636   8723   23.2%
+       after                627   2575   4801   5632   13.7%
+   Not sufficient on its own. Two scheduling changes are still outstanding and are
+   what actually clear the 2 s wall (p99 1941 ms, 0.8% over):
+     (a) SHORT-CIRCUIT the gate — only wait for the leg when the score can change the
+         answer. Measured on 890 rows: 65.7% decidable BAD immediately (precondition
+         blocks), 3.7% decidable OK immediately (another rule fires), only 30.6%
+         actually need ge50_m2.
+     (b) SERVE WHITELISTED PRs FIRST — one-worker priority queue, so the 66% that can
+         never trade stop blocking the 34% that can.
+
+⚠ NOT LIVE UNTIL 5.3 IS RESTARTED. Rules and code are read at process start; PID
+  436634 has been running since 2026-09-20 and still holds the old code path.
+
+================================================================================
+2026-09-21  Orchestrator5.3.py — gate short-circuit + priority queue for the leg
+================================================================================
+Follows the split-embedding fix earlier the same day. That cut the leg 908 -> 627
+ms; this cuts how many PRs have to wait for it at all, and in what order.
+
+WHY. The leg went gate-blocking on 2026-09-20, so STEP-1b waited for it on EVERY
+PR. First live day showed p99 7542 ms. The clerk aborts a trade whose sentiment is
+>2.0 s late (SENTIMENT_TIMEOUT_S, ../x-wing-mole/clerk-1.2.py:118) and 2 of that
+day's 3 surges hit that wall. Parallelism was evaluated and rejected on measurement
+(see the earlier entry): 1.10x from concurrency, 0.75x from batching. The only
+lever left is doing less work on the critical path.
+
+(1) _gate_early_decision(...) -> True | False | None
+    is_ok = (every REQUIRE holds) AND (any FIRE rule holds) is monotone both ways,
+    so the verdict is frequently forced before the leg exists:
+      - a REQUIRE already failed              -> BAD, whatever the score
+      - no FIRE rule can still hold           -> BAD, whatever the score
+      - every REQUIRE holds AND one rule fires-> OK,  whatever the score
+      - otherwise                             -> None, and only then do we wait
+    Measured on 890 tape rows: 65.7% forced BAD, 3.7% forced OK, 30.6% wait.
+    A condition is PENDING exactly when its field's source is in _XGB_GATE_SOURCES.
+
+    SAFETY NET, and it is not optional: after the leg lands, _collect_and_log
+    re-runs the REAL _evaluate_trigger over the complete inputs, writes THAT into
+    Trigger / ClerkSentiment / the dead-scorer alarm, and logs at ERROR if the early
+    answer disagreed with it. So the TSV is byte-for-byte what it would have been,
+    and a logic bug would be loud rather than silent.
+
+    VERIFIED EXHAUSTIVELY: 900 tape rows x 8 synthetic ge50_m2 values
+    (None/0.0/0.30/0.6999/0.70/0.7001/0.99/1.0) = 7200 (row, score) pairs.
+    5000 pairs were decided early. DISAGREEMENTS WITH THE FULL GATE: 0.
+
+(2) _PriorityExecutor replaces ThreadPoolExecutor(max_workers=1) for the leg.
+    STILL ONE WORKER — this is not parallelism, it is ordering. submit() takes a
+    leading priority; ties break FIFO via an itertools counter (which also keeps the
+    queue tuple orderable without ever comparing Futures).
+      _PRIO_TRADEABLE 0  the gate could still fire on this PR
+      _PRIO_CORPUS    1  a REQUIRE precondition already rules it out
+      _PRIO_SHUTDOWN  9  sentinel; everything queued before it still drains
+    _leg_priority() derives the lane from the LOADED rules, not a hardcoded class
+    list, so deleting the whitelist makes every PR tradeable again by itself. Rules
+    naming a key not yet knowable (EarningScore, any model score) are skipped:
+    failing to prove a PR dead means treating it as live. A dead classifier
+    (FineClass None) gets the TRADEABLE lane on purpose — it closes the whole gate
+    and that alarm must not be parked behind the corpus queue.
+
+    NOTHING IS SKIPPED. Every PR is still scored and every XGBoost column is still
+    written; blocked PRs simply stop delaying tradeable ones.
+
+(3) _classify_article() — the two-step headline-then-body classify, extracted so the
+    feed thread and the earnings worker cannot disagree. Now called ONCE in
+    _on_row_built (the priority needs it before the leg is queued) and passed to
+    _classify_and_score_earnings as `preclassified`. NET COST ZERO: the work moved,
+    it did not duplicate. 0.20 ms median / 3.5 ms p100 over 36 real PRs. If the
+    feed-thread call raises it returns None and the earnings worker retries under
+    its own handler, so behaviour on classifier failure is unchanged.
+
+MEASURED. Real 08:30 burst of 2026-09-21 replayed through the real _leg_priority and
+the real _PriorityExecutor (9 real PRs, 6 of them un-tradeable and ALL SIX queued
+ahead of ones that mattered), leg stub 627 ms:
+    sym    class               lane        live    now     gain
+    NVNI   Earnings_Results    tradeable   4193    627    +3566
+    TPET   MA                  tradeable   6335   1255    +5080
+    RUBI   Earnings_Results    tradeable   7542   1882    +5660
+    VNTG   Business_Update     corpus      1755   2509     -754
+    MASK   Offering_Financing  corpus      2639   3136     -497
+    FGL    Deficiency_Notice   corpus      3449   3763     -314
+    SLMT   Crypto_Treasury     corpus      5028   4391     +637
+    AGMH   Offering_Financing  corpus      5821   5018     +803
+    PETS   Management_Change   corpus      7017   5645    +1372
+  EVERY TRADEABLE PR UNDER THE 2 s WALL (worst 1882 ms, was 7542 ms). The three
+  corpus rows that land later only delay their own TSV write — the short-circuit
+  already sent their BAD at ~20 ms.
+
+Simulated over 885 real articles / 20 days, STEP-1b latency:
+    scheme                         med    p90    p99    max    >2s
+    2026-09-20 (as shipped)        908   4088   7636   8723   23.2%
+    + split-embedding fix          627   2575   4801   5632   13.7%
+    + short-circuit                 20    627   3857   5061    4.2%
+    + priority queue                20    627   1941   2926    0.8%
+
+UNIT / INTEGRATION CHECKS ALL PASS:
+  - priority mapping vs the live whitelist: 13 classes, 0 errors; None -> lane 0
+  - executor serves 3 tradeable ahead of 4 corpus queued BEFORE them
+  - exceptions propagate to the caller; shutdown(wait=True) drains queued work
+  - --check-rules exit 0, --check-xgb exit 0, module imports clean
+
+⚠ NOT LIVE UNTIL 5.3 IS RESTARTED (PID 436634 still holds the old code).
+⚠ ONE BUG FOUND BY THE REPLAY, worth recording: the first cut of
+  _gate_early_decision keyed FinMarBa as 'finmarba'; _evaluate_trigger keys it
+  'fmb'. That is a KeyError on the trade path, and only the tape sweep caught it.
+  Any new gate helper MUST reuse _evaluate_trigger's own source key names.
+
+================================================================================
+2026-09-21  orchestrator_trigger_rules.txt — XgbSolo exempted from the whitelist
+================================================================================
+OPERATOR REQUEST: "I want the ge50_m2 rule to trigger no matter what the
+FineClass is, no need to be in the WhiteList."
+
+WHY IT WAS NOT A ONE-LINE EDIT. `REQUIRE ClassWhitelist` is a PRECONDITION: the
+gate is (every REQUIRE holds) AND (any FIRE rule holds), so a REQUIRE is AND-ed
+over the WHOLE gate and cannot exempt a single rule. Two ways out:
+  (A) a new rule kind in the Python (an EXEMPT/ANYCLASS marker), or
+  (B) move the whitelist out of the precondition and into each rule that should
+      still be subject to it.
+CHOSE (B) — NO PYTHON CHANGED. The DSL already had everything needed: `in` with a
+comma list, and AND-ed conditions within a rule. Verified the parser accepts a
+comma-list `in` inside a multi-condition AND rule before committing to it.
+
+THE GATE NOW (no REQUIRE line at all; six FIRE rules):
+  CORE:        FineClass in <7> AND ...5 sentiment cuts...
+  EARNINGS:    FineClass == Earnings_Results AND ...        <- narrower already
+  KwBodySolo:  FineClass in <7> AND kw15_proba_bd >= 0.70 AND FinMarBa_ind_hd<=0.14
+  FLANGSolo:   FineClass in <7> AND FLANG_ss_hd >= 0.975 AND FinMarBa_ind_hd<=0.14
+  FinBERTSolo: FineClass in <7> AND Prosus_pos_hd >= 0.935
+  XgbSolo:     FineClass not in __CLASSIFIER_DEAD__ AND ge50_m2 >= 0.70
+
+MEASURED BEFORE DOING IT (model-2 val fold, 1380 rows / 25 sessions, base 16.3%):
+    ge50_m2 >= 0.70  whitelisted only : 122 fires  4.9/day  37.7%  2.31x
+    ge50_m2 >= 0.70  ALL classes      : 150 fires  6.0/day  38.0%  2.33x
+    the 28 extra fires alone          :  28 fires  1.1/day  39.3%  2.41x
+  The classes the whitelist blocks score SLIGHTLY BETTER on this cut, not worse.
+  n=28, so the per-class splits (Product_Launch 0/8, Offering_Financing 4/8,
+  Buyback_Dividend 3/3, Crypto_Treasury 2/3, Other 1/5) are noise, not findings.
+  ⚠ This says nothing about the other five rules. They keep the whitelist because
+    their 2026-08-17 calibration (22.0% -> 27.8% precision, 2.42x -> 3.07x lift)
+    was measured with it and has NOT been re-derived without it.
+
+THE LIVENESS GUARD, and why it is not a filter. `__CLASSIFIER_DEAD__` is not a
+real PrClassifier class, so EVERY real class passes `FineClass not in
+__CLASSIFIER_DEAD__`. Its only effect is to FAIL when FineClass is None — a dead
+classifier or a timed-out future. Without it, XgbSolo would have been the one rule
+still trading through a PrClassifier outage, on a feature vector with FineClass
+(one of model-2's own 25 features) NaN. Operator chose to keep the safety stop.
+Probe: MA/Offering_Financing/Other -> PASS; None -> NO[FineClass:MISSING].
+
+VERIFIED on 900 tape rows x 6 synthetic ge50_m2 values = 5400 pairs:
+  - fires LOST vs the old gate ................................ 0
+  - is_ok differences NOT explained by XgbSolo on a non-WL row . 0
+  - gained fires: 1184, ALL XgbSolo on non-whitelisted rows
+      Other 288 | Conference_Presentation 212 | Product_Launch 180 |
+      Offering_Financing 130 | Management_Change 82 | Legal 82 | + 9 more
+  - five-rule group-verdict drift: 126, EVERY ONE of the shape
+      YES->NO with whitelist BLOCK=True and old is_ok=False
+    i.e. rows where a rule's own cuts held but the precondition blocked the gate.
+    Display only; no row's trade decision moved.
+
+THREE CONSEQUENCES FOR ANYONE READING TSVs OR LOGS:
+  (a) There is NO REQUIRE rule any more. `ALLOW`/`BLOCK` verdicts vanish from the
+      Trigger cell, and `grep -c ':BLOCK\[' tables/*.tsv` counts nothing from now
+      on. A class rejection is now a FineClass:FAIL(...) token inside each rule.
+  (b) ⚠ A `:YES` group IMPLIES THE ROW FIRED AGAIN. The 2026-08-17 wart — a rule
+      holding while a precondition blocked — is structurally impossible now. A
+      parser that counts `:YES` is right before 08-17 and after 09-21, wrong in
+      between. The LEADING verdict has always been correct; use that.
+  (c) ⚠ THE SEVEN-CLASS LIST IS NOW IN FOUR PLACES. A retune must edit all four.
+      That is the price of exempting one rule, taken deliberately over adding a
+      rule kind to the Python. `--check-rules` echoes every rule rebuilt from its
+      parsed conditions, so a drifted copy is visible there — diff the four.
+
+⚠ NOT LIVE UNTIL 5.3 IS RESTARTED (rules are read once at startup).
+
+--------------------------------------------------------------------------------
+2026-09-21  OPERATIONAL NOTE (no code change) — the nightly restart window
+--------------------------------------------------------------------------------
+--check-xgb passed at 20:00 and FAILED at 20:40 the same evening, with no edit in
+between. Cause: the 20:30 cron creates stocks_universe_<today>.tsv at once but only
+appends the market-state block when Step 9 finishes ~60 min later. In between the
+file is the NEWEST, so _load_latest_iti_tsv picks it, at 43 of its eventual 147
+columns and missing 6 of the 7 XGBoost features:
+  [Xgb] universe: MISSING ['float_turnover_max_20d','atr_pct_14','range_pct_1d',
+                           'dist_swing_high_20d_pct','amihud_63d','msc_basis_ratio']
+  FAILED: synthetic scoring returned disabled_universe
+Since the leg went gate-blocking on 2026-09-20 that is a STARTUP HARD-FAIL, so
+⚠ 5.3 CANNOT START DURING ITS OWN NIGHTLY UNIVERSE BUILD, roughly 20:30-21:35 ET.
+Before restarting, require 147 columns in today's file, or an empty
+`ps aux | grep market_state_calculator`. --check-xgb answers it in one command.
+Neither the code nor the cron is at fault; this is a timing window that only became
+dangerous when a rule started reading the leg.
+
+
+--------------------------------------------------------------------------------
+2026-09-22  MEASUREMENT (no code change) — INT8 on the FinBERT embedder: REJECTED
+--------------------------------------------------------------------------------
+First full day of the 09-21 changes. Xgb_total_ms read med 1158 / p90 4584 /
+max 6956 ms. Diagnosis, from tables/news_output_2026-09-22.tsv:
+  - COMPUTE IS ON SPEC. hdx 200 + body 234 + embed 223 = 657 ms median. A PR that
+    arrives ALONE takes 641 ms of model time; one inside a burst takes 689 ms —
+    1.08x contention. The tail is pure serial queueing: 10 PRs x 660 ms = 6.6 s,
+    which is the 6956 ms max exactly.
+  - ⚠⚠ BOTH 09-21 BURST DEFENCES ARE INERT, and the same day's whitelist move is
+    why. _leg_priority loops `if rule.kind != _RULE_REQUIRE: continue` and there is
+    no REQUIRE rule left, so every PR gets _PRIO_TRADEABLE: ZERO corpus-lane
+    deferrals in 61 PRs, the priority queue ran as plain FIFO.
+    _gate_early_decision's forced-BAD branch needs "no rule can still fire", but
+    whitelist-exempt XgbSolo passes its FineClass condition on every real class, so
+    a rule can ALWAYS still fire: short-circuit rate 69.4% -> 4 of 61 rows.
+    Neither is repairable by code alone — with XgbSolo exempt every armed PR
+    genuinely can trade, so there is no un-tradeable lane to defer to.
+  - THE LEG CANNOT BE SHED. 6 of the day's 10 gate-OK rows fired on XgbSolo ALONE
+    (ALP, CLGN, VBIO, LHSW, SCNX, BURU). Load-shedding would have killed BURU and
+    LHSW, the two that traded.
+  - COST SO FAR: ZERO, BY LUCK. 30% of buy-signals (12 of 40 across clerk_logs)
+    surge within 2 s of the arm; 3 of those have been aborted by the clerk's 2 s
+    wall since the leg went gate-blocking (CNSY today, missing by ~20 ms). All 3
+    were gate-BAD. Meanwhile BURU sat at 6374 ms and traded fine — its surge came
+    95 s later.
+
+INT8 was then measured properly (price_stats_loader/statsByClaude/, new script
+measure_int8_embedder_drift.py + 2026-09-22_INT8_embedder_drift.md). Harness gated
+on reproducing live BIT-EXACTLY first (10/10 predictions, 0.000e+00, 60 rows) and
+the corpus PCA at 1.25e-06.
+  SPEED IS REAL: interleaved A/B, embed 214.7 -> 91.6 ms, 2.34x, model 436 -> 110 MB.
+  FIDELITY IS DESTROYED: cosine to FP32 0.81-0.84, while two UNRELATED FP32 body
+  embeddings score 0.847 — i.e. an INT8 body vector is less like its own FP32 self
+  than like a random other article. The 8 PCA features model-2 reads move 1.4-4.9
+  standard deviations. 5 to 8 of 11 live gate fires are LOST (BURU, CLGN, ALP, TGL
+  among them) across three recipes, including the MatMul-only per-channel recipe
+  ONNX Runtime documents for BERT. Not a recipe problem.
+  A RETRAIN WOULD NOT RESCUE IT: pairwise-distance Spearman only 0.81-0.88 and
+  norms 20% short, so the structure is degraded, not merely rotated.
+⚠ Do not generalise "our encoders are INT8 and fine" to this model. Those emit a
+  3-class softmax that absorbs the noise; this one emits the raw mean-pooled 768-dim
+  hidden state with no head, and per-tensor quantisation crushes BERT's high-
+  magnitude rogue dimensions.
+⚠ And it would not have helped anyway: 123 ms off a 657 ms leg is -19%, against a
+  10-deep burst that needs -70%.
+
+⚠ SEPARATE TRAP FOUND ON THE WAY IN — TSV QUOTING IS PER FILE. 5.3 writes
+tables/news_output_*.tsv with a plain csv.DictWriter (QUOTE_MINIMAL);
+XGBoost_inference_script reads the TRAINING corpus with QUOTE_NONE, correctly for
+that file. Reading a LIVE TSV with QUOTE_NONE leaves the escaping in the text —
+DLPN's Body came back 7157 chars instead of 7145 and moved q80_m2FT by 0.35. One
+row in 60, silent, no error. Match the quoting to the writer.
+
+CORRECTION (same day): DeBERTa is 73.8 ms measured directly, NOT the ~190 ms first
+attributed to it from the 200 ms hdx stage total. Per-model medians, 14-word headline /
+200-word body, 9 reps warm: FinBERT-embed bd 189.8 | FinancialBERT bd 85.2 | DeBERTa hd
+73.8 | TradeHero bd 70.1 | FinBERT-embed hd 15.9 | TradeHero hd 8.1 | FLANG 7.2 |
+FinMarBa 7.1 | Prosus 6.6 = 463.8 ms. ⚠ THE BODY CHANNEL IS THE COST: the four body
+calls are 345 of 464 ms (74%), and the SAME TradeHero weights cost 8.1 ms on a headline
+and 70.1 ms on a body. The three gate headline models together are 21 ms — free.
+
+
+--------------------------------------------------------------------------------
+2026-09-24  Orchestrator5.4.py — model-3 leg + a pinned, single-thread scoring engine
+--------------------------------------------------------------------------------
+A NEW FILE (5.3 untouched: it is the one-command rollback). Plan:
+~/.claude/plans/i-want-you-to-snug-storm.md. Operator decisions (2026-09-24):
+  - SLO: reception -> STEP-1b sent under 400 ms for EVERY armed PR, bursts
+    included (replay target 300 ms, leaving 100 ms of live headroom).
+  - Threads vs processes: benchmark both, ship the SIMPLEST layout that passes.
+  - Physical core 0 (CPUs 0 + 4, hyperthread siblings) RESERVED for clerk-1.2,
+    both Gateways and the connector; 5.4 runs on CPUs 1-3, 5-7.
+  - XgbSolo cut: MATCH MODEL-2'S RANK on the live tape.
+
+WHY. 5.3 live, 09-21..09-24, 185 decisions: reception -> STEP-1b median 983 ms,
+p90 4.9 s, max 7.5 s; 94% over 400 ms. On 09-24 08:00 two armed tickers fired
+their buy signal before their sentiment arrived (sentiment_ignored_late). Cause:
+model-2's gate-blocking leg (~650 ms of model time, 7 model calls incl. two on
+the body) behind ONE worker. Worst bursts on record: 17 PRs in 2.0 s (08-06
+08:30), 12 in 1 s, 7 in 0.20 s (08-18 08:30) -> 400 ms at p100 needs >= ~14
+PRs/s of throughput.
+
+WHAT CHANGED
+  1. model-2 OUT, model-3 IN (training_data/model-3/model-3_implementation_guide.md
+     §3.1-3.13). Removed: DeBERTa + TradeHero on the headline, FinancialB +
+     TradeHero on the body, the FP32 FinBERT embedder (hd + bd), model-1's PCA.
+     Added: the INT8 FinBERT embedder on the HEADLINE only (md5-pinned), model-3's
+     own PCA (6 dp), 10 boosters se/q80/ge20/ge35/ge50 x _m3 (held-out) /_m3FT
+     (full refit), fixed rounds checked against prep n_rounds, nthread=1. The
+     feature map gained source 'fmb' (model-3 reads FinMarBa_ind_hd.1).
+     body_prep stays: the PR classifier (FineClass) still reads the 200-word body
+     string — PRCLASS_BODY_CAP_WORDS, must stay 200.
+  2. ONLY THE BOOSTERS A RULE READS RUN BEFORE STEP-1b (_gate_xgb_cols, derived
+     from the rules file like _gate_needs_xgb; today ge50_m3, 47 trees). The other
+     nine + the m3FT feature build run after the send.
+  3. THE SCORING ENGINE (o54_engine.py, a new importable module): every model
+     call — the gate's 3 headline models, kw15, the embedding, the boosters — runs
+     from ONE priority queue. Layouts: threads/shared (N threads, each ONNX
+     session intra_op=1), threads/per-model (5.3's), procs (N pinned worker
+     subprocesses). The frozen headliner modules are untouched: ModelSet lets each
+     load itself, then swaps in a session built with thread options, and the
+     module's own analyze/score function runs. A goldens self-check
+     (bench/o54_goldens.json, written from 5.3's default sessions) proves every
+     output digit at every startup.
+  4. PRIORITIES FOR EVERY TASK (not just the leg): a PR no clerk will ever hear
+     about (excluded-string headline — 15.5% of rows — or no in-universe ticker)
+     is scored after every PR a clerk waits on. 5.3's REQUIRE-based leg priority is
+     kept on top.
+  5. O(1) universe index (symbol -> row dict, built per (re)load) replaces the
+     locked pandas mask scan per cell (~8 per row, all GIL-bound).
+  6. TSV 90 -> 62 columns: -28 encoder columns, -Xgb_hdx_ms/-Xgb_body_ms,
+     predictions renamed *_m3/*_m3FT, +Xgb_gen, +Decision_ms (the SLO number:
+     feed line off the socket -> STEP-1b sent). New Xgb_status values 'partial'
+     and 'late'. Log line: `[Decision] SYM OK|BAD sent N ms after reception`.
+  7. CPU pinning at the top of main() (every thread, incl. ones a library already
+     started); `[Engine]` startup block logs layout, CPUs and the CPU power state.
+  8. CLI for isolated runs: --rules --feed-port --clerk-port --out-dir --log-dir
+     --universe-file --engine --pools --workers --intra-op --cpus --spinning.
+     File logging is attached at the entry point, not at import.
+  9. perf_mode.sh on|off|status (platform_profile + EPP; needs sudo).
+ 10. bench/: o54_bench.py (goldens | parity | e2e | sweep), o54_xgbsolo_cut.py
+     (cut derivation + gate tape check + --live-parity after cutover).
+
+VERIFIED 2026-09-24 (O5.3 stopped by the operator at 13:06:49 for the bench)
+  - --check-xgb: md5 OK; 10 models / 2 preprocessing groups; trees m3
+    213/3000/188/266/47, m3FT 236/3000/266/182/110; 25 features = finbert 1,
+    flang 2, fmb 1, earn 1, row 2, univ 12, calc 1, PCA 5; synthetic row ok;
+    leg (embed + 10 boosters) 25.1 ms median / 28.1 p90 at intra_op=1.
+  - ⚠ THE INT8 HEADLINE EMBEDDING TAKES 14.0 ms ON ONE THREAD — the same as on
+    ORT's default pool (14.4 ms in model-3's latency table). Intra-op threads buy
+    nothing on a 15-40-token headline. That is the whole case for layout C1.
+  - PARITY, 7 layouts x 300 real articles, every task submitted at once: 0
+    errors, 0 mismatches — gate models at 4 dp, kw15 6 dp, hd_pca 6 dp, all ten
+    predictions == m3_infer.Model3 (max |d| 0.0).
+  - XgbSolo cut: bench/reports/O54_xgbsolo_cut_2026-09-24_1347.md. 215 live
+    rows / 4 sessions: model-2 >= 0.70 fired on 24 = the 88.8th percentile ->
+    ge50_m3 >= 0.646 (bootstrap 95% CI 0.639-0.654; val-fold same rank: 0.659).
+    Model-3 fires on 24 rows at 0.646; both fire on 18.
+  - Gate tape check at 0.646: the CORE/EARNINGS/KwBodySolo/FLANGSolo/FinBERTSolo
+    groups of 179 rows reproduce the stored Trigger cells character for character.
+    (⚠ Only rows after the 2026-09-21 22:41 restart: earlier 09-21 rows were
+    gated by the old REQUIRE ClassWhitelist rules, a different cell.)
+  - BURST SWEEP: bench/reports/O54_latency_2026-09-24_1426.md. The REAL
+    Orchestrator5.4.py as a subprocess, fed by a fake connector (c3.FeedServer,
+    exact wire format) replaying the 16 largest historical bursts at recorded
+    timing + a stress ladder (5..25 PRs inside 0.2 s) + 30 lone PRs; a fake clerk
+    answering ARM with delays drawn from the real clerk's (5.3 logs: median 43 ms,
+    max 138). Metric = clerk receives STEP-1b - feed sent the PR. 2 repeats,
+    layouts interleaved. Worst PR of ANY historical burst / burst p90 / lone median:
+        C0   5.3's layout (per-model pools, ORT default), unpinned  423 / 250 / 77
+        C0p  the same, pinned to CPUs 1-3,5-7                        529 / 367 / 100
+        C1a  threads/shared, 6 workers, intra_op=1 -> SHIPPED        168 /  92 / 60
+        C1b  threads/shared, 3 workers, intra_op=1, CPUs 1-3         184 / 100 / 65
+        C1c  threads/shared, 3 workers, intra_op=2                   206 /  96 / 59
+        C2a  6 pinned worker PROCESSES, intra_op=1                   141 /  84 / 60  10.3 GB
+        C2b  3 pinned worker processes, intra_op=2                   157 /  85 / 58   5.1 GB
+    Stress capacity (largest ladder kept < 400 ms): C0/C0p 5, C1* 10, C2* 15 PRs
+    in 0.2 s. 0 missing decisions, 0 Xgb_status != ok, in every run.
+    PICK (operator's rule: the SIMPLEST layout under the 300 ms replay target):
+    C1a. The process engine is ~15% better at the worst burst and holds 1.5x the
+    stress capacity (the GIL-bound Python halves stop sharing one lock), at 3-6x
+    the memory — kept as `--engine procs`, the fallback if bursts grow.
+    ⚠ 5.3's layout on model-3 MISSES the budget (423/529 ms): the model swap alone
+    is not enough. ORT's default pools also spin on every core, incl. core 0
+    (CPUs 0,4 ~40-57% busy during bursts vs 7-10% under C1a).
+
+TRAPS FOUND ON THE WAY
+  - ⚠⚠ PR_SET_PDEATHSIG fires when the THREAD that forked the child exits, not
+    the process. Workers launched from short-lived helper threads were SIGTERMed
+    right after their handshake: one silent death per worker (no traceback),
+    'Connection reset by peer' on their first task. Workers are now launched from
+    the calling thread (main) and respawned only from their long-lived feeder.
+  - Closing a listening socket does NOT wake a thread blocked in accept() on
+    Linux, and the port stays LISTENING (the bench's second run hit EADDRINUSE).
+    shutdown(SHUT_RDWR) first; the bench now also takes OS-picked free ports.
+  - replay_gate.py imports Orchestrator5.2, which cannot parse the live rules
+    file (unknown field) — use bench/o54_xgbsolo_cut.py's tape check instead.
+
+CPU PERFORMANCE MODE — MEASURED, NOT SCHEDULED (2026-09-24 17:01-17:13)
+  perf_mode.sh on (platform_profile=performance, EPP=performance; operator ran the
+  sudo). Same sweep, 2 repeats, C1a (shipped) and C2b, vs the balanced runs above
+  (bench/reports/O54_latency_2026-09-24_1711_perf.md):
+      C1a  worst burst PR 168 -> 171 ms | burst p90 92 -> 82 | lone median 60 -> 51
+           faster on 13/16 bursts, median -6 ms; stress capacity unchanged (10)
+      C2b  worst burst PR 157 -> 142 ms | burst p90 85 -> 77 | lone median 58 -> 50
+  A steady ~9 ms (~15%) on typical decisions, nothing on the worst case: below the
+  agreed >= 10 ms bar and irrelevant to a 400 ms budget met with ~230 ms to spare.
+  NOT scheduled; EXPECT_PERF_MODE stays False. The cron lines are in perf_mode.sh's
+  header if that ever changes.
+
+
+--------------------------------------------------------------------------------
+O5.5  (2026-09-27; Orchestrator5.5.py + o55_fm3_lane.py) — 5.4 + the FM3 SHADOW lane
+--------------------------------------------------------------------------------
+STATUS: LIVE since 2026-09-27 11:23:53 (operator: "stop the O5.4, perform the tests
+and launch O5.5"), tmux pane orch5:1.1. 5.4 is the one-step rollback; no rules-file
+change either way — 5.5 reads 5.4's rules file as is.
+
+WHAT CHANGED (nothing else did — same engine, gate, rules, model-3):
+  - FM3, the PR-text scorer from tools/keyword/model-FM3, is scored on EVERY row and
+    LOGGED ONLY. Two twins:
+      R1/DEVfit  trained 05-04..08-27, tested ONCE on 08-31..09-24 (the honest
+                 numbers: model-FM3/reports/FM3_TEST.md)
+                 -> FM3_bd_ge50 FM3_bd_reg FM3_hd_ge50 FM3_hd_reg
+      R1_FT      the same recipe on all 5,668 labelled rows (byte copy of R1/ALLfit;
+                 no held-out score, its own scale) -> the same four + "_FT"
+    + FM3_status (ok|timeout|error|not_loaded|disabled), FM3_ms, FM3_at.
+    TSV 62 -> 73 columns, appended after Decision_ms.
+    ⚠ Ranking scores (logits / z-averages / asinh-%), NOT probabilities; each twin
+    needs its own cut.
+  - WHERE: one worker SUBPROCESS (o55_fm3_lane.Fm3Lane = o54_engine's
+    ProcessEngine/_WorkerProc machinery with another worker command; o54_engine.py is
+    unchanged) holding both twins, pinned to CPUs 1-3,5-7, nice 19. Goldens
+    (bench/o55_fm3_goldens.json, 10 probes x 8 outputs, exact) checked in the worker
+    at every start. Own process = no GIL shared with the gate path.
+  - WHEN: one job per ARTICLE, submitted AFTER the row's STEP-1b. The finished row
+    goes to ONE writer thread, which waits for FM3 (<= 30 s from the job's start),
+    fills the 11 cells and writes the row: the collectors never wait on FM3.
+  - THE QUIET GATE (added after the first sweep, below): the lane's feeder sends a job
+    to the worker only once no PR has entered scoring for FM3_QUIET_MS = 300 and the
+    engine queue is empty (never held > FM3_MAX_HOLD_S = 20 s).
+  - FAIL-OPEN: a lane that cannot start, or dies, costs the FM3 cells (FM3_status)
+    and never trading. FM3 fields are NOT rule-addressable: a rule naming one fails
+    --check-rules ("unknown field 'FM3_bd_ge50'").
+  - Flags: --check-fm3 (lane + goldens + 200 tape PRs, then exit), --no-fm3.
+  - bench/o54_bench.py: --orch (e2e) / --orchs (sweep) pick the orchestrator file(s);
+    default 5.4, so every older command runs as before.
+    ⚠ Fixed with it: running_orchestrators() regex-matched the WHOLE command line, so
+    once --orchs named an orchestrator file the bench refused to run because of its
+    own wrapping shell ("refusing: an orchestrator is running [(<bash -c ...>)]"). It
+    now matches only a python process whose script (first non-option argument) is
+    Orchestrator5.N.py.
+
+MEASURED 2026-09-27 (Sunday; the live 5.4 running but idle)
+  - --check-fm3: worker ready 5.7 s, RSS ~950 MB. Both twins, one thread, nice 19:
+    compute p50/p95/p99 28.1/40.9/51.6 ms; the pipe adds ~0.3 ms.
+  - --check-rules OK (6 rules); --check-xgb OK (leg 22.6 ms median).
+  - Functional e2e (`o54_bench.py e2e --config C1a --orch Orchestrator5.5.py --top 3
+    --lone 5 --force`): 124 PRs, 0 missing decisions, FM3_status=ok on every row
+    (FM3 p50/p95 40/70 ms under the ladder), worst burst PR 181 ms, lone p50 53 ms,
+    RSS 2.6 GB incl. the lane. Offline == live: `o55_fm3_cut.py --live-parity` on
+    those 129 rows, max |diff| 0.0.
+  - BURST SWEEPS, 5.4 and 5.5 interleaved on C1a, 2 repeats each (5.4 stopped 11:00:08
+    for them). Burst PRs (328 per side) p50/p90/p99/max, ms:
+      without the gate  (O54_latency_2026-09-27_1111_fm3.md)
+        5.4  59 / 89 / 152 / 168      5.5  63 / 110 / 220 / 254
+        each burst's worst PR, 5.5 - 5.4: mean +15.9 ms [95% CI +2.4, +31.5] -> FAIL.
+        FM3 work of a burst's first PRs ran while the later PRs were scored: nice 19
+        cannot stop the worker from landing on an idle hyperthread SIBLING of a busy
+        engine thread (same core) -> the quiet gate.
+      with the gate     (O54_latency_2026-09-27_1123_fm3gate.md)
+        5.4  60 / 93 / 199 / 272      5.5  62 / 96 / 171 / 207
+        each burst's worst PR, 5.5 - 5.4: mean -1.7 ms [95% CI -16.8, +13.5] -> same.
+      Lone PRs 55 vs 54 ms; 0 missing decisions; 0 Xgb_status != ok; FM3_status=ok on
+      all 590 rows; RSS 1.7 -> 2.6 GB (the lane ~0.95 GB).
+    ⚠ A single "burst max" is noisy: 5.4 ALONE gave 160, 168, 272 and 199 ms in four
+      runs. Judge on the distributions and the paired per-burst worst PR.
+  - Startup 11:23:53 -> FEED_CONNECTED 11:24:00: engine goldens ok, smoke values
+    identical to 5.4's, [FM3] ready (lane pid, CPUs 1-3,5-7, nice 19, goldens ok,
+    quiet_gate=on), [FM3] smoke OK, [Gate] ACTIVE (6 rules).
+
+STARTING CUTS (bench/o55_fm3_cut.py -> bench/reports/FM3_starting_cuts_2026-09-27_1026.md)
+  Operator's rule: "fire as often as kw15 does today". Live tape 08-28..09-25: 1,187
+  rows DEVfit never trained on (27 sessions); 290 rows neither twin trained on.
+  Per-condition (each kw15 condition's pass rate), DEVfit / _FT (provisional):
+    kw15_proba_bd >= 0.54 (CORE, top 25.7%)      FM3_bd_ge50 >= 0.475  / _FT 0.607
+    kw15_proba_hd >= 0.50 (CORE, top 37.2%)      FM3_hd_ge50 >= 0.208  / _FT 0.171
+    kw15_proba_bd >= 0.50 (EARNINGS, top 38.1%)  FM3_bd_ge50 >= 0.136  / _FT -0.004
+    kw15_proba_bd >= 0.70 (KwBodySolo, top 2.2%) FM3_bd_ge50 >= 2.076  / _FT 2.145
+  At those cuts the RULES fire more (CORE 11 -> 19, any kw15 rule 24 -> 32): FM3's top
+  PRs overlap the other CORE conditions more than kw15's do. Rule-level cuts (each
+  rule fires as often as with kw15; few fires, noisy):
+    CORE        FM3_bd_ge50 >= 1.005 AND FM3_hd_ge50 >= 0.670  (_FT 1.016 / 0.669)
+    EARNINGS    FM3_bd_ge50 >= -0.414                          (_FT -0.429)
+    KwBodySolo  FM3_bd_ge50 >= 2.130                           (_FT 2.145)
+  _FT cuts are mapped from DEVfit's through the 290 unseen rows (FT's own scores on
+  the tape up to 09-24 are in-sample). Re-run the script after ~5 live 5.5 sessions.
+
+GO-LIVE NOTES
+  - Switch at a day boundary (or a weekend): a mid-day switch changes the header, so
+    5.5 rotates that day's 5.4 rows into news_output_<D>_rotated.tsv — and the 20:05
+    dailyStats cron only reads news_output_<D>.tsv (DAYFILE_RE). 09-24's rotated rows
+    were merged by hand.
+  - enriched_tsv_concatener.py keeps the union of columns, so the FM3 columns reach
+    the PR-stats master, beside the fromPR labels, with no extra step.
+
+
+--------------------------------------------------------------------------------
+O5.5 rev 2026-09-28  (Orchestrator5.5.py edited in place + NEW o55_kw15ft.py) — kw15_FT
+--------------------------------------------------------------------------------
+STATUS: code in place 2026-09-28 ~11:00 ET. It takes effect at the operator's restart of 5.5
+(the process running since 09-27 loaded the previous file). Pre-edit file kept as
+Orchestrator5.5.py.bak-20260928 (untracked).
+
+OPERATOR'S DECISIONS: retrain kw15 body + headline on the full dataset as "_FT", all files
+in tools/keyword/model_trained_on_2026-05-04-2026-09-24/; score it IN 5.5, next to today's
+kw15, columns beside kw15's; no thresholds now (later, from live data); train now at
+lowest priority; on restart, upgrade today's TSV in place rather than rotate it.
+
+THE MODELS (tools/keyword/kw15_ft_train.py; card.json in the model dir)
+  - Today's kw15 = keyword_finder.py --task classification --binarize-threshold 15, whose
+    run_variant_clf ALWAYS holds out 20%: the live pipelines saw 2,117 rows (05-04..06-18).
+    kw15_FT = the same recipe on EVERY labelled row: FM3's frozen snapshot
+    (fm3_common.load_corpus, fromPR_status == ok) = 5,668 rows, 05-04..09-24, >=15%:
+    1,567 (27.6%). Text = the exact live kw15 prep (o54_engine._kw15_prep). Row order
+    shuffled (seed 42): LogisticRegressionCV's inner 5 folds are unshuffled.
+  - Same recipe PROVEN: the trainer's `repro` mode (keyword_finder's own prep + split on
+    the old TRAIN corpus) rebuilds BOTH live pipelines bit for bit (same vocabulary, same
+    C / l1_ratio, max|proba diff| 0 over 2,647 texts).
+  - Fits: body tfidf C=1 l1=0.1, 66,687 features (live 27,576); headline tfidf C=1
+    l1=0.1, 4,200 features (live 1,473; live l1=0.5). Binary variants and keyword-impact
+    tables also written (same file set as the old dirs). No scorer_reference.json / combo:
+    only keyword_scorer-2 uses those, O5 does not.
+  - ⚠ NO held-out score. Honest proxy: model-FM3/runs/B1_kw15recipe_* (this recipe refit
+    on growing data, 8 out-of-time weekly blocks, 2,016 rows) vs B0_kw15live_*: body AP50
+    0.215 vs 0.201, AUC>=15 0.699 vs 0.688; headline AP50 0.210 vs 0.196, AUC>=15 0.717
+    vs 0.693 (no CIs).
+
+WHAT CHANGED IN 5.5
+  - o55_kw15ft.py: Kw15FtModelSet(o54_engine.ModelSet) — the kw15 task runs today's two
+    pipelines EXACTLY as before (the o54 goldens still pass), then the two _FT pipelines on
+    the SAME prepped strings -> kw15_proba_bd_FT / kw15_proba_hd_FT (6 dp), `_ms_ft`.
+    Kw15FtThreadEngine = ThreadEngine with that ModelSet. o54_engine.py NOT modified (5.4
+    runs byte-identical code). Thread engine only (--engine procs: _FT blank).
+  - Startup self-check: o54 goldens (hard-fail, as before) + the trainer's
+    reference_scores.json (43 raw Headline/Body cells) reproduced EXACTLY, else _FT off.
+  - FAIL-OPEN while no rule reads _FT (cells blank, ERROR logged, trading unaffected); a
+    loaded rule naming an _FT field + _FT not ok = refuse to start (the XGB leg's policy).
+    An exception while scoring _FT never costs kw15 its two values.
+  - _TRIGGER_FIELDS += kw15_proba_bd_FT, kw15_proba_hd_FT (source kw, 0-1): the gate can
+    move to them with a rules edit. The rules file is NOT changed.
+  - TSV 73 -> 75: kw15_proba_bd, kw15_proba_hd, kw15_proba_bd_FT, kw15_proba_hd_FT,
+    kw15_at (every later column moved 2 places; every reader goes by name).
+  - [KwScore] log line: "... in 3.3ms | _FT bd=0.xxxxxx hd=0.xxxxxx in 1.7ms".
+    [kw15_FT] ready — ok (43 reference rows exact) after the engine smoke.
+  - CLI: --check-kw15ft (kw15 + _FT alone: goldens, reference parity, timing on 200 tape
+    PRs, ~2 s), --no-kw15ft (plain o54 engine).
+  - _append_to_tsv: a day file whose header only LACKS columns (all old columns present,
+    same order) is UPGRADED IN PLACE — read, rewritten under the new header (new cells
+    blank), re-read and compared cell for cell, original kept as a hidden hard link
+    .news_output_<D>.pre-upgrade-HHMMSS.tsv, then os.replace. Any other header change,
+    or any error, still rotates to _rotated.tsv. Fixes the mid-day-restart gap (rotated
+    rows are skipped by the 20:05 dailyStats DAYFILE_RE) for 5.4 -> 5.5 and 5.5 -> 5.5.
+
+MEASURED (before the restart, beside the live 5.5)
+  - --check-kw15ft: kw15 p50/p95/p99 3.3/5.7/6.9 ms; + _FT pair 2.0/2.5/2.6 ms (one
+    thread). Spearman kw15 vs _FT on 200 recent tape rows: body 0.907, headline 0.779.
+  - Sandboxed 5.5 (scratch tables/logs, fake feed + clerk, CPU 3, nice 19): seeded with a
+    copy of the live 09-28 day file (73 cols, 47 rows) -> upgraded in place to 75 cols, 47
+    old rows cell-identical, _FT blank on them, backup == seed, no _rotated; 13/13 new rows
+    with kw15 AND _FT equal to offline scoring exactly, FM3_status ok, Decision_ms 47-72
+    ms; no ERROR line.
+  - --check-rules: the live rules file unchanged (6 rules); a scratch copy with an _FT
+    rule parses ("ge15 keyword feeds rule(s): ..., KwFTTest").
+
+NEXT
+  - After the restart: [kw15_FT] ready — ok ... in the log, the day file upgraded (no
+    _rotated), _FT cells on new rows. After a live day: offline parity of the live _FT
+    cells; Decision_ms p50/p95 vs the previous days.
+  - Cuts for _FT: from live data after a few sessions (operator's call), ranked like
+    bench/o55_fm3_cut.py does for FM3.
+
+
+--------------------------------------------------------------------------------
+O5.5 rev 2026-09-29  (Orchestrator5.5.py edited in place + NEW o55_s4kw.py) — S4 kw
+columns, score-only
+--------------------------------------------------------------------------------
+STATUS: code in place 2026-09-29. It takes effect at the operator's restart of 5.5.
+
+OPERATOR'S REQUEST: score kw30_tfidf_S4_FT_hd and kw50_tfidf_S4_FT_bd (already-trained
+models, tools/keyword/S4_model_trained_on_2026-05-04-2026-09-24_val7030/) on every row,
+columns placed next to the existing kw15/kw15_FT family. No gate rule, no trade impact.
+
+THE MODELS (card.json / model_performance_summary.csv in each model dir)
+  - kw30_tfidf_S4_FT_hd: headline-only TF-IDF LogisticRegressionCV, label
+    fromPR_High(%) >= 30, 5,667 rows, refit on every labelled row (no held-out split).
+  - kw50_tfidf_S4_FT_bd: body-only (text_bd400, 400-word cap) TF-IDF LogisticRegressionCV,
+    label fromPR_High(%) >= 50, 5,668 rows, same idea. Same corpus as kw15_FT
+    (fm3_common.load_corpus, 05-04..09-24). Neither is a head/body pair of ONE threshold
+    like kw15_FT — two independent single-channel models at different thresholds.
+  - Neither shipped with a reference_scores.json (card.json's own note: "nothing loads
+    this model live, so there is no consumer to byte-verify against"). Wrote one:
+    tools/keyword/s4_reference_gen.py — raw Headline/Body cells through the live prep
+    (fm3_common.prep_headline / prep_body400_kw) into the fitted joblib pipelines, 40
+    seeded rows + the 3 edge-case probes kw15_ft_train.py uses.
+
+WHAT CHANGED IN 5.5
+  - o55_s4kw.py: S4ModelSet(o55_kw15ft.Kw15FtModelSet) — the kw15 task runs kw15 +
+    kw15_FT exactly as before (super()._t_kw15), then the S4 pair on the SAME prepped
+    strings (a separate, sequential self._kw_lock acquisition, not nested) ->
+    kw30_tfidf_S4_FT_hd / kw50_tfidf_S4_FT_bd (6 dp), `_ms_s4`. S4ThreadEngine =
+    Kw15FtThreadEngine with that ModelSet. o54_engine.py and o55_kw15ft.py NOT modified.
+    Thread engine only, and only when kw15_FT is also on (--engine procs or --no-kw15ft
+    disable S4 too — no kw15_FT-off/S4-on combination; --no-s4 alone keeps kw15_FT).
+  - Startup self-check: kw15 goldens + kw15_FT reference (unchanged, hard/fail-open as
+    before), then S4's reference_scores.json (43 rows) reproduced EXACTLY, else S4 off.
+  - FAIL-OPEN while no rule reads S4 (cells blank, ERROR logged, trading unaffected); a
+    loaded rule naming an S4 field + S4 not ok = refuse to start (the XGB leg's policy).
+    An exception while scoring S4 never costs kw15/kw15_FT their values.
+  - _TRIGGER_FIELDS += kw30_tfidf_S4_FT_hd, kw50_tfidf_S4_FT_bd (source kw, 0-1):
+    addressable, unused. The rules file is NOT changed.
+  - TSV 75 -> 77: kw15_proba_bd, kw15_proba_hd, kw15_proba_bd_FT, kw15_proba_hd_FT,
+    kw30_tfidf_S4_FT_hd, kw50_tfidf_S4_FT_bd, kw15_at (every later column moved 2 more
+    places; every reader goes by name).
+  - [KwScore] log line: "... | S4 hd=0.xxxxxx bd=0.xxxxxx in X.Xms".
+    [S4] ready — ok (43 reference rows exact) after the engine smoke.
+  - CLI: --check-s4 (kw15 + kw15_FT + S4 alone: goldens, both reference parities, timing
+    on 200 tape PRs, ~2 s), --no-s4 (kw15_FT keeps running, S4 cells blank).
+  - _append_to_tsv's in-place header upgrade (added 2026-09-28) covers this too: an
+    older-header day file gets the two new columns added blank, no rotate.
+
+MEASURED (before the restart)
+  - --check-s4: kw15 p50/p95/p99 1.9/3.0/4.3 ms; + kw15_FT pair 1.1/1.3/1.5 ms; + S4 pair
+    1.9/2.9/4.1 ms (one thread; kw50_bd's much larger vocabulary is the slower of the two).
+  - Spearman kw15_hd vs kw30_S4_hd 0.662, kw15_bd vs kw50_S4_bd 0.830 on 200 tape rows.
+  - --check-rules: the live rules file unchanged (6 rules, none reference the S4 fields).
+  - --check-kw15ft, --check-xgb: unaffected.
+  - Direct engine tests: --no-s4 keeps kw15_FT scoring (S4 cells None); --no-kw15ft (or
+    kw15ft=False) also takes S4 to None (falls back to the plain o54/Kw15Ft engine,
+    per design).
+
+NEXT
+  - After the restart: [S4] ready — ok ... in the log, the day file upgraded (no
+    _rotated), S4 cells on new rows.
+  - No cuts planned unless the operator later wants a gate rule on kw30_tfidf_S4_FT_hd /
+    kw50_tfidf_S4_FT_bd — today this is score-only.
+
+
+--------------------------------------------------------------------------------
+O5.5 rev 2026-10-07  (Orchestrator5.5.py, edited IN PLACE — operator's choice)
+--------------------------------------------------------------------------------
+WHAT CHANGED (operator request 2026-10-07)
+  1. THE GATE. All six rules (CORE, EARNINGS, KwBodySolo, FLANGSolo, FinBERTSolo,
+     XgbSolo) and the class whitelist are replaced by:
+       REQUIRE ClassAlive: FineClass not in __CLASSIFIER_DEAD__   ("any news type")
+       Core:   kw15_proba_hd_FT >= 0.570 AND ge35_m3FT >= 0.619 AND se_m3 >= 14.76
+               AND FM3_bd_ge50_FT >= -0.678
+       SeSolo: se_m3 >= 36.6
+       Combo:  FM3_bd_ge50_FT >= 1.6 AND kw15_proba_bd_FT >= 0.70
+     Cuts are the operator's. kw15_*_FT, ge35_m3FT and FM3_bd_ge50_FT are full-refit
+     models: no held-out score, so the cuts are in-sample.
+     Replay of the logged rows 2026-09-29..10-07 (8 sessions, 540 armed rows, the real
+     _evaluate_trigger): 45 fires (Core 35, SeSolo 8, Combo 12; ~5.6/session) where the
+     old gate fired 92.
+  2. NEW RULE FIELD FM3_bd_ge50_FT (source 'fm3'). Scored at RECEPTION by a new FM3
+     PRIORITY worker (o55_fm3_lane.Fm3PrioLane): its own subprocess, nice 0, no quiet
+     gate, R1_FT's bd_ge50 artifact only (two TF-IDF parts). check-prio, 200 tape PRs:
+     compute p50/p95 1.2/1.4 ms, submit->result 1.4/1.7 ms, RSS 209 MB, 0 mismatches vs
+     the shadow lane. A rule reading it + the worker not ok = refuse to start.
+  3. ONLY THE 6 PRIORITY MODELS RUN BEFORE STEP-1b: FinBERT, FinMarBa, FLANG (model-3
+     reads them as features — they cannot be deferred), model-3 (embedding + ONLY the
+     boosters the rules read: se_m3, ge35_m3FT), kw15_FT and the FM3 priority worker.
+     - kw15 task split (o55_kw15ft / o55_s4kw): 'kw_ft' = the kw15_FT pair only (decision
+       path, p50 2.2 ms vs ~6 ms for kw15+FT+S4); 'kw_rest' = plain kw15 + S4 (late).
+       Same prep, same pipelines: --check-s4 and the startup smoke prove the split equals
+       the 'kw15' task digit for digit.
+     - The earnings SCORE (~19 ms median, GIL-bound regex) left the decision path; the
+       class (FineClass) is still computed on the feed thread and read by the gate.
+     - Measured and NOT done: scoring se_m3 and ge35_m3FT as two parallel engine tasks
+       (one per model group) — 9.1 ms vs 8.3 ms as one task (GIL-bound feature build).
+  4. ONE DECISION DEADLINE (DECISION_DEADLINE_MS = 350, --decision-deadline-ms) replaces
+     the 60/10/5 s waits on an armed row. A score not back in time reads MISSING (only
+     the rules needing it lose), logs [Deadline], and the late stage fills its cells.
+     model-3 never scores a half-blank feature row before the send.
+  5. THE LATE STAGE (o55_late.py). The row is written RIGHT AFTER the decision with the
+     priority cells; plain kw15 + S4, the earnings score, the other 8 boosters and the
+     FM3 shadow lane (all 8 cells) run LATE_DELAY_SEC = 300 s after reception
+     (--late-delay-sec), one article at a time, only when no PR entered scoring for 2 s
+     and the engine queue is empty (at the latest 600 s). Their cells are written by an
+     in-place rewrite of the day file (fill_tsv_rows: under _tsv_lock, verified cell for
+     cell, os.replace), batched per burst (~20 ms per MB).
+     Ctrl+C runs every pending late job at once (<= 60 s) before the engine stops.
+  6. SCHEMA 77 -> 79: + Late_status (pending|ok|partial) and Late_at. Additive, so the day
+     file is upgraded in place. At the decision: Xgb_status='pending' (gate boosters ok,
+     the rest late), FM3_status='pending'. FM3_bd_ge50_FT is the decision's value (what
+     the gate read); the shadow lane's must equal it (ERROR "PRIORITY/SHADOW MISMATCH").
+  7. A rule naming a late-only field (kw15_proba_bd/hd, the S4 pair, EarningScore) is
+     REFUSED at load: it would read None on every row.
+  8. bench/o54_bench.py: ORCH_PROFILES gives the pre-10-07 file its own rules file and
+     today's file --late-delay-sec 5; records Late_status.
+MEASURED 2026-10-07 10:37-10:52 (live orchestrator stopped; all --check-* pass):
+  bench/reports/O54_latency_2026-10-07_1048_prio1007.md — old 5.5 (.bak) vs new, C1a,
+  2 interleaved repeats, the 16 largest historical bursts + ladders + 30 lone PRs:
+                     burst max  burst p90  burst p50  lone p50  ladder 15  ladder 25
+    old 5.5            197        107         69        64        540       1091
+    new 5.5            277         99         67        64        315        618
+  - 0 missing decisions; every historical-burst PR under 400 ms; Late_status=ok on every
+    row; 0 priority/shadow FM3 mismatches.
+  - Per historical burst the new version is faster on 8 of 16, slower on 8.
+  - The 277 ms is ONE PR (08-05 burst, repeat 2; repeat 1 gave 124 ms there): model-3's
+    feature build took 143 ms instead of ~8 under GIL contention. The new rules read BOTH
+    model groups (se_m3 = m3, ge35_m3FT = m3FT), so the decision path now does two
+    GIL-bound feature builds per ticker where XgbSolo needed one. Next lever if burst
+    tails matter: a faster build_row_features (must keep offline parity).
+  - Ladders of 20-25 PRs in 0.2 s (beyond any burst on record) now hit the 350 ms
+    deadline on 23-26 rows per repeat: BAD sent at once instead of waiting
+    (Xgb_status=late, cells filled by the late stage). The old version answered those
+    PRs after 600-1090 ms.
+ROLLBACK: copy each *.bak-20261007 over its file (Orchestrator5.5.py, o55_fm3_lane.py,
+  o55_kw15ft.py, o55_s4kw.py, o54_engine.py, bench/o54_bench.py) and
+  orchestrator_trigger_rules.pre-20261007.txt over orchestrator_trigger_rules.txt; restart.
+  (o55_late.py is new and unused by the old files.) The old code rotates a 79-column day
+  file (columns go away) — switch at a day boundary.
+
+
+O5.5 rules-file edit 2026-10-07 (later the same day): one more solo rule
+  KwBodySolo: kw15_proba_bd_FT >= 0.82   (the operator typed 8.2, impossible for a 0-1
+  probability; confirmed as 0.82). Rules file only, no Python edit. Highest logged
+  kw15_proba_bd_FT is 0.863, and 4 of 488 logged rows are >= 0.82.
+  --check-rules OK: 1 REQUIRE + 4 rules. The live process keeps its old gate until restart.
+  Rollback: delete the line, or copy orchestrator_trigger_rules.txt.bak-20261007b back.
+
+O5.5 rules + code edit 2026-10-07 (evening): new rule
+  FM3Pair: FM3_hd_reg_FT >= 3.4 AND FM3_bd_ge50_FT >= 1.6
+  - o55_fm3_lane.py: the FM3 priority worker now scores FM3_bd_ge50_FT AND FM3_hd_reg_FT in
+    one task (FM3P_COLS). Check (10 PRs, nice 19): goldens ok, parity 0 mismatches, pair
+    p50 1.7 ms. The shadow worker is unchanged.
+  - Orchestrator5.5.py: FM3_hd_reg_FT is a rule field (source 'fm3'); both priority values
+    are written at the decision; the late stage checks both against the shadow lane
+    (ERROR "PRIORITY/SHADOW MISMATCH" if they differ).
+  - daily-board.py: FM3_hd_reg_FT is shown right after kw15_proba_bd_FT, starred when a
+    rule bar is met.
+  - Logged rows (547): 6 reach both cuts (hd_reg>=3.4: 15, bd>=1.6: 29).
+  - NOT live: the running process keeps its old gate. Heavy checks (--check-fm3, bench) wait
+    until the live process is stopped.
+  - Backups: Orchestrator5.5.py.bak-20261007b, orchestrator_trigger_rules.txt.bak-20261007c.

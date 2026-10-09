@@ -99,7 +99,7 @@ _CFG = n2_config.load_config()
 # --------------------------------------------------------------------------- #
 CAPITAL                       = 5.00            # dollar budget per trade
 ACCOUNT                       = n2_config.get(_CFG, "IBKR_ACCOUNT", "UNCONFIGURED_IBKR_ACCOUNT")  # set IBKR_ACCOUNT in config/n2_config_file.txt; sentinel makes orders fail loudly if unset
-INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v7-smoothed-yield_vs-stopLimits.tsv")
+INPUT_LIMITS_TABLE            = str(_HERE / "yield-triggerLimit-data" / "v8-input.tsv")
 LOG_DIR                       = str(_HERE / "xwing-logs")                          # xwing_<symbol>_<date>_<time>.log
 PRICE_ACTION_TABLE_DIR        = str(_HERE / "xwing_tables")  # xwing-table_<symbol>_<date>_<time>.tsv
 LIFETIME                      = "04:00:00"         # hh:mm:ss or mm:ss (max 12h); starts at the buy-signal

@@ -30,6 +30,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -79,6 +80,33 @@ FEED_PROTO = 1
 FEED_HEARTBEAT_SECONDS = 5.0
 FEED_CLIENT_QUEUE_MAX = 2000
 
+# --- Upstream WebSocket liveness --------------------------------------------
+# The RTPR server sends an application-level {"type":"ping"} every 30s, which we
+# answer with PONG_FRAME. ANSWERING IS NOT CHECKING. On 2026-09-23 the upstream
+# went silent at 06:02:32 and this process sat idle for 2h48m still holding an
+# ESTABLISHED socket that never delivered another byte -- 50 pre-market PRs lost,
+# no WARNING, no ERROR, nothing in `ps` to see. A half-open TCP connection never
+# delivers a FIN, so `async for raw in ws` simply never yields again, no
+# ConnectionClosed is ever raised, and the reconnect path in websocket_listener
+# is unreachable. Silence itself has to be the alarm.
+#
+# 90s is 3 missed server pings. This mirrors FEED_SILENCE_TIMEOUT_SEC in
+# Orchestrator5.3.py, which guards the NEXT hop down -- and which is exactly why
+# that hop rode out the same incident and reconnected on its own.
+WS_IDLE_TIMEOUT_SECONDS = 90.0
+WS_IDLE_POLL_SECONDS = 5.0
+
+# Library-level keepalive (RFC 6455 protocol Ping frames, a separate mechanism
+# from the server's application-level ping above). Set to 0 to disable and
+# restore pre-2026-09-23 behaviour if RTPR's edge ever stops answering Pings.
+WS_PING_INTERVAL_SECONDS = 30.0
+WS_PING_TIMEOUT_SECONDS = 30.0
+
+# OS-level half-open detection; belt and braces with the idle watchdog.
+WS_TCP_KEEPIDLE = 60
+WS_TCP_KEEPINTVL = 10
+WS_TCP_KEEPCNT = 3
+
 # In-process row hook (default None -> no extra work on the hot path).
 # websocket_listener calls _row_hook(data, row, arrival_dt) on the WS loop
 # thread right after the row is enqueued — BEFORE the writer's dedup, so WS
@@ -117,6 +145,9 @@ class Config:
     table_suffix: str
     table_delimiter: str
     ws_url_template: str
+    ws_idle_timeout: float
+    ws_ping_interval: float
+    ws_ping_timeout: float
     feed_port: int
     self_test: bool
 
@@ -273,6 +304,32 @@ def parse_args(argv: list[str]) -> Config:
         default="wss://ws.rtpr.io?apiKey={api_key}",
     )
     parser.add_argument(
+        "--ws-idle-timeout",
+        type=float,
+        default=WS_IDLE_TIMEOUT_SECONDS,
+        help=(
+            "Reconnect if NOTHING (server ping or article) arrives on the upstream "
+            "WebSocket for this many seconds. The server pings every 30s, so the "
+            "default is 3 missed pings. 0 disables the watchdog (not advised: it is "
+            "the only thing that catches a silently half-open upstream)."
+        ),
+    )
+    parser.add_argument(
+        "--ws-ping-interval",
+        type=float,
+        default=WS_PING_INTERVAL_SECONDS,
+        help=(
+            "Seconds between client-sent protocol Ping frames (0 disables, which was "
+            "the behaviour before 2026-09-23)."
+        ),
+    )
+    parser.add_argument(
+        "--ws-ping-timeout",
+        type=float,
+        default=WS_PING_TIMEOUT_SECONDS,
+        help="Seconds to wait for a Pong before treating the connection as dead.",
+    )
+    parser.add_argument(
         "--feed-port",
         type=int,
         default=8900,
@@ -336,6 +393,9 @@ def parse_args(argv: list[str]) -> Config:
         table_suffix=suffix,
         table_delimiter=delimiter,
         ws_url_template=args.ws_url_template,
+        ws_idle_timeout=args.ws_idle_timeout,
+        ws_ping_interval=args.ws_ping_interval,
+        ws_ping_timeout=args.ws_ping_timeout,
         feed_port=args.feed_port,
         self_test=args.self_test,
     )
@@ -810,6 +870,29 @@ async def dataframe_writer(
         logger.info("DF_WRITER_STOP rows_in_memory=%d", len(PR_dataframe))
 
 
+def _enable_tcp_keepalive(ws: Any, logger: logging.Logger) -> None:
+    """OS-level half-open detection, belt and braces with the idle watchdog.
+
+    Best effort by design: this reaches into the transport for the raw socket, which
+    not every websockets backend exposes. A failure here is harmless -- the idle
+    watchdog is the authoritative check -- so it is logged and never raised."""
+    try:
+        transport = getattr(ws, "transport", None)
+        sock = transport.get_extra_info("socket") if transport is not None else None
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", WS_TCP_KEEPIDLE),
+            ("TCP_KEEPINTVL", WS_TCP_KEEPINTVL),
+            ("TCP_KEEPCNT", WS_TCP_KEEPCNT),
+        ):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except Exception as exc:  # pragma: no cover - platform/transport dependent
+        logger.info("WS_KEEPALIVE_SKIP error_type=%s", type(exc).__name__)
+
+
 async def websocket_listener(
     result_queue: asyncio.Queue[dict[str, str] | None],
     api_key: str,
@@ -824,19 +907,55 @@ async def websocket_listener(
     first_article_logged = False
 
     while True:
+        idle_fired = False
+        watchdog = None
         try:
             logger.info("WS_CONNECT")
             async with websockets.connect(
-                ws_url, ping_interval=None, max_queue=None
+                ws_url,
+                ping_interval=(config.ws_ping_interval or None),
+                ping_timeout=(config.ws_ping_timeout or None),
+                max_queue=None,
             ) as ws:
                 conn_state.ws = ws
                 backoff = 2.0
                 consecutive_failures = 0
+                _enable_tcp_keepalive(ws, logger)
                 logger.info("WS_CONNECTED")
                 await send_subscribe(ws, universe_cache.symbols, config, logger, "connect")
 
+                # Silence watchdog -- see WS_IDLE_TIMEOUT_SECONDS above for why this
+                # exists. It runs as its own task and CLOSES the socket rather than
+                # cancelling recv(), so a frame can never be lost mid-read. The close
+                # ends `async for` cleanly, and execution then falls through to the
+                # reconnect path at the bottom of this loop, reusing the backoff that
+                # is already there.
+                last_msg_at = now_fixed()
+
+                async def _idle_watchdog() -> None:
+                    nonlocal idle_fired
+                    while True:
+                        await asyncio.sleep(WS_IDLE_POLL_SECONDS)
+                        idle_s = (now_fixed() - last_msg_at).total_seconds()
+                        if idle_s < config.ws_idle_timeout:
+                            continue
+                        idle_fired = True
+                        logger.warning(
+                            "WS_IDLE_TIMEOUT idle=%.1fs limit=%.1fs — upstream silent, "
+                            "closing to force a reconnect",
+                            idle_s,
+                            config.ws_idle_timeout,
+                        )
+                        await ws.close()
+                        return
+
+                if config.ws_idle_timeout > 0:
+                    watchdog = asyncio.create_task(_idle_watchdog())
+
                 async for raw in ws:
-                    arrival_dt = now_fixed()
+                    # ANY frame -- article, ping or control -- proves the upstream is
+                    # alive. This stamp is what the idle watchdog reads.
+                    last_msg_at = arrival_dt = now_fixed()
                     try:
                         msg = json.loads(raw)
                     except (json.JSONDecodeError, TypeError):
@@ -917,6 +1036,12 @@ async def websocket_listener(
 
                     logger.info("WS_SKIP type=%s", msg_type)
 
+            # A watchdog close exits the loop above CLEANLY, so it never reaches the
+            # except handlers. Count it, or a genuinely dead upstream would be retried
+            # at the floor delay forever instead of backing off.
+            if idle_fired:
+                consecutive_failures += 1
+
         except asyncio.CancelledError:
             raise
         except websockets.ConnectionClosed as exc:
@@ -937,6 +1062,11 @@ async def websocket_listener(
             )
         finally:
             conn_state.ws = None
+            if watchdog is not None:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+                watchdog = None
 
         if consecutive_failures >= 8:
             delay = 300.0

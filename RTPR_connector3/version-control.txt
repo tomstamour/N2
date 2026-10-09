@@ -1,0 +1,98 @@
+RTPR_connector3 — change log
+============================
+Newest entries at the bottom. Source-only; tables/ and logs/ are gitignored.
+
+
+2026-09-23  FIX — silent upstream death: the WS listener could hang forever
+------------------------------------------------------------------------------
+File: RTPR_connector3_Firehose.py
+
+THE INCIDENT
+  The firehose stopped delivering at 06:02:32 ET and nothing noticed until
+  08:40. The orchestrator wrote ONE row all morning (AIDX, 06:00:21); the same
+  06:00-08:40 window carried 51 PRs the day before. ~2h48m of peak pre-market
+  lost, including the 08:00 hour, which is the single busiest of the day.
+
+  What made it expensive is that NOTHING looked wrong:
+    - the process was alive, 0% CPU, `ps` perfectly normal;
+    - its asyncio loop was alive (the 5s FeedServer heartbeat kept running);
+    - the TCP socket to the feed read ESTABLISHED with 0 bytes queued;
+    - the log had no WARNING, no ERROR, no WS_CLOSED, no WS_RECONNECT.
+  The only symptom was the ABSENCE of the 30s `HEARTBEAT pong` line. On
+  09-20/21/22 that line appeared 2880 times a day — one per 30s, zero gaps.
+  On 09-23 it stopped mid-stream and never resumed.
+
+  fd 8 still pointed at socket inode 227827, opened Sep 15 22:58. The process
+  had held the same dead connection for seven days without one reconnect.
+
+ROOT CAUSE
+  websocket_listener connected with `ping_interval=None`, disabling the
+  websockets library's own protocol-level keepalive. The ONLY liveness signal
+  was the server's application-level {"type":"ping"}, which the code ANSWERED
+  but never CHECKED.
+
+  When an upstream dies half-open, no FIN and no RST ever arrive. So
+  `async for raw in ws` just never yields again. No ConnectionClosed is raised,
+  both `except` handlers are skipped, and the exponential-backoff reconnect
+  below them is STRUCTURALLY UNREACHABLE. The process waits forever.
+
+  Note the asymmetry that made this survivable at all: the NEXT hop down,
+  Orchestrator5.3.py `_run_feed_client`, has exactly the check this lacked
+  (FEED_SILENCE_TIMEOUT_SEC = 20 → socket timeout → reconnect every 3s). It
+  rode out the incident and re-attached on its own within 3s of the restart.
+  The connector's upstream hop was the one link in the chain with no such
+  guard.
+
+THE FIX — three independent layers, any one of which closes the hole
+  1. IDLE WATCHDOG (authoritative). WS_IDLE_TIMEOUT_SECONDS = 90.0, polled
+     every 5s. Any frame — article, ping, control — stamps `last_msg_at`. On
+     timeout the watchdog logs WS_IDLE_TIMEOUT and CLOSES the socket; the close
+     ends `async for` cleanly and execution falls through to the reconnect path
+     that was already there. 90s is 3 missed server pings against a measured
+     30s cadence, so it cannot false-positive.
+     It closes the socket rather than cancelling recv() ON PURPOSE — cancelling
+     a read can lose a frame mid-parse.
+     An idle close exits the loop CLEANLY, so it never reaches the except
+     handlers; `consecutive_failures` is bumped explicitly after the `async
+     with`, or a genuinely dead upstream would retry at the 2s floor forever.
+  2. LIBRARY KEEPALIVE. ping_interval/ping_timeout now configurable, default
+     30/30. Sends real protocol Ping frames; a missed Pong raises
+     ConnectionClosed into the existing handler.
+  3. TCP KEEPALIVE. SO_KEEPALIVE + KEEPIDLE 60 / KEEPINTVL 10 / KEEPCNT 3 on
+     the transport socket — OS-level half-open detection in ~90s. Best effort:
+     if the transport exposes no socket it logs WS_KEEPALIVE_SKIP and moves on.
+
+  New flags: --ws-idle-timeout, --ws-ping-interval, --ws-ping-timeout.
+  0 disables each. `--ws-ping-interval 0` restores pre-fix ping behaviour
+  WITHOUT giving up the watchdog — that is the rollback if RTPR's edge ever
+  turns out not to answer protocol Pings.
+
+VERIFIED
+  - Watchdog proven against a mock server that goes silent WITHOUT closing (the
+    exact failure mode): detected and recovered 3 times in 30s —
+    "WS_IDLE_TIMEOUT idle=8.0s limit=6.0s" → WS_RECONNECT 2.0s → WS_CONNECTED.
+    Run with --ws-ping-interval 0, so layer 1 alone is sufficient.
+  - Live socket now shows `timer:(keepalive,32sec,0)` in `ss -tno`; the hung
+    one had no keepalive timer at all.
+  - --self-test passes; file compiles.
+
+DEPLOYED 08:56:20 ET, orchestrator re-attached in 3.0s (it was 9.0s on the
+first restart). Running with --ws-ping-interval 0 --ws-ping-timeout 0, i.e.
+watchdog + TCP keepalive only. Layer 2 is left for an after-hours window
+because a proxy that ignores Pings would cause reconnect churn, and that has
+not been observed against the real endpoint yet.
+
+ALSO CHANGED THE RUN COMMAND
+  Now started with --flush-on-shutdown and the venv interpreter, per
+  scripts/CLAUDE.md. Without that flag SIGTERM DISCARDS the in-memory
+  PR_dataframe: the first restart lost 3 buffered rows (LBGJ, PLCE, AIDX — all
+  three were already safe in the orchestrator's own TSVs). The second restart
+  logged "DF_FLUSH_OK reason=shutdown rows=1" instead. The process had also
+  been running under system python3, not the venv.
+
+STILL OPEN
+  Nothing alerts on a PR drought. The watchdog fixes the hang, but if RTPR
+  itself goes quiet during market hours no one is told. A "no article in N
+  minutes between 04:00 and 20:00 ET" warning would have caught this at 06:05
+  instead of 08:40. That is monitoring, not this bug, and belongs in its own
+  change.
